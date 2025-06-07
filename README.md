@@ -44,7 +44,7 @@ All Python dependencies are listed in `requirements.txt` and will be installed a
 
 ### 1. Clone or Download
 ```bash
-git clone <your-repo-url>
+git clone https://github.com/MalcolmStran/discord-music-bot.git
 cd discordbot
 ```
 
