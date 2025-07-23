@@ -1,6 +1,13 @@
 """
 Media handler cog for Twitter/TikTok video conversion
 Automatically converts Twitter and TikTok links to MP4 files
+
+Features:
+- Uses ffmpeg-python for robust video processing
+- Targets 7MB file size (safe margin under Discord's 8MB limit)
+- Adaptive compression settings based on original file size
+- Two-pass compression for challenging cases
+- Handles videos with or without audio tracks
 """
 
 import discord
@@ -207,7 +214,18 @@ class MediaHandler(commands.Cog, name="Media"):
         return await self._compress_video(file_path)
     
     async def _compress_video(self, file_path: str) -> Optional[str]:
-        """Compress video to meet 7MB target using ffmpeg-python"""
+        """
+        Compress video to meet 7MB target using ffmpeg-python
+        
+        Uses adaptive compression settings based on the required compression ratio:
+        - Light compression: CRF 26, 854px width, 96k audio
+        - Medium compression: CRF 28, 640px width, 64k audio  
+        - Heavy compression: CRF 30, 480px width, 48k audio
+        - Very heavy compression: CRF 32, 320px width, 32k audio
+        
+        If first pass still exceeds target, attempts second pass with more aggressive settings.
+        Properly handles videos with or without audio tracks.
+        """
         try:
             compressed_path = str(self.temp_dir / f'compressed_{uuid.uuid4()}.mp4')
             
