@@ -12,3 +12,6 @@ temp/
 *.log
 .DS_Store
 Thumbs.db
+
+# Test files
+test_compression.py
