@@ -13,6 +13,8 @@ import uuid
 import tempfile
 import subprocess
 import logging
+import ffmpeg
+import asyncio
 from pathlib import Path
 from typing import Optional
 
@@ -30,7 +32,9 @@ class MediaHandler(commands.Cog, name="Media"):
         self.temp_dir.mkdir(exist_ok=True)
         
         # Discord file size limit (8MB for regular users, 50MB for Nitro)
+        # Target 7MB to provide buffer below Discord's 8MB limit
         self.max_file_size = 8 * 1024 * 1024  # 8MB in bytes
+        self.target_file_size = 7 * 1024 * 1024  # 7MB in bytes (target for compression)
         
         # TikTok API configuration
         self.tiktok_api_url = "https://tiktok-download-without-watermark.p.rapidapi.com/analysis"
@@ -197,7 +201,7 @@ class MediaHandler(commands.Cog, name="Media"):
         # Check file size
         file_size = os.path.getsize(file_path)
         
-        if file_size <= self.max_file_size:
+        if file_size <= self.target_file_size:
             return file_path
         
         # File is too large, try to compress
@@ -205,25 +209,69 @@ class MediaHandler(commands.Cog, name="Media"):
         return await self._compress_video(file_path)
     
     async def _compress_video(self, file_path: str) -> Optional[str]:
-        """Compress video to meet Discord's file size limit"""
+        """Compress video to meet Discord's file size limit using ffmpeg-python"""
         try:
             compressed_path = str(self.temp_dir / f'compressed_{uuid.uuid4()}.mp4')
             
-            # FFmpeg compression command
-            cmd = [
-                'ffmpeg', '-i', file_path,
-                '-vf', 'scale=640:-2',  # Scale to max width of 640px
-                '-c:v', 'libx264',      # Video codec
-                '-crf', '28',           # Quality (higher = more compression)
-                '-preset', 'fast',      # Encoding speed
-                '-c:a', 'aac',          # Audio codec
-                '-b:a', '64k',          # Audio bitrate
-                '-movflags', '+faststart',  # Web optimization
-                '-y',                   # Overwrite output file
-                compressed_path
-            ]
+            # Get video information first
+            try:
+                probe = ffmpeg.probe(file_path)
+                video_info = next((stream for stream in probe['streams'] if stream['codec_type'] == 'video'), None)
+                if not video_info:
+                    logger.error("No video stream found in file")
+                    return file_path
+                
+                duration = float(probe['format'].get('duration', 0))
+                if duration <= 0:
+                    logger.error("Invalid video duration")
+                    return file_path
+                
+            except ffmpeg.Error as e:
+                logger.error(f"Error probing video: {e}")
+                return file_path
             
-            # Run FFmpeg
+            # Calculate target bitrate for 7MB file
+            # Formula: target_size_bits = bitrate * duration
+            target_size_bits = self.target_file_size * 8  # Convert bytes to bits
+            target_bitrate_bps = int(target_size_bits / duration)
+            
+            # Reserve some bitrate for audio (64kbps) and overhead
+            audio_bitrate_bps = 64 * 1000  # 64kbps
+            overhead_factor = 0.9  # 10% overhead buffer
+            target_video_bitrate = int((target_bitrate_bps - audio_bitrate_bps) * overhead_factor)
+            
+            # Ensure minimum quality - don't go below 200kbps
+            target_video_bitrate = max(target_video_bitrate, 200 * 1000)
+            
+            logger.info(f"Compressing video: duration={duration:.2f}s, target_video_bitrate={target_video_bitrate//1000}kbps")
+            
+            # Build ffmpeg pipeline using ffmpeg-python
+            stream = ffmpeg.input(file_path)
+            
+            # Video processing
+            video_stream = stream.video.filter('scale', width=-2, height='min(720,ih)')  # Scale down if needed, max height 720p
+            
+            # Audio processing
+            audio_stream = stream.audio
+            
+            # Output with compression settings (removing movflags for now to debug)
+            output = ffmpeg.output(
+                video_stream,
+                audio_stream,
+                compressed_path,
+                vcodec='libx264',
+                acodec='aac',
+                video_bitrate=target_video_bitrate,
+                audio_bitrate='64k',
+                preset='fast',
+                y=None  # Overwrite output file
+            )
+            
+            # Debug: print the command that will be executed
+            cmd = ffmpeg.compile(output)
+            logger.info(f"FFmpeg command: {' '.join(cmd)}")
+            
+            # Run the ffmpeg command
             process = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
@@ -236,21 +284,68 @@ class MediaHandler(commands.Cog, name="Media"):
                 logger.error(f"FFmpeg compression failed: {stderr.decode()}")
                 return file_path  # Return original if compression fails
             
-            # Check if compressed file is smaller
+            # Check if compressed file exists and is smaller
             if os.path.exists(compressed_path):
                 compressed_size = os.path.getsize(compressed_path)
                 
-                if compressed_size <= self.max_file_size:
+                # If still too large, try more aggressive compression
+                if compressed_size > self.target_file_size:
+                    logger.info(f"First compression attempt: {compressed_size} bytes, trying more aggressive compression")
+                    
+                    # Remove the first attempt
+                    os.remove(compressed_path)
+                    
+                    # Try with even lower bitrate and smaller resolution
+                    more_aggressive_bitrate = max(target_video_bitrate // 2, 150 * 1000)  # Half bitrate, min 150kbps
+                    
+                    stream = ffmpeg.input(file_path)
+                    video_stream = stream.video.filter('scale', width=-2, height='min(480,ih)')  # Scale to 480p max
+                    audio_stream = stream.audio
+                    
+                    output = ffmpeg.output(
+                        video_stream,
+                        audio_stream,
+                        compressed_path,
+                        vcodec='libx264',
+                        acodec='aac',
+                        video_bitrate=more_aggressive_bitrate,
+                        audio_bitrate='48k',  # Lower audio bitrate too
+                        preset='fast',
+                        y=None
+                    )
+                    
+                    # Run second compression attempt
+                    process = await asyncio.create_subprocess_exec(
+                        *ffmpeg.compile(output),
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE
+                    )
+                    
+                    stdout, stderr = await process.communicate()
+                    
+                    if process.returncode != 0:
+                        logger.error(f"Second FFmpeg compression failed: {stderr.decode()}")
+                        return file_path
+                    
+                    if os.path.exists(compressed_path):
+                        compressed_size = os.path.getsize(compressed_path)
+                
+                if compressed_size <= self.target_file_size:
                     # Remove original and return compressed
                     os.remove(file_path)
-                    logger.info(f"Compression successful: {compressed_size} bytes")
+                    logger.info(f"Compression successful: {compressed_size} bytes (target: {self.target_file_size} bytes)")
                     return compressed_path
                 else:
                     # Still too large, remove compressed file
-                    os.remove(compressed_path)
-                    logger.warning(f"Compressed file still too large: {compressed_size} bytes")
+                    if os.path.exists(compressed_path):
+                        os.remove(compressed_path)
+                    logger.warning(f"Compressed file still too large: {compressed_size} bytes (target: {self.target_file_size} bytes)")
             
             return file_path  # Return original if compression didn't help
+        
+        except ffmpeg.Error as e:
+            logger.error(f"FFmpeg error during video compression: {e}")
+            return file_path  # Return original if compression fails
         
         except Exception as e:
             logger.error(f"Video compression error: {e}")
@@ -336,6 +431,7 @@ class MediaHandler(commands.Cog, name="Media"):
         embed.add_field(name="TikTok Support", value=tiktok_status, inline=True)
         embed.add_field(name="Twitter/X Support", value=twitter_status, inline=True)
         embed.add_field(name="Max File Size", value=f"{self.max_file_size // 1024 // 1024}MB", inline=True)
+        embed.add_field(name="Compression Target", value=f"{self.target_file_size // 1024 // 1024}MB", inline=True)
         
         # Features
         features = [
@@ -378,7 +474,6 @@ class MediaHandler(commands.Cog, name="Media"):
             logger.error(f"Error cleaning up temp directory: {e}")
 
 # Add asyncio import at the top
-import asyncio
 
 async def setup(bot):
     await bot.add_cog(MediaHandler(bot))
