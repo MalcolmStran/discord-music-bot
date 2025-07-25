@@ -385,7 +385,7 @@ class MediaHandler(commands.Cog, name="Media"):
         return await self._compress_video(file_path)
     
     async def _compress_video(self, file_path: str) -> Optional[str]:
-        """Compress video to meet Discord's file size limit using ffmpeg-python"""
+        """Compress video to meet Discord's file size limit using H.265 and Opus"""
         try:
             compressed_path = str(self.temp_dir / f'compressed_{uuid.uuid4()}.mp4')
             
@@ -411,121 +411,515 @@ class MediaHandler(commands.Cog, name="Media"):
             target_size_bits = self.target_file_size * 8  # Convert bytes to bits
             target_bitrate_bps = int(target_size_bits / duration)
             
-            # Reserve some bitrate for audio (64kbps) and overhead
-            audio_bitrate_bps = 64 * 1000  # 64kbps
+            # Reserve some bitrate for audio - Opus is more efficient than AAC
+            audio_bitrate_bps = 48 * 1000  # 48kbps Opus (equivalent to 64kbps AAC)
             overhead_factor = 0.9  # 10% overhead buffer
             target_video_bitrate = int((target_bitrate_bps - audio_bitrate_bps) * overhead_factor)
             
-            # Ensure minimum quality - don't go below 200kbps
-            target_video_bitrate = max(target_video_bitrate, 200 * 1000)
+            # Ensure minimum quality - H.265 can go lower than H.264
+            target_video_bitrate = max(target_video_bitrate, 150 * 1000)  # 150kbps minimum for H.265
             
-            logger.info(f"Compressing video: duration={duration:.2f}s, target_video_bitrate={target_video_bitrate//1000}kbps")
+            logger.info(f"Compressing video with H.265: duration={duration:.2f}s, target_video_bitrate={target_video_bitrate//1000}kbps")
             
-            # Build ffmpeg pipeline using ffmpeg-python
-            stream = ffmpeg.input(file_path)
-            
-            # Video processing
-            video_stream = stream.video.filter('scale', width=-2, height='min(720,ih)')  # Scale down if needed, max height 720p
-            
-            # Audio processing
-            audio_stream = stream.audio
-            
-            # Output with compression settings (removing movflags for now to debug)
-            output = ffmpeg.output(
-                video_stream,
-                audio_stream,
-                compressed_path,
-                vcodec='libx264',
-                acodec='aac',
-                video_bitrate=target_video_bitrate,
-                audio_bitrate='64k',
-                preset='fast',
-                y=None  # Overwrite output file
+            # Try H.265 + Opus first (best compression)
+            success = await self._try_compression(
+                file_path, compressed_path, target_video_bitrate, 
+                vcodec='libx265', acodec='libopus', preset='ultrafast'
             )
             
-            # Debug: print the command that will be executed
-            cmd = ffmpeg.compile(output)
-            logger.info(f"FFmpeg command: {' '.join(cmd)}")
+            if not success:
+                # Fallback to H.264 + Opus if H.265 fails
+                logger.info("H.265 failed, trying H.264 + Opus")
+                success = await self._try_compression(
+                    file_path, compressed_path, target_video_bitrate,
+                    vcodec='libx264', acodec='libopus', preset='ultrafast'
+                )
             
-            # Run the ffmpeg command
-            process = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
+            if not success:
+                # Final fallback to H.264 + AAC
+                logger.info("H.264 + Opus failed, trying H.264 + AAC")
+                success = await self._try_compression(
+                    file_path, compressed_path, target_video_bitrate,
+                    vcodec='libx264', acodec='aac', preset='ultrafast'
+                )
             
-            stdout, stderr = await process.communicate()
-            
-            if process.returncode != 0:
-                logger.error(f"FFmpeg compression failed: {stderr.decode()}")
-                return file_path  # Return original if compression fails
-            
-            # Check if compressed file exists and is smaller
-            if os.path.exists(compressed_path):
+            if success and os.path.exists(compressed_path):
                 compressed_size = os.path.getsize(compressed_path)
                 
                 # If still too large, try more aggressive compression
                 if compressed_size > self.target_file_size:
                     logger.info(f"First compression attempt: {compressed_size} bytes, trying more aggressive compression")
-                    
-                    # Remove the first attempt
-                    os.remove(compressed_path)
-                    
-                    # Try with even lower bitrate and smaller resolution
-                    more_aggressive_bitrate = max(target_video_bitrate // 2, 150 * 1000)  # Half bitrate, min 150kbps
-                    
-                    stream = ffmpeg.input(file_path)
-                    video_stream = stream.video.filter('scale', width=-2, height='min(480,ih)')  # Scale to 480p max
-                    audio_stream = stream.audio
-                    
-                    output = ffmpeg.output(
-                        video_stream,
-                        audio_stream,
-                        compressed_path,
-                        vcodec='libx264',
-                        acodec='aac',
-                        video_bitrate=more_aggressive_bitrate,
-                        audio_bitrate='48k',  # Lower audio bitrate too
-                        preset='fast',
-                        y=None
-                    )
-                    
-                    # Run second compression attempt
-                    process = await asyncio.create_subprocess_exec(
-                        *ffmpeg.compile(output),
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.PIPE
-                    )
-                    
-                    stdout, stderr = await process.communicate()
-                    
-                    if process.returncode != 0:
-                        logger.error(f"Second FFmpeg compression failed: {stderr.decode()}")
-                        return file_path
-                    
-                    if os.path.exists(compressed_path):
-                        compressed_size = os.path.getsize(compressed_path)
+                    return await self._try_aggressive_compression(file_path, target_video_bitrate)
                 
                 if compressed_size <= self.target_file_size:
                     # Remove original and return compressed
                     os.remove(file_path)
                     logger.info(f"Compression successful: {compressed_size} bytes (target: {self.target_file_size} bytes)")
                     return compressed_path
-                else:
-                    # Still too large, remove compressed file
-                    if os.path.exists(compressed_path):
-                        os.remove(compressed_path)
-                    logger.warning(f"Compressed file still too large: {compressed_size} bytes (target: {self.target_file_size} bytes)")
             
             return file_path  # Return original if compression didn't help
-        
-        except ffmpeg.Error as e:
-            logger.error(f"FFmpeg error during video compression: {e}")
-            return file_path  # Return original if compression fails
         
         except Exception as e:
             logger.error(f"Video compression error: {e}")
             return file_path  # Return original if compression fails
+    
+    async def _try_compression(self, input_path: str, output_path: str, video_bitrate: int, 
+                             vcodec: str, acodec: str, preset: str) -> bool:
+        """Try compression with two-pass encoding for precise file size control"""
+        try:
+            # Remove existing output file if present
+            if os.path.exists(output_path):
+                os.remove(output_path)
+            
+            # Get video duration for bitrate calculation
+            try:
+                probe = ffmpeg.probe(input_path)
+                duration = float(probe['format'].get('duration', 0))
+                if duration <= 0:
+                    logger.error("Invalid video duration for compression")
+                    return False
+            except ffmpeg.Error as e:
+                logger.error(f"Error getting video duration: {e}")
+                return False
+            
+            # Calculate precise bitrates for target file size
+            target_size_bits = self.target_file_size * 8  # Convert to bits
+            audio_bitrate_kbps = 48  # 48 kbps for Opus/AAC
+            audio_bitrate_bps = audio_bitrate_kbps * 1000
+            
+            # Reserve 5% overhead for container and metadata
+            overhead_factor = 0.95
+            available_bitrate = int((target_size_bits / duration) * overhead_factor)
+            target_video_bitrate_bps = available_bitrate - audio_bitrate_bps
+            
+            # Ensure minimum video bitrate
+            min_video_bitrate = 80 * 1000 if vcodec == 'libx265' else 150 * 1000
+            target_video_bitrate_bps = max(target_video_bitrate_bps, min_video_bitrate)
+            
+            logger.info(f"Two-pass encoding: duration={duration:.2f}s, target_video_bitrate={target_video_bitrate_bps//1000}kbps")
+            
+            # Use two-pass encoding for precise file size control
+            if vcodec == 'libx265':
+                success = await self._two_pass_h265_encode(
+                    input_path, output_path, target_video_bitrate_bps, audio_bitrate_kbps, acodec, preset
+                )
+            else:  # libx264
+                success = await self._two_pass_h264_encode(
+                    input_path, output_path, target_video_bitrate_bps, audio_bitrate_kbps, acodec, preset
+                )
+            
+            if success:
+                # Verify the output file size
+                actual_size = os.path.getsize(output_path)
+                logger.info(f"Two-pass encoding result: {actual_size} bytes (target: {self.target_file_size} bytes)")
+                
+                if actual_size <= self.target_file_size * 1.05:  # Allow 5% tolerance
+                    logger.info(f"Two-pass compression successful with {vcodec} + {acodec}")
+                    return True
+                else:
+                    logger.warning(f"Two-pass result exceeded target: {actual_size} vs {self.target_file_size}")
+                    return False
+            
+            return False
+                
+        except Exception as e:
+            logger.error(f"Error in two-pass compression with {vcodec} + {acodec}: {e}")
+            return False
+    
+    async def _two_pass_h265_encode(self, input_path: str, output_path: str, 
+                                  video_bitrate_bps: int, audio_bitrate_kbps: int, 
+                                  acodec: str, preset: str) -> bool:
+        """Two-pass H.265 encoding for precise file size control"""
+        passlog_file = str(self.temp_dir / f'passlog_{uuid.uuid4()}')
+        
+        try:
+            # PASS 1: Analysis pass
+            logger.info("Starting H.265 pass 1 (analysis)")
+            
+            stream = ffmpeg.input(input_path)
+            video_stream = stream.video.filter('scale', width=-2, height='min(720,ih)')
+            
+            pass1_args = {
+                'vcodec': 'libx265',
+                'b:v': f'{video_bitrate_bps}',
+                'pass': 1,
+                'passlogfile': passlog_file,
+                'preset': preset,
+                'x265-params': f'log-level=error:pass=1',
+                'f': 'null',
+                'y': None
+            }
+            
+            output1 = ffmpeg.output(video_stream, 'NUL' if os.name == 'nt' else '/dev/null', **pass1_args)
+            
+            process1 = await asyncio.create_subprocess_exec(
+                *ffmpeg.compile(output1),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            
+            stdout1, stderr1 = await process1.communicate()
+            
+            if process1.returncode != 0:
+                logger.error(f"H.265 pass 1 failed: {stderr1.decode()}")
+                return False
+            
+            logger.info("H.265 pass 1 completed, starting pass 2")
+            
+            # PASS 2: Final encoding
+            stream = ffmpeg.input(input_path)
+            video_stream = stream.video.filter('scale', width=-2, height='min(720,ih)')
+            audio_stream = stream.audio
+            
+            pass2_args = {
+                'vcodec': 'libx265',
+                'acodec': acodec,
+                'b:v': f'{video_bitrate_bps}',
+                'b:a': f'{audio_bitrate_kbps}k',
+                'pass': 2,
+                'passlogfile': passlog_file,
+                'preset': preset,
+                'x265-params': f'log-level=error:pass=2',
+                'tag:v': 'hvc1',
+                'y': None
+            }
+            
+            output2 = ffmpeg.output(video_stream, audio_stream, output_path, **pass2_args)
+            
+            process2 = await asyncio.create_subprocess_exec(
+                *ffmpeg.compile(output2),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            
+            stdout2, stderr2 = await process2.communicate()
+            
+            if process2.returncode == 0:
+                logger.info("H.265 two-pass encoding completed successfully")
+                return True
+            else:
+                logger.error(f"H.265 pass 2 failed: {stderr2.decode()}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Error in H.265 two-pass encoding: {e}")
+            return False
+        finally:
+            # Always clean up pass log files
+            self._cleanup_passlog_files(passlog_file)
+    
+    async def _two_pass_h264_encode(self, input_path: str, output_path: str, 
+                                  video_bitrate_bps: int, audio_bitrate_kbps: int, 
+                                  acodec: str, preset: str) -> bool:
+        """Two-pass H.264 encoding for precise file size control"""
+        passlog_file = str(self.temp_dir / f'passlog_{uuid.uuid4()}')
+        
+        try:
+            # PASS 1: Analysis pass
+            logger.info("Starting H.264 pass 1 (analysis)")
+            
+            stream = ffmpeg.input(input_path)
+            video_stream = stream.video.filter('scale', width=-2, height='min(720,ih)')
+            
+            pass1_args = {
+                'vcodec': 'libx264',
+                'b:v': f'{video_bitrate_bps}',
+                'pass': 1,
+                'passlogfile': passlog_file,
+                'preset': preset,
+                'f': 'null',
+                'y': None
+            }
+            
+            output1 = ffmpeg.output(video_stream, 'NUL' if os.name == 'nt' else '/dev/null', **pass1_args)
+            
+            process1 = await asyncio.create_subprocess_exec(
+                *ffmpeg.compile(output1),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            
+            stdout1, stderr1 = await process1.communicate()
+            
+            if process1.returncode != 0:
+                logger.error(f"H.264 pass 1 failed: {stderr1.decode()}")
+                return False
+            
+            logger.info("H.264 pass 1 completed, starting pass 2")
+            
+            # PASS 2: Final encoding
+            stream = ffmpeg.input(input_path)
+            video_stream = stream.video.filter('scale', width=-2, height='min(720,ih)')
+            audio_stream = stream.audio
+            
+            pass2_args = {
+                'vcodec': 'libx264',
+                'acodec': acodec,
+                'b:v': f'{video_bitrate_bps}',
+                'b:a': f'{audio_bitrate_kbps}k',
+                'pass': 2,
+                'passlogfile': passlog_file,
+                'preset': preset,
+                'y': None
+            }
+            
+            output2 = ffmpeg.output(video_stream, audio_stream, output_path, **pass2_args)
+            
+            process2 = await asyncio.create_subprocess_exec(
+                *ffmpeg.compile(output2),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            
+            stdout2, stderr2 = await process2.communicate()
+            
+            if process2.returncode == 0:
+                logger.info("H.264 two-pass encoding completed successfully")
+                return True
+            else:
+                logger.error(f"H.264 pass 2 failed: {stderr2.decode()}")
+                return False
+                
+            return False
+        finally:
+            # Always clean up pass log files
+            self._cleanup_passlog_files(passlog_file)
+    
+    async def _two_pass_h265_encode_scaled(self, input_path: str, output_path: str, 
+                                         video_bitrate_bps: int, audio_bitrate_kbps: int, 
+                                         acodec: str, preset: str, max_height: int) -> bool:
+        """Two-pass H.265 encoding with scaling for aggressive compression"""
+        passlog_file = str(self.temp_dir / f'passlog_{uuid.uuid4()}')
+        
+        try:
+            # PASS 1: Analysis pass
+            logger.info(f"Starting H.265 pass 1 (analysis) with {max_height}p scaling")
+            
+            stream = ffmpeg.input(input_path)
+            video_stream = stream.video.filter('scale', width=-2, height=f'min({max_height},ih)')
+            
+            pass1_args = {
+                'vcodec': 'libx265',
+                'b:v': f'{video_bitrate_bps}',
+                'pass': 1,
+                'passlogfile': passlog_file,
+                'preset': preset,
+                'x265-params': f'log-level=error:pass=1',
+                'f': 'null',
+                'y': None
+            }
+            
+            output1 = ffmpeg.output(video_stream, 'NUL' if os.name == 'nt' else '/dev/null', **pass1_args)
+            
+            process1 = await asyncio.create_subprocess_exec(
+                *ffmpeg.compile(output1),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            
+            stdout1, stderr1 = await process1.communicate()
+            
+            if process1.returncode != 0:
+                logger.error(f"H.265 scaled pass 1 failed: {stderr1.decode()}")
+                return False
+            
+            logger.info("H.265 scaled pass 1 completed, starting pass 2")
+            
+            # PASS 2: Final encoding
+            stream = ffmpeg.input(input_path)
+            video_stream = stream.video.filter('scale', width=-2, height=f'min({max_height},ih)')
+            audio_stream = stream.audio
+            
+            pass2_args = {
+                'vcodec': 'libx265',
+                'acodec': acodec,
+                'b:v': f'{video_bitrate_bps}',
+                'b:a': f'{audio_bitrate_kbps}k',
+                'pass': 2,
+                'passlogfile': passlog_file,
+                'preset': preset,
+                'x265-params': f'log-level=error:pass=2',
+                'tag:v': 'hvc1',
+                'y': None
+            }
+            
+            output2 = ffmpeg.output(video_stream, audio_stream, output_path, **pass2_args)
+            
+            process2 = await asyncio.create_subprocess_exec(
+                *ffmpeg.compile(output2),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            
+            stdout2, stderr2 = await process2.communicate()
+            
+            if process2.returncode == 0:
+                logger.info(f"H.265 scaled two-pass encoding completed successfully")
+                return True
+            else:
+                logger.error(f"H.265 scaled pass 2 failed: {stderr2.decode()}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Error in H.265 scaled two-pass encoding: {e}")
+            return False
+        finally:
+            # Always clean up pass log files
+            self._cleanup_passlog_files(passlog_file)
+    
+    async def _two_pass_h264_encode_scaled(self, input_path: str, output_path: str, 
+                                         video_bitrate_bps: int, audio_bitrate_kbps: int, 
+                                         acodec: str, preset: str, max_height: int) -> bool:
+        """Two-pass H.264 encoding with scaling for aggressive compression"""
+        passlog_file = str(self.temp_dir / f'passlog_{uuid.uuid4()}')
+        
+        try:
+            # PASS 1: Analysis pass
+            logger.info(f"Starting H.264 pass 1 (analysis) with {max_height}p scaling")
+            
+            stream = ffmpeg.input(input_path)
+            video_stream = stream.video.filter('scale', width=-2, height=f'min({max_height},ih)')
+            
+            pass1_args = {
+                'vcodec': 'libx264',
+                'b:v': f'{video_bitrate_bps}',
+                'pass': 1,
+                'passlogfile': passlog_file,
+                'preset': preset,
+                'f': 'null',
+                'y': None
+            }
+            
+            output1 = ffmpeg.output(video_stream, 'NUL' if os.name == 'nt' else '/dev/null', **pass1_args)
+            
+            process1 = await asyncio.create_subprocess_exec(
+                *ffmpeg.compile(output1),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            
+            stdout1, stderr1 = await process1.communicate()
+            
+            if process1.returncode != 0:
+                logger.error(f"H.264 scaled pass 1 failed: {stderr1.decode()}")
+                return False
+            
+            logger.info("H.264 scaled pass 1 completed, starting pass 2")
+            
+            # PASS 2: Final encoding
+            stream = ffmpeg.input(input_path)
+            video_stream = stream.video.filter('scale', width=-2, height=f'min({max_height},ih)')
+            audio_stream = stream.audio
+            
+            pass2_args = {
+                'vcodec': 'libx264',
+                'acodec': acodec,
+                'b:v': f'{video_bitrate_bps}',
+                'b:a': f'{audio_bitrate_kbps}k',
+                'pass': 2,
+                'passlogfile': passlog_file,
+                'preset': preset,
+                'y': None
+            }
+            
+            output2 = ffmpeg.output(video_stream, audio_stream, output_path, **pass2_args)
+            
+            process2 = await asyncio.create_subprocess_exec(
+                *ffmpeg.compile(output2),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            
+            stdout2, stderr2 = await process2.communicate()
+            
+            if process2.returncode == 0:
+                logger.info(f"H.264 scaled two-pass encoding completed successfully")
+                return True
+            else:
+                logger.error(f"H.264 scaled pass 2 failed: {stderr2.decode()}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Error in H.264 scaled two-pass encoding: {e}")
+            return False
+        finally:
+            # Always clean up pass log files
+            self._cleanup_passlog_files(passlog_file)
+    
+    def _cleanup_passlog_files(self, passlog_file: str):
+        """Clean up pass log files created during two-pass encoding"""
+        try:
+            # Common pass log file extensions
+            extensions = ['.log', '.log.mbtree', '-0.log', '-0.log.mbtree']
+            
+            for ext in extensions:
+                log_file = f"{passlog_file}{ext}"
+                if os.path.exists(log_file):
+                    os.remove(log_file)
+                    logger.debug(f"Cleaned up passlog file: {log_file}")
+                    
+        except Exception as e:
+            logger.warning(f"Error cleaning up passlog files: {e}")
+    
+    async def _try_aggressive_compression(self, file_path: str, base_bitrate: int) -> Optional[str]:
+        """Try more aggressive compression settings with two-pass encoding"""
+        try:
+            compressed_path = str(self.temp_dir / f'aggressive_{uuid.uuid4()}.mp4')
+            
+            # Get video duration for bitrate calculation
+            try:
+                probe = ffmpeg.probe(file_path)
+                duration = float(probe['format'].get('duration', 0))
+                if duration <= 0:
+                    logger.error("Invalid video duration for aggressive compression")
+                    return file_path
+            except ffmpeg.Error as e:
+                logger.error(f"Error getting video duration for aggressive compression: {e}")
+                return file_path
+            
+            # Calculate more aggressive bitrate targeting 5MB
+            target_size_mb = 5
+            target_size_bits = target_size_mb * 1024 * 1024 * 8
+            audio_bitrate_kbps = 32  # Lower audio bitrate for aggressive compression
+            audio_bitrate_bps = audio_bitrate_kbps * 1000
+            
+            # More aggressive overhead factor
+            overhead_factor = 0.90
+            available_bitrate = int((target_size_bits / duration) * overhead_factor)
+            target_video_bitrate_bps = available_bitrate - audio_bitrate_bps
+            
+            # Lower minimum bitrates for aggressive compression
+            min_video_bitrate = 60 * 1000 if base_bitrate < 200000 else 100 * 1000
+            target_video_bitrate_bps = max(target_video_bitrate_bps, min_video_bitrate)
+            
+            logger.info(f"Aggressive two-pass compression: target={target_size_mb}MB, video_bitrate={target_video_bitrate_bps//1000}kbps")
+            
+            # Try H.265 first for aggressive compression (scale to 480p max)
+            success = await self._two_pass_h265_encode_scaled(
+                file_path, compressed_path, target_video_bitrate_bps, audio_bitrate_kbps, 'libopus', 'ultrafast', 480
+            )
+            
+            if not success:
+                # Fallback to H.264
+                success = await self._two_pass_h264_encode_scaled(
+                    file_path, compressed_path, target_video_bitrate_bps, audio_bitrate_kbps, 'libopus', 'ultrafast', 480
+                )
+            
+            if success and os.path.exists(compressed_path):
+                compressed_size = os.path.getsize(compressed_path)
+                if compressed_size <= self.target_file_size:
+                    os.remove(file_path)
+                    logger.info(f"Aggressive two-pass compression successful: {compressed_size} bytes")
+                    return compressed_path
+                else:
+                    os.remove(compressed_path)
+                    logger.warning(f"Aggressive compression still too large: {compressed_size} bytes")
+            
+            return file_path
+            
+        except Exception as e:
+            logger.error(f"Aggressive compression error: {e}")
+            return file_path
     
     async def _send_video_file(self, message: discord.Message, video_path: str, original_url: str):
         """Send the video file to Discord"""
@@ -590,7 +984,7 @@ class MediaHandler(commands.Cog, name="Media"):
                 logger.error(f"Error cleaning up file {video_path}: {e}")
     
     async def _final_aggressive_compression(self, file_path: str) -> Optional[str]:
-        """Final aggressive compression attempt for oversized videos"""
+        """Final aggressive compression attempt using H.265 with maximum settings"""
         try:
             compressed_path = str(self.temp_dir / f'final_compressed_{uuid.uuid4()}.mp4')
             
@@ -617,34 +1011,86 @@ class MediaHandler(commands.Cog, name="Media"):
             target_size_bits = target_size_mb * 1024 * 1024 * 8
             target_bitrate_bps = int(target_size_bits / duration)
             
-            # Reserve minimal audio bitrate and apply overhead
-            audio_bitrate_bps = 32 * 1000  # Very low audio bitrate
+            # Reserve minimal audio bitrate and apply overhead - Opus is very efficient
+            audio_bitrate_bps = 24 * 1000  # Very low Opus bitrate (equivalent to 32kbps AAC)
             overhead_factor = 0.85  # More aggressive overhead buffer
             target_video_bitrate = int((target_bitrate_bps - audio_bitrate_bps) * overhead_factor)
             
-            # Absolute minimum video bitrate
-            target_video_bitrate = max(target_video_bitrate, 100 * 1000)  # 100kbps minimum
+            # Absolute minimum video bitrate for H.265
+            target_video_bitrate = max(target_video_bitrate, 80 * 1000)  # 80kbps minimum for H.265
             
-            logger.info(f"Final aggressive compression: target={target_size_mb}MB, video_bitrate={target_video_bitrate//1000}kbps")
+            logger.info(f"Final aggressive H.265 compression: target={target_size_mb}MB, video_bitrate={target_video_bitrate//1000}kbps")
             
-            # Very aggressive settings
+            # Very aggressive H.265 settings for maximum compression
             stream = ffmpeg.input(file_path)
             # Scale to maximum 360p and apply additional filters for size reduction
             video_stream = stream.video.filter('scale', width=-2, height='min(360,ih)').filter('fps', fps=15)
             audio_stream = stream.audio
             
-            output = ffmpeg.output(
-                video_stream,
-                audio_stream,
-                compressed_path,
-                vcodec='libx264',
-                acodec='aac',
-                video_bitrate=target_video_bitrate,
-                audio_bitrate='32k',
-                preset='veryslow',  # Better compression
-                crf=28,  # Higher CRF for more compression
-                y=None
+            # Try H.265 + Opus first (best compression)
+            success = await self._try_final_compression(
+                stream, compressed_path, target_video_bitrate,
+                vcodec='libx265', acodec='libopus'
             )
+            
+            if not success:
+                # Fallback to H.264 + Opus
+                logger.info("Final H.265 failed, trying H.264 + Opus")
+                success = await self._try_final_compression(
+                    stream, compressed_path, target_video_bitrate,
+                    vcodec='libx264', acodec='libopus'
+                )
+            
+            if not success:
+                # Final fallback to H.264 + AAC
+                logger.info("Final H.264 + Opus failed, trying H.264 + AAC")
+                success = await self._try_final_compression(
+                    stream, compressed_path, target_video_bitrate,
+                    vcodec='libx264', acodec='aac'
+                )
+            
+            if success and os.path.exists(compressed_path):
+                compressed_size = os.path.getsize(compressed_path)
+                logger.info(f"Final compression result: {compressed_size} bytes")
+                return compressed_path
+            
+            return file_path
+        
+        except Exception as e:
+            logger.error(f"Final compression error: {e}")
+            return file_path
+    
+    async def _try_final_compression(self, input_stream, output_path: str, video_bitrate: int,
+                                   vcodec: str, acodec: str) -> bool:
+        """Try final compression with specific codec settings"""
+        try:
+            # Remove existing output file if present
+            if os.path.exists(output_path):
+                os.remove(output_path)
+            
+            video_stream = input_stream.video.filter('scale', width=-2, height='min(360,ih)').filter('fps', fps=15)
+            audio_stream = input_stream.audio
+            
+            # Build output with specific codecs and aggressive settings
+            output_args = {
+                'vcodec': vcodec,
+                'acodec': acodec,
+                'video_bitrate': video_bitrate,
+                'audio_bitrate': '24k',
+                'y': None
+            }
+            
+            # Add codec-specific parameters for maximum compression
+            if vcodec == 'libx265':
+                output_args['preset'] = 'ultrafast'  # Speed over quality
+                output_args['crf'] = 32  # Higher CRF for more compression
+                output_args['x265_params'] = 'log-level=error:no-scenecut:keyint=30'
+                output_args['tag'] = 'hvc1'
+            else:  # libx264
+                output_args['preset'] = 'ultrafast'
+                output_args['crf'] = 30  # High CRF for H.264
+            
+            output = ffmpeg.output(video_stream, audio_stream, output_path, **output_args)
             
             # Run compression
             process = await asyncio.create_subprocess_exec(
@@ -655,20 +1101,16 @@ class MediaHandler(commands.Cog, name="Media"):
             
             stdout, stderr = await process.communicate()
             
-            if process.returncode != 0:
-                logger.error(f"Final compression failed: {stderr.decode()}")
-                return file_path
-            
-            if os.path.exists(compressed_path):
-                compressed_size = os.path.getsize(compressed_path)
-                logger.info(f"Final compression result: {compressed_size} bytes")
-                return compressed_path
-            
-            return file_path
-        
+            if process.returncode == 0:
+                logger.info(f"Final compression successful with {vcodec} + {acodec}")
+                return True
+            else:
+                logger.warning(f"Final compression failed with {vcodec} + {acodec}: {stderr.decode()}")
+                return False
+                
         except Exception as e:
-            logger.error(f"Final compression error: {e}")
-            return file_path
+            logger.error(f"Error in final compression with {vcodec} + {acodec}: {e}")
+            return False
     
     @commands.command(name='convert')
     async def manual_convert(self, ctx, url: str):
