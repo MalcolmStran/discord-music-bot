@@ -48,7 +48,7 @@ class MediaHandler(commands.Cog, name="Media"):
         
         # YouTube-dl options for Twitter with size limits
         self.ytdl_opts = {
-            'format': f'best[filesize<{self.max_download_size}][ext=mp4]',
+            'format': 'best[ext=mp4]/best[height<=720]/best',  # More flexible format selection
             'outtmpl': str(self.temp_dir / '%(extractor)s_%(id)s.%(ext)s'),
             'quiet': True,
             'no_warnings': True,
@@ -280,11 +280,20 @@ class MediaHandler(commands.Cog, name="Media"):
                 url = url.replace('x.com', 'twitter.com')
             
             # Create unique filename
-            unique_filename = self.temp_dir / f'twitter_{uuid.uuid4()}.mp4'
+            unique_filename = self.temp_dir / f'twitter_{uuid.uuid4()}.%(ext)s'
             
-            # Configure yt-dlp options with size limits
-            ytdl_opts = self.ytdl_opts.copy()
-            ytdl_opts['outtmpl'] = str(unique_filename)
+            # Configure yt-dlp options with more flexible format selection
+            ytdl_opts = {
+                'format': 'best[ext=mp4]/best[height<=720]/best',  # Flexible format selection
+                'outtmpl': str(unique_filename),
+                'quiet': True,
+                'no_warnings': True,
+                'max_filesize': self.max_download_size,
+                'extract_flat': False,
+                'writeinfojson': False,
+                'writesubtitles': False,
+                'writeautomaticsub': False,
+            }
             
             # Download using yt-dlp with timeout
             with yt_dlp.YoutubeDL(ytdl_opts) as ydl:
@@ -300,6 +309,12 @@ class MediaHandler(commands.Cog, name="Media"):
                     raise Exception("Timeout while checking video information")
                 
                 if not info:
+                    return None
+                
+                # Check if there are any formats available
+                formats = info.get('formats', [])
+                if not formats:
+                    logger.warning(f"No video formats found for URL: {url}")
                     return None
                 
                 # Check filesize if available
@@ -318,16 +333,21 @@ class MediaHandler(commands.Cog, name="Media"):
                 except asyncio.TimeoutError:
                     raise Exception("Download timeout - video may be too large")
             
-            # Check if file was created
-            if not unique_filename.exists():
+            # Find the downloaded file (yt-dlp might change the extension)
+            downloaded_files = list(self.temp_dir.glob(f'twitter_{unique_filename.stem}.*'))
+            if not downloaded_files:
+                logger.warning(f"No file found after download for: {url}")
                 return None
             
+            # Use the first (and should be only) downloaded file
+            actual_filename = downloaded_files[0]
+            
             # Verify downloaded file size
-            actual_size = unique_filename.stat().st_size
+            actual_size = actual_filename.stat().st_size
             logger.info(f"Twitter video downloaded: {actual_size // 1024 // 1024}MB")
             
             # Process the video file
-            return await self._process_video_file(str(unique_filename))
+            return await self._process_video_file(str(actual_filename))
         
         except yt_dlp.utils.DownloadError as e:
             if "Unsupported URL" in str(e) or "No video" in str(e):
@@ -335,12 +355,74 @@ class MediaHandler(commands.Cog, name="Media"):
                 return None
             elif "File is larger than max-filesize" in str(e):
                 raise Exception("Video exceeds maximum download size limit")
+            elif "Requested format is not available" in str(e):
+                logger.warning(f"Format not available for Twitter URL: {url}")
+                # Try with even more permissive format
+                return await self._download_twitter_video_fallback(url)
             logger.error(f"Twitter download error: {e}")
             raise e
         
         except Exception as e:
             logger.error(f"Twitter download error: {e}")
             raise e
+    
+    async def _download_twitter_video_fallback(self, url: str) -> Optional[str]:
+        """Fallback Twitter download with most permissive settings"""
+        try:
+            logger.info(f"Attempting fallback download for Twitter URL: {url}")
+            
+            # Create unique filename
+            unique_filename = self.temp_dir / f'twitter_fallback_{uuid.uuid4()}.%(ext)s'
+            
+            # Most permissive yt-dlp options
+            ytdl_opts = {
+                'format': 'worst/best',  # Accept any available format
+                'outtmpl': str(unique_filename),
+                'quiet': False,  # Enable output for debugging
+                'no_warnings': False,
+                'max_filesize': self.max_download_size,
+                'extract_flat': False,
+                'writeinfojson': False,
+                'writesubtitles': False,
+                'writeautomaticsub': False,
+                'ignoreerrors': False,
+            }
+            
+            # Download using yt-dlp with timeout
+            with yt_dlp.YoutubeDL(ytdl_opts) as ydl:
+                try:
+                    await asyncio.wait_for(
+                        asyncio.get_event_loop().run_in_executor(
+                            None, lambda: ydl.download([url])
+                        ),
+                        timeout=300  # 5 minute timeout for download
+                    )
+                except asyncio.TimeoutError:
+                    raise Exception("Fallback download timeout")
+            
+            # Find the downloaded file
+            downloaded_files = list(self.temp_dir.glob(f'twitter_fallback_{unique_filename.stem}.*'))
+            if not downloaded_files:
+                logger.warning(f"No file found after fallback download for: {url}")
+                return None
+            
+            # Use the first downloaded file
+            actual_filename = downloaded_files[0]
+            
+            # Verify file exists and has content
+            if not actual_filename.exists() or actual_filename.stat().st_size == 0:
+                logger.warning(f"Downloaded file is empty or doesn't exist: {actual_filename}")
+                return None
+            
+            actual_size = actual_filename.stat().st_size
+            logger.info(f"Twitter fallback video downloaded: {actual_size // 1024 // 1024}MB")
+            
+            # Process the video file
+            return await self._process_video_file(str(actual_filename))
+            
+        except Exception as e:
+            logger.error(f"Twitter fallback download error: {e}")
+            return None
     
     async def _process_video_file(self, file_path: str) -> Optional[str]:
         """Process video file - compress if too large"""
