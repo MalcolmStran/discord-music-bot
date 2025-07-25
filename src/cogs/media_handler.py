@@ -356,13 +356,22 @@ class MediaHandler(commands.Cog, name="Media"):
         try:
             file_size = os.path.getsize(video_path)
             
+            # If file is still too large, try one final aggressive compression
             if file_size > self.max_file_size:
-                await message.reply(
-                    f"Video is too large to upload ({file_size // 1024 // 1024}MB > 8MB limit).\n"
-                    f"Original URL: {original_url}",
-                    delete_after=30
-                )
-                return
+                logger.info(f"Video still too large ({file_size} bytes), attempting final compression")
+                final_compressed_path = await self._final_aggressive_compression(video_path)
+                
+                if final_compressed_path and final_compressed_path != video_path:
+                    # Use the newly compressed file
+                    if os.path.exists(video_path):
+                        os.remove(video_path)  # Clean up original
+                    video_path = final_compressed_path
+                    file_size = os.path.getsize(video_path)
+                
+                # If still too large after final compression, we'll try to upload anyway
+                # Discord might still accept it, or the user has Nitro
+                if file_size > self.max_file_size:
+                    logger.warning(f"Video still large after final compression: {file_size} bytes")
             
             # Create Discord file
             discord_file = discord.File(video_path)
@@ -374,10 +383,18 @@ class MediaHandler(commands.Cog, name="Media"):
         
         except discord.HTTPException as e:
             logger.error(f"Discord upload error: {e}")
-            await message.reply(
-                f"Failed to upload video: {str(e)}\nOriginal URL: {original_url}",
-                delete_after=30
-            )
+            # If upload fails due to size, provide helpful message
+            if "Request entity too large" in str(e) or "Payload Too Large" in str(e):
+                await message.reply(
+                    f"❌ Video is too large to upload even after compression ({file_size // 1024 // 1024}MB).\n"
+                    f"Discord's limit is 8MB.\n",
+                    delete_after=30
+                )
+            else:
+                await message.reply(
+                    f"Failed to upload video: {str(e)}\nOriginal URL: {original_url}",
+                    delete_after=30
+                )
         
         except Exception as e:
             logger.error(f"Error sending video file: {e}")
@@ -389,6 +406,87 @@ class MediaHandler(commands.Cog, name="Media"):
                     os.remove(video_path)
             except Exception as e:
                 logger.error(f"Error cleaning up file {video_path}: {e}")
+    
+    async def _final_aggressive_compression(self, file_path: str) -> Optional[str]:
+        """Final aggressive compression attempt for oversized videos"""
+        try:
+            compressed_path = str(self.temp_dir / f'final_compressed_{uuid.uuid4()}.mp4')
+            
+            # Get video information
+            try:
+                probe = ffmpeg.probe(file_path)
+                video_info = next((stream for stream in probe['streams'] if stream['codec_type'] == 'video'), None)
+                if not video_info:
+                    logger.error("No video stream found for final compression")
+                    return file_path
+                
+                duration = float(probe['format'].get('duration', 0))
+                if duration <= 0:
+                    logger.error("Invalid video duration for final compression")
+                    return file_path
+                
+            except ffmpeg.Error as e:
+                logger.error(f"Error probing video for final compression: {e}")
+                return file_path
+            
+            # Very aggressive settings to ensure we get under Discord's limit
+            # Target 6MB to provide safety margin
+            target_size_mb = 6
+            target_size_bits = target_size_mb * 1024 * 1024 * 8
+            target_bitrate_bps = int(target_size_bits / duration)
+            
+            # Reserve minimal audio bitrate and apply overhead
+            audio_bitrate_bps = 32 * 1000  # Very low audio bitrate
+            overhead_factor = 0.85  # More aggressive overhead buffer
+            target_video_bitrate = int((target_bitrate_bps - audio_bitrate_bps) * overhead_factor)
+            
+            # Absolute minimum video bitrate
+            target_video_bitrate = max(target_video_bitrate, 100 * 1000)  # 100kbps minimum
+            
+            logger.info(f"Final aggressive compression: target={target_size_mb}MB, video_bitrate={target_video_bitrate//1000}kbps")
+            
+            # Very aggressive settings
+            stream = ffmpeg.input(file_path)
+            # Scale to maximum 360p and apply additional filters for size reduction
+            video_stream = stream.video.filter('scale', width=-2, height='min(360,ih)').filter('fps', fps=15)
+            audio_stream = stream.audio
+            
+            output = ffmpeg.output(
+                video_stream,
+                audio_stream,
+                compressed_path,
+                vcodec='libx264',
+                acodec='aac',
+                video_bitrate=target_video_bitrate,
+                audio_bitrate='32k',
+                preset='veryslow',  # Better compression
+                crf=28,  # Higher CRF for more compression
+                y=None
+            )
+            
+            # Run compression
+            process = await asyncio.create_subprocess_exec(
+                *ffmpeg.compile(output),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            
+            stdout, stderr = await process.communicate()
+            
+            if process.returncode != 0:
+                logger.error(f"Final compression failed: {stderr.decode()}")
+                return file_path
+            
+            if os.path.exists(compressed_path):
+                compressed_size = os.path.getsize(compressed_path)
+                logger.info(f"Final compression result: {compressed_size} bytes")
+                return compressed_path
+            
+            return file_path
+        
+        except Exception as e:
+            logger.error(f"Final compression error: {e}")
+            return file_path
     
     @commands.command(name='convert')
     async def manual_convert(self, ctx, url: str):
