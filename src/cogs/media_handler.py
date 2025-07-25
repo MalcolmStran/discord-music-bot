@@ -99,15 +99,13 @@ class MediaHandler(commands.Cog, name="Media"):
                 # Send user-friendly error messages for specific cases
                 if "too large" in str(e).lower():
                     await message.reply(
-                        f"❌ Video is too large to process (max: {self.max_download_size // 1024 // 1024}MB)\n"
-                        f"Original URL: {url}",
-                        delete_after=30
+                        f"❌ Video is too large to process (max: {self.max_download_size // 1024 // 1024}MB)",
+                        delete_after=5
                     )
                 elif "timeout" in str(e).lower():
                     await message.reply(
-                        f"⏱️ Video download timed out. The video may be too large or the connection too slow.\n"
-                        f"Original URL: {url}",
-                        delete_after=30
+                        f"⏱️ Video download timed out. The video may be too large or the connection too slow.",
+                        delete_after=5
                     )
                 # For automatic link detection, don't send generic error messages
                 # Only send specific known error types to avoid spam
@@ -1062,19 +1060,19 @@ class MediaHandler(commands.Cog, name="Media"):
                 await message.reply(
                     f"❌ Video is too large to upload even after compression ({file_size // 1024 // 1024}MB).\n"
                     f"Discord's limit is 8MB.\n",
-                    delete_after=30
+                    delete_after=5
                 )
             else:
                 await message.reply(
-                    f"Failed to upload video: {str(e)}\nOriginal URL: {original_url}",
-                    delete_after=30
+                    f"Failed to upload video: {str(e)}",
+                    delete_after=5
                 )
         
         except Exception as e:
             logger.error(f"Error sending video file: {e}")
             await message.reply(
-                f"❌ Error processing video: {str(e)}\nOriginal URL: {original_url}",
-                delete_after=30
+                f"❌ Error processing video: {str(e)}",
+                delete_after=5
             )
         
         finally:
