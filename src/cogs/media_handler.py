@@ -36,6 +36,10 @@ class MediaHandler(commands.Cog, name="Media"):
         self.max_file_size = 8 * 1024 * 1024  # 8MB in bytes
         self.target_file_size = 7 * 1024 * 1024  # 7MB in bytes (target for compression)
         
+        # Download limits to prevent disk space issues
+        self.max_download_size = 500 * 1024 * 1024  # 500MB max download
+        self.min_free_space = 1024 * 1024 * 1024  # Require 1GB free space
+        
         # TikTok API configuration
         self.tiktok_api_url = "https://tiktok-download-without-watermark.p.rapidapi.com/analysis"
         self.tiktok_headers = {
@@ -43,17 +47,24 @@ class MediaHandler(commands.Cog, name="Media"):
             "x-rapidapi-key": self.rapidapi_key
         } if self.rapidapi_key else None
         
-        # YouTube-dl options for Twitter
+        # YouTube-dl options for Twitter with size limits
         self.ytdl_opts = {
-            'format': 'best[ext=mp4]',
+            'format': f'best[filesize<{self.max_download_size}][ext=mp4]',
             'outtmpl': str(self.temp_dir / '%(extractor)s_%(id)s.%(ext)s'),
             'quiet': True,
-            'no_warnings': True
+            'no_warnings': True,
+            'max_filesize': self.max_download_size,
         }
+        
+        # Cleanup old files on startup
+        asyncio.create_task(self._cleanup_old_files())
+        
+        # Start periodic cleanup task
+        asyncio.create_task(self._periodic_cleanup())
     
     @commands.Cog.listener()
     async def on_message(self, message):
-        """Auto-convert media links in messages"""
+        """Auto-convert media links in messages with improved error handling"""
         # Ignore bot messages and DMs
         if message.author.bot or not message.guild:
             return
@@ -85,8 +96,28 @@ class MediaHandler(commands.Cog, name="Media"):
             
             except Exception as e:
                 logger.error(f"Error processing URL {url}: {e}")
-                # Only send error message for explicit conversion commands
-                continue
+                
+                # Send user-friendly error messages for specific cases
+                if "too large" in str(e).lower():
+                    await message.reply(
+                        f"❌ Video is too large to process (max: {self.max_download_size // 1024 // 1024}MB)\n"
+                        f"Original URL: {url}",
+                        delete_after=30
+                    )
+                elif "disk space" in str(e).lower() or "no space left" in str(e).lower():
+                    await message.reply(
+                        f"⚠️ Insufficient storage space for video processing.\n"
+                        f"Please try again later.",
+                        delete_after=30
+                    )
+                elif "timeout" in str(e).lower():
+                    await message.reply(
+                        f"⏱️ Video download timed out. The video may be too large or the connection too slow.\n"
+                        f"Original URL: {url}",
+                        delete_after=30
+                    )
+                # For automatic link detection, don't send generic error messages
+                # Only send specific known error types to avoid spam
     
     def _is_tiktok_url(self, url: str) -> bool:
         """Check if URL is a TikTok link"""
@@ -107,14 +138,101 @@ class MediaHandler(commands.Cog, name="Media"):
         ]
         return any(re.search(pattern, url, re.IGNORECASE) for pattern in twitter_patterns)
     
+    async def _cleanup_old_files(self):
+        """Clean up old temporary files on startup"""
+        try:
+            import time
+            current_time = time.time()
+            cleaned_count = 0
+            
+            for file_path in self.temp_dir.glob('*'):
+                if file_path.is_file():
+                    # Remove files older than 1 hour
+                    if current_time - file_path.stat().st_mtime > 3600:
+                        try:
+                            file_path.unlink()
+                            cleaned_count += 1
+                        except Exception as e:
+                            logger.warning(f"Could not remove old file {file_path}: {e}")
+            
+            if cleaned_count > 0:
+                logger.info(f"Cleaned up {cleaned_count} old temporary files")
+                
+        except Exception as e:
+            logger.error(f"Error during startup cleanup: {e}")
+    
+    async def _periodic_cleanup(self):
+        """Periodically clean up temporary files"""
+        while True:
+            try:
+                await asyncio.sleep(1800)  # Clean up every 30 minutes
+                await self._cleanup_old_files()
+            except Exception as e:
+                logger.error(f"Error in periodic cleanup: {e}")
+                await asyncio.sleep(1800)  # Wait before retrying
+    
+    def _check_disk_space(self) -> bool:
+        """Check if there's enough disk space for downloads"""
+        try:
+            import shutil
+            free_space = shutil.disk_usage(self.temp_dir).free
+            
+            if free_space < self.min_free_space:
+                logger.warning(f"Low disk space: {free_space // 1024 // 1024}MB free, need {self.min_free_space // 1024 // 1024}MB")
+                return False
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error checking disk space: {e}")
+            return True  # Assume OK if we can't check
+    
+    async def _safe_download_with_cleanup(self, download_func, *args, **kwargs):
+        """Wrapper for downloads with automatic cleanup on failure"""
+        temp_files = []
+        
+        try:
+            # Check disk space before starting
+            if not self._check_disk_space():
+                raise Exception("Insufficient disk space for download")
+            
+            # Track files before download
+            existing_files = set(self.temp_dir.glob('*'))
+            
+            # Perform download
+            result = await download_func(*args, **kwargs)
+            
+            # Track new files created
+            new_files = set(self.temp_dir.glob('*')) - existing_files
+            temp_files.extend(new_files)
+            
+            return result
+            
+        except Exception as e:
+            # Clean up any files created during failed download
+            for file_path in temp_files:
+                try:
+                    if file_path.exists():
+                        file_path.unlink()
+                        logger.debug(f"Cleaned up failed download file: {file_path}")
+                except Exception as cleanup_error:
+                    logger.warning(f"Could not clean up file {file_path}: {cleanup_error}")
+            
+            # Re-raise the original exception
+            raise e
+    
     async def _download_tiktok_video(self, url: str) -> Optional[str]:
-        """Download TikTok video using RapidAPI"""
+        """Download TikTok video using RapidAPI with improved error handling"""
         if not self.rapidapi_key:
             logger.warning("No RapidAPI key provided for TikTok downloads")
             return None
-        
+
+        return await self._safe_download_with_cleanup(self._download_tiktok_video_impl, url)
+    
+    async def _download_tiktok_video_impl(self, url: str) -> Optional[str]:
+        """Implementation of TikTok video download"""
         try:
-            # Make API request
+            # Make API request with timeout
             querystring = {"url": url, "hd": "0"}
             response = requests.get(
                 self.tiktok_api_url, 
@@ -135,24 +253,54 @@ class MediaHandler(commands.Cog, name="Media"):
                 logger.error("No video URL in TikTok API response")
                 return None
             
-            # Download the video
+            # Create unique filename
             unique_filename = self.temp_dir / f'tiktok_{uuid.uuid4()}.mp4'
-            video_response = requests.get(video_url, timeout=60)
+            
+            # Download with size limit and timeout
+            video_response = requests.get(
+                video_url, 
+                timeout=120,  # 2 minute timeout
+                stream=True   # Stream to check size during download
+            )
             video_response.raise_for_status()
             
-            # Save video file
+            # Check content length if available
+            content_length = video_response.headers.get('content-length')
+            if content_length and int(content_length) > self.max_download_size:
+                raise Exception(f"Video too large: {int(content_length) // 1024 // 1024}MB (max: {self.max_download_size // 1024 // 1024}MB)")
+            
+            # Download with size checking
+            downloaded_size = 0
             with open(unique_filename, 'wb') as f:
-                f.write(video_response.content)
+                for chunk in video_response.iter_content(chunk_size=8192):
+                    if chunk:
+                        downloaded_size += len(chunk)
+                        
+                        # Check size limit during download
+                        if downloaded_size > self.max_download_size:
+                            raise Exception(f"Download exceeded size limit: {downloaded_size // 1024 // 1024}MB")
+                        
+                        f.write(chunk)
+            
+            logger.info(f"TikTok video downloaded: {downloaded_size // 1024 // 1024}MB")
             
             # Check and compress if needed
             return await self._process_video_file(str(unique_filename))
         
+        except requests.exceptions.Timeout:
+            raise Exception("Download timeout - video may be too large")
+        except requests.exceptions.RequestException as e:
+            raise Exception(f"Network error during download: {e}")
         except Exception as e:
             logger.error(f"TikTok download error: {e}")
-            return None
+            raise e
     
     async def _download_twitter_video(self, url: str) -> Optional[str]:
-        """Download Twitter video using yt-dlp"""
+        """Download Twitter video using yt-dlp with improved error handling"""
+        return await self._safe_download_with_cleanup(self._download_twitter_video_impl, url)
+    
+    async def _download_twitter_video_impl(self, url: str) -> Optional[str]:
+        """Implementation of Twitter video download"""
         try:
             # Convert x.com to twitter.com for better compatibility
             if 'x.com' in url:
@@ -161,23 +309,49 @@ class MediaHandler(commands.Cog, name="Media"):
             # Create unique filename
             unique_filename = self.temp_dir / f'twitter_{uuid.uuid4()}.mp4'
             
-            # Configure yt-dlp options
+            # Configure yt-dlp options with size limits
             ytdl_opts = self.ytdl_opts.copy()
             ytdl_opts['outtmpl'] = str(unique_filename)
             
-            # Download using yt-dlp
+            # Download using yt-dlp with timeout
             with yt_dlp.YoutubeDL(ytdl_opts) as ydl:
-                # Extract info first to check if video exists
-                info = ydl.extract_info(url, download=False)
+                # Extract info first to check if video exists and size
+                try:
+                    info = await asyncio.wait_for(
+                        asyncio.get_event_loop().run_in_executor(
+                            None, lambda: ydl.extract_info(url, download=False)
+                        ),
+                        timeout=30  # 30 second timeout for info extraction
+                    )
+                except asyncio.TimeoutError:
+                    raise Exception("Timeout while checking video information")
+                
                 if not info:
                     return None
                 
-                # Download the video
-                ydl.download([url])
+                # Check filesize if available
+                filesize = info.get('filesize') or info.get('filesize_approx')
+                if filesize and filesize > self.max_download_size:
+                    raise Exception(f"Video too large: {filesize // 1024 // 1024}MB (max: {self.max_download_size // 1024 // 1024}MB)")
+                
+                # Download the video with timeout
+                try:
+                    await asyncio.wait_for(
+                        asyncio.get_event_loop().run_in_executor(
+                            None, lambda: ydl.download([url])
+                        ),
+                        timeout=300  # 5 minute timeout for download
+                    )
+                except asyncio.TimeoutError:
+                    raise Exception("Download timeout - video may be too large")
             
             # Check if file was created
             if not unique_filename.exists():
                 return None
+            
+            # Verify downloaded file size
+            actual_size = unique_filename.stat().st_size
+            logger.info(f"Twitter video downloaded: {actual_size // 1024 // 1024}MB")
             
             # Process the video file
             return await self._process_video_file(str(unique_filename))
@@ -186,12 +360,14 @@ class MediaHandler(commands.Cog, name="Media"):
             if "Unsupported URL" in str(e) or "No video" in str(e):
                 logger.info(f"No video found in Twitter URL: {url}")
                 return None
+            elif "File is larger than max-filesize" in str(e):
+                raise Exception("Video exceeds maximum download size limit")
             logger.error(f"Twitter download error: {e}")
-            return None
+            raise e
         
         except Exception as e:
             logger.error(f"Twitter download error: {e}")
-            return None
+            raise e
     
     async def _process_video_file(self, file_path: str) -> Optional[str]:
         """Process video file - compress if too large"""
@@ -353,6 +529,8 @@ class MediaHandler(commands.Cog, name="Media"):
     
     async def _send_video_file(self, message: discord.Message, video_path: str, original_url: str):
         """Send the video file to Discord"""
+        file_size = 0  # Initialize to prevent unbound variable error
+        
         try:
             file_size = os.path.getsize(video_path)
             
@@ -398,6 +576,10 @@ class MediaHandler(commands.Cog, name="Media"):
         
         except Exception as e:
             logger.error(f"Error sending video file: {e}")
+            await message.reply(
+                f"❌ Error processing video: {str(e)}\nOriginal URL: {original_url}",
+                delete_after=30
+            )
         
         finally:
             # Clean up the file
@@ -512,7 +694,18 @@ class MediaHandler(commands.Cog, name="Media"):
             
             except Exception as e:
                 logger.error(f"Manual conversion error: {e}")
-                await ctx.send(f"❌ Error converting video: {str(e)}")
+                
+                # Provide specific error messages for manual commands
+                if "too large" in str(e).lower():
+                    await ctx.send(f"❌ Video is too large to process (max: {self.max_download_size // 1024 // 1024}MB)")
+                elif "disk space" in str(e).lower() or "no space left" in str(e).lower():
+                    await ctx.send("⚠️ Insufficient storage space. Please try again later.")
+                elif "timeout" in str(e).lower():
+                    await ctx.send("⏱️ Download timed out. The video may be too large or slow to download.")
+                elif "network" in str(e).lower():
+                    await ctx.send("🌐 Network error. Please check the URL and try again.")
+                else:
+                    await ctx.send(f"❌ Error converting video: {str(e)}")
     
     @commands.command(name='mediainfo')
     async def media_info(self, ctx):
@@ -560,6 +753,98 @@ class MediaHandler(commands.Cog, name="Media"):
             )
         
         await ctx.send(embed=embed)
+    
+    @commands.command(name='media-cleanup')
+    @commands.has_permissions(administrator=True)
+    async def manual_cleanup(self, ctx):
+        """Manually clean up temporary media files (Admin only)"""
+        try:
+            # Get current file count and sizes
+            files_before = list(self.temp_dir.glob('*'))
+            total_size_before = sum(f.stat().st_size for f in files_before if f.is_file())
+            
+            await self._cleanup_old_files()
+            
+            # Get file count after cleanup
+            files_after = list(self.temp_dir.glob('*'))
+            total_size_after = sum(f.stat().st_size for f in files_after if f.is_file())
+            
+            files_removed = len(files_before) - len(files_after)
+            space_freed = total_size_before - total_size_after
+            
+            embed = discord.Embed(
+                title="🧹 Media Cleanup Complete",
+                color=0x00FF00
+            )
+            embed.add_field(name="Files Removed", value=str(files_removed), inline=True)
+            embed.add_field(name="Space Freed", value=f"{space_freed // 1024 // 1024}MB", inline=True)
+            embed.add_field(name="Remaining Files", value=str(len(files_after)), inline=True)
+            
+            # Check available disk space
+            import shutil
+            free_space = shutil.disk_usage(self.temp_dir).free
+            embed.add_field(name="Available Space", value=f"{free_space // 1024 // 1024 // 1024}GB", inline=True)
+            
+            await ctx.send(embed=embed)
+            
+        except Exception as e:
+            logger.error(f"Manual cleanup error: {e}")
+            await ctx.send(f"❌ Cleanup failed: {e}")
+    
+    @commands.command(name='media-status')
+    @commands.has_permissions(administrator=True)
+    async def media_status(self, ctx):
+        """Show media handler status and disk usage (Admin only)"""
+        try:
+            # Get temp directory info
+            temp_files = list(self.temp_dir.glob('*'))
+            temp_file_count = len([f for f in temp_files if f.is_file()])
+            temp_total_size = sum(f.stat().st_size for f in temp_files if f.is_file())
+            
+            # Get disk space info
+            import shutil
+            disk_usage = shutil.disk_usage(self.temp_dir)
+            
+            embed = discord.Embed(
+                title="📊 Media Handler Status",
+                color=0x3498db
+            )
+            
+            embed.add_field(
+                name="Temporary Files", 
+                value=f"{temp_file_count} files\n{temp_total_size // 1024 // 1024}MB total", 
+                inline=True
+            )
+            
+            embed.add_field(
+                name="Disk Usage", 
+                value=f"Free: {disk_usage.free // 1024 // 1024 // 1024}GB\n"
+                      f"Used: {disk_usage.used // 1024 // 1024 // 1024}GB\n"
+                      f"Total: {disk_usage.total // 1024 // 1024 // 1024}GB", 
+                inline=True
+            )
+            
+            embed.add_field(
+                name="Settings",
+                value=f"Max Download: {self.max_download_size // 1024 // 1024}MB\n"
+                      f"Target Size: {self.target_file_size // 1024 // 1024}MB\n"
+                      f"Min Free Space: {self.min_free_space // 1024 // 1024 // 1024}GB",
+                inline=True
+            )
+            
+            # Add warning if disk space is low
+            if disk_usage.free < self.min_free_space:
+                embed.add_field(
+                    name="⚠️ Warning",
+                    value="Disk space is below minimum threshold!",
+                    inline=False
+                )
+            
+            await ctx.send(embed=embed)
+            
+        except Exception as e:
+            logger.error(f"Media status error: {e}")
+            await ctx.send(f"❌ Status check failed: {e}")
     
     async def cog_unload(self):
         """Clean up when cog is unloaded"""
