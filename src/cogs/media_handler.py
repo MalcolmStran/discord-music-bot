@@ -279,8 +279,9 @@ class MediaHandler(commands.Cog, name="Media"):
             if 'x.com' in url:
                 url = url.replace('x.com', 'twitter.com')
             
-            # Create unique filename
-            unique_filename = self.temp_dir / f'twitter_{uuid.uuid4()}.%(ext)s'
+            # Create unique filename - use simpler template
+            filename_base = f'twitter_{uuid.uuid4().hex[:8]}'
+            unique_filename = self.temp_dir / f'{filename_base}.%(ext)s'
             
             # Configure yt-dlp options with more flexible format selection
             ytdl_opts = {
@@ -334,13 +335,36 @@ class MediaHandler(commands.Cog, name="Media"):
                     raise Exception("Download timeout - video may be too large")
             
             # Find the downloaded file (yt-dlp might change the extension)
-            downloaded_files = list(self.temp_dir.glob(f'twitter_{unique_filename.stem}.*'))
+            # Use a more flexible pattern to find any files created during download
+            base_pattern = filename_base  # Use the simplified base name
+            downloaded_files = list(self.temp_dir.glob(f'{base_pattern}*'))
+            
+            # If no files found with our pattern, try broader search for recent files
+            if not downloaded_files:
+                logger.debug(f"No files found with pattern '{base_pattern}*', checking all recent files")
+                import time
+                current_time = time.time()
+                # Look for any files created in the last 30 seconds
+                recent_files = [
+                    f for f in self.temp_dir.glob('*') 
+                    if f.is_file() and (current_time - f.stat().st_mtime) < 30
+                ]
+                logger.debug(f"Recent files in temp dir: {[f.name for f in recent_files]}")
+                
+                # Filter for video files
+                video_extensions = ['.mp4', '.webm', '.mkv', '.avi', '.mov']
+                downloaded_files = [
+                    f for f in recent_files 
+                    if any(f.name.lower().endswith(ext) for ext in video_extensions)
+                ]
+            
             if not downloaded_files:
                 logger.warning(f"No file found after download for: {url}")
                 return None
             
             # Use the first (and should be only) downloaded file
             actual_filename = downloaded_files[0]
+            logger.info(f"Found downloaded file: {actual_filename.name}")
             
             # Verify downloaded file size
             actual_size = actual_filename.stat().st_size
@@ -371,8 +395,9 @@ class MediaHandler(commands.Cog, name="Media"):
         try:
             logger.info(f"Attempting fallback download for Twitter URL: {url}")
             
-            # Create unique filename
-            unique_filename = self.temp_dir / f'twitter_fallback_{uuid.uuid4()}.%(ext)s'
+            # Create unique filename - use simpler template
+            filename_base = f'twitter_fallback_{uuid.uuid4().hex[:8]}'
+            unique_filename = self.temp_dir / f'{filename_base}.%(ext)s'
             
             # Most permissive yt-dlp options
             ytdl_opts = {
@@ -400,14 +425,36 @@ class MediaHandler(commands.Cog, name="Media"):
                 except asyncio.TimeoutError:
                     raise Exception("Fallback download timeout")
             
-            # Find the downloaded file
-            downloaded_files = list(self.temp_dir.glob(f'twitter_fallback_{unique_filename.stem}.*'))
+            # Find the downloaded file with improved detection
+            base_pattern = filename_base  # Use the simplified base name
+            downloaded_files = list(self.temp_dir.glob(f'{base_pattern}*'))
+            
+            # If no files found with our pattern, try broader search for recent files
+            if not downloaded_files:
+                logger.debug(f"Fallback: No files found with pattern '{base_pattern}*', checking all recent files")
+                import time
+                current_time = time.time()
+                # Look for any files created in the last 30 seconds
+                recent_files = [
+                    f for f in self.temp_dir.glob('*') 
+                    if f.is_file() and (current_time - f.stat().st_mtime) < 30
+                ]
+                logger.debug(f"Fallback recent files: {[f.name for f in recent_files]}")
+                
+                # Filter for video files
+                video_extensions = ['.mp4', '.webm', '.mkv', '.avi', '.mov']
+                downloaded_files = [
+                    f for f in recent_files 
+                    if any(f.name.lower().endswith(ext) for ext in video_extensions)
+                ]
+            
             if not downloaded_files:
                 logger.warning(f"No file found after fallback download for: {url}")
                 return None
             
             # Use the first downloaded file
             actual_filename = downloaded_files[0]
+            logger.info(f"Fallback found downloaded file: {actual_filename.name}")
             
             # Verify file exists and has content
             if not actual_filename.exists() or actual_filename.stat().st_size == 0:
