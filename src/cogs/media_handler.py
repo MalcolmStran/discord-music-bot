@@ -36,9 +36,8 @@ class MediaHandler(commands.Cog, name="Media"):
         self.max_file_size = 8 * 1024 * 1024  # 8MB in bytes
         self.target_file_size = 7 * 1024 * 1024  # 7MB in bytes (target for compression)
         
-        # Download limits to prevent disk space issues
+        # Download limits to prevent issues
         self.max_download_size = 500 * 1024 * 1024  # 500MB max download
-        self.min_free_space = 1024 * 1024 * 1024  # Require 1GB free space
         
         # TikTok API configuration
         self.tiktok_api_url = "https://tiktok-download-without-watermark.p.rapidapi.com/analysis"
@@ -104,12 +103,6 @@ class MediaHandler(commands.Cog, name="Media"):
                         f"Original URL: {url}",
                         delete_after=30
                     )
-                elif "disk space" in str(e).lower() or "no space left" in str(e).lower():
-                    await message.reply(
-                        f"⚠️ Insufficient storage space for video processing.\n"
-                        f"Please try again later.",
-                        delete_after=30
-                    )
                 elif "timeout" in str(e).lower():
                     await message.reply(
                         f"⏱️ Video download timed out. The video may be too large or the connection too slow.\n"
@@ -171,31 +164,11 @@ class MediaHandler(commands.Cog, name="Media"):
                 logger.error(f"Error in periodic cleanup: {e}")
                 await asyncio.sleep(1800)  # Wait before retrying
     
-    def _check_disk_space(self) -> bool:
-        """Check if there's enough disk space for downloads"""
-        try:
-            import shutil
-            free_space = shutil.disk_usage(self.temp_dir).free
-            
-            if free_space < self.min_free_space:
-                logger.warning(f"Low disk space: {free_space // 1024 // 1024}MB free, need {self.min_free_space // 1024 // 1024}MB")
-                return False
-            
-            return True
-            
-        except Exception as e:
-            logger.error(f"Error checking disk space: {e}")
-            return True  # Assume OK if we can't check
-    
     async def _safe_download_with_cleanup(self, download_func, *args, **kwargs):
         """Wrapper for downloads with automatic cleanup on failure"""
         temp_files = []
         
         try:
-            # Check disk space before starting
-            if not self._check_disk_space():
-                raise Exception("Insufficient disk space for download")
-            
             # Track files before download
             existing_files = set(self.temp_dir.glob('*'))
             
@@ -1140,8 +1113,6 @@ class MediaHandler(commands.Cog, name="Media"):
                 # Provide specific error messages for manual commands
                 if "too large" in str(e).lower():
                     await ctx.send(f"❌ Video is too large to process (max: {self.max_download_size // 1024 // 1024}MB)")
-                elif "disk space" in str(e).lower() or "no space left" in str(e).lower():
-                    await ctx.send("⚠️ Insufficient storage space. Please try again later.")
                 elif "timeout" in str(e).lower():
                     await ctx.send("⏱️ Download timed out. The video may be too large or slow to download.")
                 elif "network" in str(e).lower():
@@ -1269,18 +1240,9 @@ class MediaHandler(commands.Cog, name="Media"):
             embed.add_field(
                 name="Settings",
                 value=f"Max Download: {self.max_download_size // 1024 // 1024}MB\n"
-                      f"Target Size: {self.target_file_size // 1024 // 1024}MB\n"
-                      f"Min Free Space: {self.min_free_space // 1024 // 1024 // 1024}GB",
+                      f"Target Size: {self.target_file_size // 1024 // 1024}MB",
                 inline=True
             )
-            
-            # Add warning if disk space is low
-            if disk_usage.free < self.min_free_space:
-                embed.add_field(
-                    name="⚠️ Warning",
-                    value="Disk space is below minimum threshold!",
-                    inline=False
-                )
             
             await ctx.send(embed=embed)
             
