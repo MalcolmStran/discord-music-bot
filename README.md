@@ -257,7 +257,27 @@ This project is open source. Feel free to modify and distribute according to you
 
 ## Credits
 
-- Built with [discord.py](https://discordpy.readthedocs.io/)
-- Uses [yt-dlp](https://github.com/yt-dlp/yt-dlp) for video downloading
-- TikTok support via RapidAPI
-- Audio processing with FFmpeg
+### Core Technologies
+- **[discord.py](https://discordpy.readthedocs.io/)** - Python library for Discord API integration
+- **[Python](https://www.python.org/)** - Programming language and runtime environment
+- **[FFmpeg](https://ffmpeg.org/)** - Multimedia framework for audio/video processing
+
+### Media Processing Libraries
+- **[yt-dlp](https://github.com/yt-dlp/yt-dlp)** - YouTube and media downloader (fork of youtube-dl)
+- **[PyNaCl](https://github.com/pyca/pynacl)** - Cryptographic library for Discord voice encryption
+- **[python-dotenv](https://github.com/theskumar/python-dotenv)** - Environment variable management
+
+### External APIs
+- **[RapidAPI](https://rapidapi.com/)** - TikTok Download Without Watermark API
+- **[Discord API](https://discord.com/developers/docs)** - Bot integration and voice services
+
+### Development Tools
+- **[asyncio](https://docs.python.org/3/library/asyncio.html)** - Asynchronous programming support
+- **[logging](https://docs.python.org/3/library/logging.html)** - Python's built-in logging framework
+- **[pathlib](https://docs.python.org/3/library/pathlib.html)** - Object-oriented filesystem paths
+- **[tempfile](https://docs.python.org/3/library/tempfile.html)** - Temporary file and directory creation
+
+### Special Thanks
+- **YouTube-DL project** - Original inspiration for media downloading capabilities
+- **Discord.py community** - Documentation, examples, and community support
+- **FFmpeg developers** - Robust multimedia processing foundation
