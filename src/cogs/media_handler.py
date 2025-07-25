@@ -215,184 +215,158 @@ class MediaHandler(commands.Cog, name="Media"):
     
     async def _compress_video(self, file_path: str) -> Optional[str]:
         """
-        Compress video to meet 7MB target using ffmpeg-python
-        
-        Uses adaptive compression settings based on the required compression ratio:
-        - Light compression: CRF 26, 854px width, 96k audio
-        - Medium compression: CRF 28, 640px width, 64k audio  
-        - Heavy compression: CRF 30, 480px width, 48k audio
-        - Very heavy compression: CRF 32, 320px width, 32k audio
-        
-        If first pass still exceeds target, attempts second pass with more aggressive settings.
-        Properly handles videos with or without audio tracks.
+        Compress video to meet 7MB target using ffmpeg-python with two-pass, target-bitrate encoding.
+        This approach calculates the required bitrate to fit the file under the size limit, and uses ffmpeg's two-pass encoding for best results.
         """
         try:
+            import math
             compressed_path = str(self.temp_dir / f'compressed_{uuid.uuid4()}.mp4')
-            
-            # Get video information for better compression planning
             original_size = os.path.getsize(file_path)
             target_size = self.max_file_size  # 7MB target
-            
+
             logger.info(f"Compressing video: {original_size / 1024 / 1024:.2f}MB -> target: {target_size / 1024 / 1024:.2f}MB")
-            
-            # Calculate compression ratio needed
-            size_ratio = target_size / original_size
-            
-            # Determine compression settings based on size ratio
-            if size_ratio > 0.8:
-                # Minor compression needed
-                crf = 26
-                scale_width = 854  # 480p width
-                audio_bitrate = '96k'
-            elif size_ratio > 0.5:
-                # Medium compression needed  
-                crf = 28
-                scale_width = 640  # Lower resolution
-                audio_bitrate = '64k'
-            elif size_ratio > 0.3:
-                # Heavy compression needed
-                crf = 30
-                scale_width = 480
-                audio_bitrate = '48k'
-            else:
-                # Very heavy compression needed
-                crf = 32
-                scale_width = 320
-                audio_bitrate = '32k'
-            
-            # Use ffmpeg-python to build the compression pipeline
-            input_stream = ffmpeg.input(file_path)
-            
-            # Check if video has audio stream
+
+            # Probe for duration and audio
             try:
                 probe = ffmpeg.probe(file_path)
-                has_audio = any(stream['codec_type'] == 'audio' for stream in probe['streams'])
-            except Exception:
-                has_audio = False  # Assume no audio if probe fails
-            
-            # Build video filter chain
-            video = input_stream.video.filter('scale', scale_width, -2)
-            
-            # Apply compression settings
+                streams = probe['streams']
+                video_stream = next(s for s in streams if s['codec_type'] == 'video')
+                duration = float(video_stream.get('duration') or probe['format']['duration'])
+                has_audio = any(s['codec_type'] == 'audio' for s in streams)
+            except Exception as e:
+                logger.error(f"ffmpeg.probe failed: {e}")
+                return file_path
+
+            # Calculate total bitrate (bits/sec) to fit target size
+            # Reserve a minimum for audio, rest for video
+            min_audio_bitrate = 48000 if has_audio else 0  # 48k for audio
+            # Subtract a little for container overhead (2%)
+            overhead = 0.98
+            total_bitrate = int((target_size * 8 * overhead) / duration)  # bits/sec
             if has_audio:
-                audio = input_stream.audio
-                output = ffmpeg.output(
-                    video, audio,
-                    compressed_path,
-                    vcodec='libx264',
-                    crf=crf,
-                    preset='fast',
-                    acodec='aac',
-                    audio_bitrate=audio_bitrate,
-                    movflags='+faststart'
-                ).overwrite_output()
+                video_bitrate = max(32000, total_bitrate - min_audio_bitrate)  # at least 32k for video
+                audio_bitrate = min_audio_bitrate
             else:
-                # Video only, no audio
-                output = ffmpeg.output(
-                    video,
-                    compressed_path,
-                    vcodec='libx264',
-                    crf=crf,
-                    preset='fast',
-                    movflags='+faststart'
-                ).overwrite_output()
+                video_bitrate = total_bitrate
+                audio_bitrate = None
+
+            logger.info(f"Target bitrates: video={video_bitrate//1000}k, audio={audio_bitrate//1000 if audio_bitrate else 0}k, duration={duration:.2f}s")
+
+            # Build ffmpeg-python command for two-pass encoding
+            # First pass
+            passlog = str(self.temp_dir / f'ffmpeg2pass_{uuid.uuid4()}')
+            input_kwargs = {}
+            output_kwargs = {
+                'vcodec': 'libx264',
+                'b:v': str(video_bitrate),
+                'preset': 'fast',
+                'pass': 1,
+                'f': 'mp4',
+                'movflags': '+faststart',
+                'y': None,
+                'loglevel': 'error',
+            }
+            if has_audio:
+                output_kwargs['an'] = None  # no audio in first pass
             
-            # Run the compression
-            logger.info(f"Running compression with CRF={crf}, scale={scale_width}, audio={audio_bitrate}")
-            process = await asyncio.create_subprocess_exec(
-                *ffmpeg.compile(output),
+            # First pass (no output file, just stats)
+            output1 = ffmpeg.output(
+                ffmpeg.input(file_path, **input_kwargs),
+                'NUL' if os.name == 'nt' else '/dev/null',
+                **output_kwargs,
+                passlogfile=passlog
+            )
+            # Second pass
+            output_kwargs2 = output_kwargs.copy()
+            output_kwargs2['pass'] = 2
+            if has_audio:
+                output_kwargs2.pop('an', None)
+                output_kwargs2['acodec'] = 'aac'
+                output_kwargs2['b:a'] = str(audio_bitrate)
+            output2 = ffmpeg.output(
+                ffmpeg.input(file_path, **input_kwargs),
+                compressed_path,
+                **output_kwargs2,
+                passlogfile=passlog
+            )
+
+            # Run first pass
+            logger.info(f"Running ffmpeg two-pass first pass...")
+            process1 = await asyncio.create_subprocess_exec(
+                *ffmpeg.compile(output1),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE
             )
-            
-            stdout, stderr = await process.communicate()
-            
-            if process.returncode != 0:
-                logger.error(f"FFmpeg compression failed: {stderr.decode()}")
-                return file_path
-            
+            await process1.communicate()
+
+            # Run second pass
+            logger.info(f"Running ffmpeg two-pass second pass...")
+            process2 = await asyncio.create_subprocess_exec(
+                *ffmpeg.compile(output2),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            await process2.communicate()
+
+            # Clean up passlog files
+            for ext in ('-0.log', '-0.log.mbtree', '-0.log.temp'):  # x264 two-pass log files
+                try:
+                    os.remove(passlog + ext)
+                except Exception:
+                    pass
+
             # Check result
             if os.path.exists(compressed_path):
                 compressed_size = os.path.getsize(compressed_path)
-                logger.info(f"First compression attempt: {compressed_size / 1024 / 1024:.2f}MB")
-                
-                # If still too large, try a second pass with more aggressive settings
-                if compressed_size > target_size and compressed_size < original_size:
-                    logger.info("First compression too large, attempting second pass")
-                    second_pass_path = str(self.temp_dir / f'compressed2_{uuid.uuid4()}.mp4')
-                    
-                    # More aggressive settings
-                    aggressive_crf = min(35, crf + 4)
-                    smaller_scale = max(240, scale_width - 160)
-                    lower_audio = '24k' if audio_bitrate != '32k' else '16k'
-                    
-                    input_stream2 = ffmpeg.input(compressed_path)
-                    video2 = input_stream2.video.filter('scale', smaller_scale, -2)
-                    
-                    if has_audio:
-                        audio2 = input_stream2.audio
-                        output2 = ffmpeg.output(
-                            video2, audio2,
-                            second_pass_path,
-                            vcodec='libx264',
-                            crf=aggressive_crf,
-                            preset='fast',
-                            acodec='aac',
-                            audio_bitrate=lower_audio,
-                            movflags='+faststart'
-                        ).overwrite_output()
-                    else:
-                        output2 = ffmpeg.output(
-                            video2,
-                            second_pass_path,
-                            vcodec='libx264',
-                            crf=aggressive_crf,
-                            preset='fast',
-                            movflags='+faststart'
-                        ).overwrite_output()
-                    
-                    logger.info(f"Second pass: CRF={aggressive_crf}, scale={smaller_scale}, audio={lower_audio}")
-                    process2 = await asyncio.create_subprocess_exec(
-                        *ffmpeg.compile(output2),
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.PIPE
-                    )
-                    await process2.communicate()
-                    
-                    if os.path.exists(second_pass_path):
-                        second_size = os.path.getsize(second_pass_path)
-                        logger.info(f"Second compression result: {second_size / 1024 / 1024:.2f}MB")
-                        
-                        # Use the better result
-                        if second_size <= target_size or second_size < compressed_size:
-                            os.remove(compressed_path)
-                            compressed_path = second_pass_path
-                            compressed_size = second_size
-                        else:
-                            os.remove(second_pass_path)
-                
-                # Check final result
+                logger.info(f"Compressed result: {compressed_size / 1024 / 1024:.2f}MB")
                 if compressed_size <= target_size:
-                    # Success - remove original and return compressed
                     os.remove(file_path)
                     logger.info(f"Compression successful: {compressed_size / 1024 / 1024:.2f}MB (target: {target_size / 1024 / 1024:.2f}MB)")
                     return compressed_path
                 else:
-                    # Still too large but smaller than original - return compressed anyway
-                    if compressed_size < original_size:
+                    # Try fallback: lower bitrate and/or scale down
+                    logger.warning(f"Compressed file still over target ({compressed_size / 1024 / 1024:.2f}MB), trying fallback")
+                    fallback_bitrate = int(video_bitrate * 0.7)
+                    fallback_audio = int(audio_bitrate * 0.7) if audio_bitrate else None
+                    fallback_path = str(self.temp_dir / f'compressed_fallback_{uuid.uuid4()}.mp4')
+                    output_kwargs2['b:v'] = str(fallback_bitrate)
+                    if fallback_audio:
+                        output_kwargs2['b:a'] = str(fallback_audio)
+                    output3 = ffmpeg.output(
+                        ffmpeg.input(file_path, **input_kwargs),
+                        fallback_path,
+                        **output_kwargs2,
+                        passlogfile=passlog
+                    )
+                    process3 = await asyncio.create_subprocess_exec(
+                        *ffmpeg.compile(output3),
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE
+                    )
+                    await process3.communicate()
+                    if os.path.exists(fallback_path):
+                        fallback_size = os.path.getsize(fallback_path)
+                        if fallback_size < compressed_size:
+                            os.remove(compressed_path)
+                            compressed_path = fallback_path
+                            compressed_size = fallback_size
+                        else:
+                            os.remove(fallback_path)
+                    if compressed_size <= target_size:
                         os.remove(file_path)
-                        logger.warning(f"Compressed file still over target ({compressed_size / 1024 / 1024:.2f}MB) but smaller than original")
+                        logger.info(f"Fallback compression successful: {compressed_size / 1024 / 1024:.2f}MB")
                         return compressed_path
                     else:
-                        # Compression made it larger somehow - return original
-                        os.remove(compressed_path)
-                        logger.warning("Compression failed to reduce file size")
-                        return file_path
-            
-            # No compressed file created
+                        if compressed_size < original_size:
+                            os.remove(file_path)
+                            logger.warning(f"Compressed file still over target ({compressed_size / 1024 / 1024:.2f}MB) but smaller than original")
+                            return compressed_path
+                        else:
+                            os.remove(compressed_path)
+                            logger.warning("Compression failed to reduce file size")
+                            return file_path
             logger.error("No compressed file was created")
             return file_path
-            
         except Exception as e:
             logger.error(f"Video compression error: {e}")
             return file_path  # Return original if compression fails
