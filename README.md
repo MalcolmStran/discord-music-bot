@@ -63,15 +63,28 @@ cp .env.example .env
 Edit `.env`:
 ```env
 # Required
-DISCORD_TOKEN=your_discord_bot_token_here
+DISCORD_TOKEN=your_discord_token_here
 
 # Optional - for TikTok support
 RAPIDAPI_KEY=your_rapidapi_key_here
 
-# Optional settings
+# Voice Connection Settings
+VOICE_CONNECTION_TIMEOUT=35
+VOICE_RECONNECT_ATTEMPTS=3
+VOICE_RETRY_DELAY=2
+VOICE_AUTO_DISCONNECT_TIMEOUT=300
+
+# Music Settings
 MAX_QUEUE_SIZE=20
 MAX_SONG_DURATION=7200
+DEFAULT_VOLUME=0.5
+
+# Bot Settings
+COMMAND_PREFIX=!
 DOWNLOAD_DIR=./downloads
+
+# Logging
+LOG_LEVEL=INFO
 ```
 
 ### 4. Run the Bot
@@ -176,9 +189,16 @@ discordbot/
 ### Environment Variables
 - `DISCORD_TOKEN` - Your Discord bot token (required)
 - `RAPIDAPI_KEY` - RapidAPI key for TikTok support (optional)
+- `VOICE_CONNECTION_TIMEOUT` - How long to wait for voice connection in seconds (default: 35)
+- `VOICE_RECONNECT_ATTEMPTS` - Number of retry attempts for voice connections (default: 3)
+- `VOICE_RETRY_DELAY` - Initial delay between retries in seconds (default: 2)
+- `VOICE_AUTO_DISCONNECT_TIMEOUT` - Auto-disconnect timeout in seconds (default: 300)
 - `MAX_QUEUE_SIZE` - Maximum songs in queue (default: 20)
 - `MAX_SONG_DURATION` - Maximum song length in seconds (default: 7200)
+- `DEFAULT_VOLUME` - Default volume level 0.0-1.0 (default: 0.5)
+- `COMMAND_PREFIX` - Bot command prefix (default: !)
 - `DOWNLOAD_DIR` - Directory for temporary downloads (default: ./downloads)
+- `LOG_LEVEL` - Logging level: DEBUG, INFO, WARNING, ERROR (default: INFO)
 
 ### FFmpeg Requirements
 The bot requires FFmpeg for audio processing. Make sure it's installed and available in your system PATH.
@@ -221,11 +241,14 @@ The bot requires FFmpeg for audio processing. Make sure it's installed and avail
 - **Better error handling**: More informative error messages for connection issues
 
 ### Configuration Options
-You can customize voice connection behavior in your `.env` file:
+All voice connection and bot behavior can be customized in your `.env` file. The available options are:
 - `VOICE_CONNECTION_TIMEOUT`: How long to wait for voice connection (default: 35 seconds)
 - `VOICE_RECONNECT_ATTEMPTS`: Number of retry attempts (default: 3)
 - `VOICE_RETRY_DELAY`: Initial delay between retries (default: 2 seconds)
 - `VOICE_AUTO_DISCONNECT_TIMEOUT`: Auto-disconnect timeout (default: 300 seconds)
+- `DEFAULT_VOLUME`: Default playback volume 0.0-1.0 (default: 0.5)
+- `COMMAND_PREFIX`: Bot command prefix (default: !)
+- `LOG_LEVEL`: Logging verbosity level (default: INFO)
 
 ### Logging
 The bot logs to both console and `bot.log` file. Check the logs for detailed error information.
