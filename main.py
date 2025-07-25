@@ -89,10 +89,27 @@ class MusicBot(commands.Bot):
                 # Type cast to access the player attribute safely
                 player = getattr(music_cog, 'player', None)
                 if player:
+                    # Force cleanup without attempting graceful disconnect
                     player.voice_client = None
                     player.is_playing = False
                     player.is_paused = False
-                    player.current_song = None
+                    # Don't clear current_song in case we want to retry
+                    logger.info("Cleared player state after voice disconnect")
+        
+        # If bot was moved between channels
+        elif (member == self.user and 
+              before.channel is not None and 
+              after.channel is not None and 
+              before.channel != after.channel):
+            logger.info(f"Bot moved from {before.channel.name} to {after.channel.name}")
+            
+            # Update player's voice client channel reference
+            music_cog = self.get_cog('Music')
+            if music_cog and hasattr(music_cog, 'player'):
+                player = getattr(music_cog, 'player', None)
+                if player and player.voice_client:
+                    # The voice client should automatically handle the move
+                    logger.info("Voice client channel updated after move")
     
     async def on_command_error(self, ctx, error):
         """Global error handler"""

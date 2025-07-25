@@ -197,22 +197,35 @@ class MusicCog(commands.Cog, name="Music"):
             await progress_msg.edit(content=f"❌ Error processing playlist: {str(e)}")
     
     async def _ensure_voice_connection(self, ctx) -> bool:
-        """Ensure bot is connected to a voice channel"""
+        """Ensure bot is connected to a voice channel with better error handling"""
         if not ctx.author.voice:
             await ctx.send("You need to join a voice channel first!")
             return False
         
+        target_channel = ctx.author.voice.channel
+        
         if not self.player.is_connected:
-            success = await self.player.connect(ctx.author.voice.channel)
+            await ctx.send("🔗 Connecting to voice channel...")
+            success = await self.player.connect(target_channel)
             if not success:
-                await ctx.send("Could not connect to voice channel! Please try again.")
+                await ctx.send("❌ Could not connect to voice channel! This might be due to:")
+                await ctx.send("• Discord voice server issues\n• Bot permissions\n• Network connectivity")
+                await ctx.send("Please try again in a few moments.")
                 return False
+            await ctx.send(f"✅ Connected to **{target_channel.name}**")
         else:
             # Ensure we're still properly connected
-            success = await self.player.ensure_connection(ctx.author.voice.channel)
+            success = await self.player.ensure_connection(target_channel)
             if not success:
-                await ctx.send("Lost voice connection! Trying to reconnect...")
-                return False
+                await ctx.send("❌ Lost voice connection! Attempting to reconnect...")
+                # Clear the connection and try again
+                await self.player.disconnect(force_cleanup=True)
+                await asyncio.sleep(2)
+                success = await self.player.connect(target_channel)
+                if not success:
+                    await ctx.send("❌ Failed to reconnect. Please try the command again.")
+                    return False
+                await ctx.send(f"✅ Reconnected to **{target_channel.name}**")
         
         return True
     
@@ -561,6 +574,85 @@ class MusicCog(commands.Cog, name="Music"):
         await self.player.disconnect()
         self.queue.clear()
         await ctx.send("👋 Disconnected!")
+    
+    @commands.command(name='voice-debug', aliases=['vdebug'])
+    @commands.has_permissions(administrator=True)
+    async def voice_debug(self, ctx):
+        """Debug voice connection issues (Admin only)"""
+        embed = discord.Embed(title="🔧 Voice Connection Debug", color=0x3498db)
+        
+        # Check user voice state
+        if ctx.author.voice:
+            embed.add_field(
+                name="User Voice Channel", 
+                value=f"✅ {ctx.author.voice.channel.name}", 
+                inline=False
+            )
+        else:
+            embed.add_field(
+                name="User Voice Channel", 
+                value="❌ Not in voice channel", 
+                inline=False
+            )
+        
+        # Check bot voice state
+        bot_voice = ctx.guild.voice_client
+        if bot_voice:
+            embed.add_field(
+                name="Bot Voice Client", 
+                value=f"✅ Connected to {bot_voice.channel.name}", 
+                inline=False
+            )
+            embed.add_field(
+                name="Voice Client State", 
+                value=f"Connected: {bot_voice.is_connected()}\nPlaying: {bot_voice.is_playing()}\nPaused: {bot_voice.is_paused()}", 
+                inline=False
+            )
+        else:
+            embed.add_field(
+                name="Bot Voice Client", 
+                value="❌ Not connected", 
+                inline=False
+            )
+        
+        # Check player state
+        player_status = self.player.get_status()
+        embed.add_field(
+            name="Player State", 
+            value=f"Connected: {player_status['is_connected']}\nPlaying: {player_status['is_playing']}\nChannel: {player_status['channel'] or 'None'}", 
+            inline=False
+        )
+        
+        # Check bot permissions
+        if ctx.author.voice and ctx.author.voice.channel:
+            perms = ctx.author.voice.channel.permissions_for(ctx.guild.me)
+            embed.add_field(
+                name="Bot Permissions", 
+                value=f"Connect: {'✅' if perms.connect else '❌'}\nSpeak: {'✅' if perms.speak else '❌'}\nUse VAD: {'✅' if perms.use_voice_activation else '❌'}", 
+                inline=False
+            )
+        
+        await ctx.send(embed=embed)
+    
+    @commands.command(name='force-reconnect', aliases=['freconnect'])
+    @commands.has_permissions(administrator=True)
+    async def force_reconnect(self, ctx):
+        """Force a voice reconnection (Admin only)"""
+        if not ctx.author.voice:
+            return await ctx.send("❌ You need to be in a voice channel!")
+        
+        await ctx.send("🔄 Forcing voice reconnection...")
+        
+        # Force disconnect first
+        await self.player.disconnect(force_cleanup=True)
+        await asyncio.sleep(3)
+        
+        # Try to reconnect
+        success = await self.player.connect(ctx.author.voice.channel)
+        if success:
+            await ctx.send("✅ Successfully reconnected!")
+        else:
+            await ctx.send("❌ Failed to reconnect. Check the logs for details.")
 
 async def setup(bot):
     await bot.add_cog(MusicCog(bot))

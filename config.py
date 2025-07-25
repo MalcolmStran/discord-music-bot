@@ -7,10 +7,11 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # Voice connection settings
-VOICE_CONNECTION_TIMEOUT = int(os.getenv('VOICE_CONNECTION_TIMEOUT', 35))
-VOICE_RECONNECT_ATTEMPTS = int(os.getenv('VOICE_RECONNECT_ATTEMPTS', 3))
-VOICE_RETRY_DELAY = int(os.getenv('VOICE_RETRY_DELAY', 2))
+VOICE_CONNECTION_TIMEOUT = int(os.getenv('VOICE_CONNECTION_TIMEOUT', 20))  # Reduced timeout
+VOICE_RECONNECT_ATTEMPTS = int(os.getenv('VOICE_RECONNECT_ATTEMPTS', 5))  # Increased attempts
+VOICE_RETRY_DELAY = int(os.getenv('VOICE_RETRY_DELAY', 3))  # Increased delay
 VOICE_AUTO_DISCONNECT_TIMEOUT = int(os.getenv('VOICE_AUTO_DISCONNECT_TIMEOUT', 300))
+VOICE_SESSION_TIMEOUT = int(os.getenv('VOICE_SESSION_TIMEOUT', 45))  # New session timeout
 
 # Music settings
 MAX_QUEUE_SIZE = int(os.getenv('MAX_QUEUE_SIZE', 20))

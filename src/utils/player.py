@@ -79,50 +79,93 @@ class Player:
                 # Clean up any existing connection first
                 if self.voice_client:
                     try:
-                        await self.voice_client.disconnect(force=True)
-                        await asyncio.sleep(1)  # Give time for cleanup
-                    except:
-                        pass
-                    self.voice_client = None
+                        if self.voice_client.is_connected():
+                            await self.voice_client.disconnect(force=True)
+                        await asyncio.sleep(2)  # Longer cleanup time
+                    except Exception as cleanup_error:
+                        logger.warning(f"Cleanup error: {cleanup_error}")
+                    finally:
+                        self.voice_client = None
                 
-                # Connect with timeout
+                # Add delay between attempts to avoid session conflicts
+                if attempt > 0:
+                    delay = retry_delay * (2 ** (attempt - 1))  # Exponential backoff
+                    logger.info(f"Waiting {delay} seconds before retry...")
+                    await asyncio.sleep(delay)
+                
+                logger.info(f"Attempting to connect to {channel.name} (attempt {attempt + 1}/{max_retries})")
+                
+                # Connect with timeout and better error handling
                 self.voice_client = await asyncio.wait_for(
-                    channel.connect(timeout=timeout, reconnect=True, self_deaf=True),
+                    channel.connect(
+                        timeout=timeout, 
+                        reconnect=False,  # Disable auto-reconnect to handle manually
+                        self_deaf=True
+                    ),
                     timeout=timeout + 5
                 )
                 
-                logger.info(f"Connected to voice channel: {channel.name} (attempt {attempt + 1})")
+                logger.info(f"Successfully connected to voice channel: {channel.name}")
                 self._cancel_disconnect_timer()
-                return True
+                
+                # Verify connection is actually working
+                if self.voice_client and self.voice_client.is_connected():
+                    return True
+                else:
+                    logger.warning("Connection established but not properly connected")
+                    continue
                 
             except asyncio.TimeoutError:
                 logger.warning(f"Connection timeout on attempt {attempt + 1}")
-                if attempt < max_retries - 1:
-                    await asyncio.sleep(retry_delay)
-                    retry_delay *= 2  # Exponential backoff
-                    
-            except discord.ClientException as e:
-                logger.warning(f"Discord client error on attempt {attempt + 1}: {e}")
-                if attempt < max_retries - 1:
-                    await asyncio.sleep(retry_delay)
-                    retry_delay *= 2
+                
+            except discord.errors.ClientException as e:
+                if "already connected" in str(e).lower():
+                    logger.warning("Already connected to voice - cleaning up...")
+                    # Force cleanup and retry
+                    if self.voice_client:
+                        try:
+                            await self.voice_client.disconnect(force=True)
+                            await asyncio.sleep(3)
+                        except:
+                            pass
+                        self.voice_client = None
+                elif "opus" in str(e).lower():
+                    logger.error("Opus library not loaded - voice will not work properly")
+                    return False
+                else:
+                    logger.warning(f"Discord client error on attempt {attempt + 1}: {e}")
                     
             except Exception as e:
-                logger.error(f"Failed to connect to voice channel on attempt {attempt + 1}: {e}")
-                if attempt < max_retries - 1:
-                    await asyncio.sleep(retry_delay)
-                    retry_delay *= 2
+                logger.error(f"Unexpected error on attempt {attempt + 1}: {e}")
+                # For session-related errors, wait longer before retry
+                if "4006" in str(e) or "session" in str(e).lower():
+                    logger.warning("Session error detected - waiting longer before retry")
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(10)  # Wait 10 seconds for session errors
+        
+        logger.error(f"Failed to connect after {max_retries} attempts")
+        return False
         
         logger.error(f"Failed to connect after {max_retries} attempts")
         return False
     
-    async def disconnect(self):
-        """Disconnect from voice channel"""
+    async def disconnect(self, force_cleanup=False):
+        """Disconnect from voice channel with improved cleanup"""
         if self.voice_client:
             self.stop()
             try:
+                # Stop any ongoing audio first
+                if self.voice_client.is_playing():
+                    self.voice_client.stop()
+                
+                # Disconnect with force flag
                 await self.voice_client.disconnect(force=True)
                 logger.info("Disconnected from voice channel")
+                
+                # Additional cleanup for persistent connections
+                if force_cleanup:
+                    await asyncio.sleep(2)  # Give time for cleanup
+                    
             except Exception as e:
                 logger.warning(f"Error during disconnect: {e}")
             finally:
@@ -134,18 +177,38 @@ class Player:
         self._cancel_disconnect_timer()
     
     async def ensure_connection(self, channel: discord.VoiceChannel) -> bool:
-        """Ensure we have a valid voice connection"""
+        """Ensure we have a valid voice connection with session validation"""
         if not self.is_connected:
             return await self.connect(channel)
         
         # Check if connection is still valid
         try:
+            # Test the connection by checking the channel
             if self.voice_client and self.voice_client.channel != channel:
+                logger.info(f"Moving from {self.voice_client.channel} to {channel.name}")
                 await self.voice_client.move_to(channel)
                 logger.info(f"Moved to voice channel: {channel.name}")
+            
+            # Additional validation - check if we can actually use the connection
+            if self.voice_client:
+                # Check if the voice client is still properly connected
+                if not self.voice_client.is_connected():
+                    logger.warning("Voice client reports not connected - reconnecting")
+                    return await self.connect(channel)
+                    
+        except discord.errors.ConnectionClosed as e:
+            logger.warning(f"Connection closed error (code {e.code}): {e}")
+            if e.code == 4006:  # Session no longer valid
+                logger.warning("Session invalidated - forcing reconnection")
+                await self.disconnect(force_cleanup=True)
+                await asyncio.sleep(3)  # Wait before reconnecting
+                return await self.connect(channel)
+            return await self.connect(channel)
+            
         except Exception as e:
             logger.warning(f"Connection validation failed: {e}")
-            # Try to reconnect
+            # For any other error, try to reconnect
+            await self.disconnect(force_cleanup=True)
             return await self.connect(channel)
         
         return True
@@ -175,8 +238,26 @@ class Player:
     
     @property
     def is_connected(self) -> bool:
-        """Check if connected to a voice channel"""
-        return self.voice_client is not None and self.voice_client.is_connected()
+        """Check if connected to a voice channel with additional validation"""
+        if not self.voice_client:
+            return False
+        
+        try:
+            return self.voice_client.is_connected()
+        except:
+            # If checking connection throws an error, we're not connected
+            return False
+    
+    async def handle_voice_error(self, error):
+        """Handle voice-related errors and attempt recovery"""
+        if "4006" in str(error):
+            logger.warning("Session invalidated (4006) - clearing connection state")
+            await self.disconnect(force_cleanup=True)
+        elif "ConnectionClosed" in str(error):
+            logger.warning("Connection closed - clearing connection state")
+            await self.disconnect(force_cleanup=True)
+        else:
+            logger.error(f"Unhandled voice error: {error}")
     
     @property
     def current_channel(self):
