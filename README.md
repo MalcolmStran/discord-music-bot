@@ -110,6 +110,7 @@ python main.py
 - `!stop` - Stop playback and clear queue
 - `!pause` - Pause current song
 - `!resume` - Resume paused song
+- `!repeat` - Toggle repeat mode for current song
 - `!volume <0-100>` - Set volume
 - `!queue [page]` - Show current queue
 - `!nowplaying` - Show current song info
@@ -117,6 +118,8 @@ python main.py
 - `!shuffle` - Randomize queue order
 - `!remove <position>` - Remove song from queue
 - `!disconnect` - Disconnect from voice channel
+- `!reconnect` - Manually reconnect to voice channel
+- `!status` - Check voice connection status
 
 ### Media Commands
 - `!convert <URL>` - Manually convert Twitter/TikTok URL
@@ -194,6 +197,13 @@ The bot requires FFmpeg for audio processing. Make sure it's installed and avail
 - Check if the bot has voice permissions
 - Verify you're in a voice channel
 
+**Voice connection issues (Error 4006):**
+- Use `!reconnect` command to manually reconnect
+- Check `!status` for current voice connection state
+- The bot now has improved retry logic for unstable connections
+- If issues persist, try `!disconnect` and `!play` again
+- Ensure the bot has "Connect" and "Speak" permissions in the voice channel
+
 **Media conversion doesn't work:**
 - Check internet connection
 - For TikTok: Verify RapidAPI key is correct
@@ -202,6 +212,20 @@ The bot requires FFmpeg for audio processing. Make sure it's installed and avail
 **File size errors:**
 - Videos are automatically compressed to fit Discord's 8MB limit
 - Very large videos may still fail to upload
+
+### New Voice Connection Features
+- **Automatic retry logic**: The bot will attempt to reconnect multiple times with exponential backoff
+- **Connection validation**: The bot checks connection health before playing songs
+- **Manual reconnection**: Use `!reconnect` to force a new connection
+- **Status monitoring**: Use `!status` to check voice connection health
+- **Better error handling**: More informative error messages for connection issues
+
+### Configuration Options
+You can customize voice connection behavior in your `.env` file:
+- `VOICE_CONNECTION_TIMEOUT`: How long to wait for voice connection (default: 35 seconds)
+- `VOICE_RECONNECT_ATTEMPTS`: Number of retry attempts (default: 3)
+- `VOICE_RETRY_DELAY`: Initial delay between retries (default: 2 seconds)
+- `VOICE_AUTO_DISCONNECT_TIMEOUT`: Auto-disconnect timeout (default: 300 seconds)
 
 ### Logging
 The bot logs to both console and `bot.log` file. Check the logs for detailed error information.

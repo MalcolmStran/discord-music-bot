@@ -6,6 +6,12 @@ import discord
 import logging
 import asyncio
 from typing import Optional, Dict, Any
+import sys
+import os
+
+# Add parent directory to path to import config
+sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
+import config
 
 logger = logging.getLogger(__name__)
 
@@ -14,9 +20,10 @@ class Player:
         self.voice_client: Optional[discord.VoiceClient] = None
         self.is_playing = False
         self.is_paused = False
-        self.volume = 0.5
+        self.volume = config.DEFAULT_VOLUME
         self.current_song: Optional[Dict[str, Any]] = None
         self._disconnect_timer = None
+        self.repeat_mode = False  # Add repeat mode flag
         
     def play(self, source: discord.AudioSource, after=None):
         """Play an audio source"""
@@ -55,36 +62,98 @@ class Player:
         # Volume will be applied when creating the next audio source
         logger.info(f"Volume set to {self.volume}")
     
+    def toggle_repeat(self) -> bool:
+        """Toggle repeat mode and return the new state"""
+        self.repeat_mode = not self.repeat_mode
+        logger.info(f"Repeat mode {'enabled' if self.repeat_mode else 'disabled'}")
+        return self.repeat_mode
+    
     async def connect(self, channel: discord.VoiceChannel) -> bool:
-        """Connect to a voice channel"""
-        try:
-            if self.voice_client and self.voice_client.is_connected():
-                await self.voice_client.move_to(channel)
-            else:
-                self.voice_client = await channel.connect()
-            
-            logger.info(f"Connected to voice channel: {channel.name}")
-            self._cancel_disconnect_timer()
-            return True
-        except Exception as e:
-            logger.error(f"Failed to connect to voice channel: {e}")
-            return False
+        """Connect to a voice channel with retry logic"""
+        max_retries = config.VOICE_RECONNECT_ATTEMPTS
+        retry_delay = config.VOICE_RETRY_DELAY
+        timeout = config.VOICE_CONNECTION_TIMEOUT
+        
+        for attempt in range(max_retries):
+            try:
+                # Clean up any existing connection first
+                if self.voice_client:
+                    try:
+                        await self.voice_client.disconnect(force=True)
+                        await asyncio.sleep(1)  # Give time for cleanup
+                    except:
+                        pass
+                    self.voice_client = None
+                
+                # Connect with timeout
+                self.voice_client = await asyncio.wait_for(
+                    channel.connect(timeout=timeout, reconnect=True, self_deaf=True),
+                    timeout=timeout + 5
+                )
+                
+                logger.info(f"Connected to voice channel: {channel.name} (attempt {attempt + 1})")
+                self._cancel_disconnect_timer()
+                return True
+                
+            except asyncio.TimeoutError:
+                logger.warning(f"Connection timeout on attempt {attempt + 1}")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(retry_delay)
+                    retry_delay *= 2  # Exponential backoff
+                    
+            except discord.ClientException as e:
+                logger.warning(f"Discord client error on attempt {attempt + 1}: {e}")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(retry_delay)
+                    retry_delay *= 2
+                    
+            except Exception as e:
+                logger.error(f"Failed to connect to voice channel on attempt {attempt + 1}: {e}")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(retry_delay)
+                    retry_delay *= 2
+        
+        logger.error(f"Failed to connect after {max_retries} attempts")
+        return False
     
     async def disconnect(self):
         """Disconnect from voice channel"""
         if self.voice_client:
             self.stop()
-            await self.voice_client.disconnect()
-            self.voice_client = None
-            logger.info("Disconnected from voice channel")
+            try:
+                await self.voice_client.disconnect(force=True)
+                logger.info("Disconnected from voice channel")
+            except Exception as e:
+                logger.warning(f"Error during disconnect: {e}")
+            finally:
+                self.voice_client = None
         
         self.is_playing = False
         self.is_paused = False
         self.current_song = None
         self._cancel_disconnect_timer()
     
-    def start_disconnect_timer(self, timeout: int = 300):
+    async def ensure_connection(self, channel: discord.VoiceChannel) -> bool:
+        """Ensure we have a valid voice connection"""
+        if not self.is_connected:
+            return await self.connect(channel)
+        
+        # Check if connection is still valid
+        try:
+            if self.voice_client and self.voice_client.channel != channel:
+                await self.voice_client.move_to(channel)
+                logger.info(f"Moved to voice channel: {channel.name}")
+        except Exception as e:
+            logger.warning(f"Connection validation failed: {e}")
+            # Try to reconnect
+            return await self.connect(channel)
+        
+        return True
+    
+    def start_disconnect_timer(self, timeout: Optional[int] = None):
         """Start a timer to disconnect after inactivity"""
+        if timeout is None:
+            timeout = config.VOICE_AUTO_DISCONNECT_TIMEOUT
         self._cancel_disconnect_timer()
         self._disconnect_timer = asyncio.create_task(self._disconnect_after_timeout(timeout))
     
@@ -121,6 +190,7 @@ class Player:
             'is_playing': self.is_playing,
             'is_paused': self.is_paused,
             'volume': self.volume,
+            'repeat_mode': self.repeat_mode,
             'current_song': self.current_song,
             'channel': self.current_channel.name if self.current_channel else None
         }

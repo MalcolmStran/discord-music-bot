@@ -11,6 +11,11 @@ import logging
 from pathlib import Path
 from typing import Optional
 import tempfile
+import sys
+
+# Add parent directory to path to import config
+sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
+import config
 
 from ..utils.queue import Queue
 from ..utils.player import Player
@@ -24,11 +29,11 @@ class MusicCog(commands.Cog, name="Music"):
     def __init__(self, bot):
         self.bot = bot
         self.player = Player()
-        self.queue = Queue(max_size=int(os.getenv('MAX_QUEUE_SIZE', 20)))
-        self.max_duration = int(os.getenv('MAX_SONG_DURATION', 7200))  # 2 hours
+        self.queue = Queue(max_size=config.MAX_QUEUE_SIZE)
+        self.max_duration = config.MAX_SONG_DURATION
         
         # Create downloads directory
-        self.downloads_dir = Path(os.getenv('DOWNLOAD_DIR', './downloads'))
+        self.downloads_dir = Path(config.DOWNLOAD_DIR)
         self.downloads_dir.mkdir(exist_ok=True)
     
     def cog_check(self, ctx):
@@ -200,35 +205,66 @@ class MusicCog(commands.Cog, name="Music"):
         if not self.player.is_connected:
             success = await self.player.connect(ctx.author.voice.channel)
             if not success:
-                await ctx.send("Could not connect to voice channel!")
+                await ctx.send("Could not connect to voice channel! Please try again.")
+                return False
+        else:
+            # Ensure we're still properly connected
+            success = await self.player.ensure_connection(ctx.author.voice.channel)
+            if not success:
+                await ctx.send("Lost voice connection! Trying to reconnect...")
                 return False
         
         return True
     
     async def _play_next(self, ctx):
         """Play the next song in the queue"""
-        if self.queue.is_empty():
-            self.player.is_playing = False
-            self.player.start_disconnect_timer(300)  # 5 minutes
-            return
+        # Check if we should repeat the current song
+        if self.player.repeat_mode and self.player.current_song:
+            next_song = self.player.current_song
+        else:
+            if self.queue.is_empty():
+                self.player.is_playing = False
+                self.player.start_disconnect_timer(300)  # 5 minutes
+                return
+            
+            next_song = self.queue.get_next()
+            if not next_song:
+                return
         
         # Check if still connected to voice
         if not self.player.is_connected:
             logger.error("Error playing next song: Not connected to voice.")
-            return
+            # Try to reconnect if user is still in voice
+            if ctx.author.voice:
+                logger.info("Attempting to reconnect...")
+                if not await self._ensure_voice_connection(ctx):
+                    await ctx.send("❌ Lost voice connection and couldn't reconnect!")
+                    return
+            else:
+                await ctx.send("❌ Lost voice connection - please rejoin a voice channel!")
+                return
         
         try:
-            next_song = self.queue.get_next()
-            if not next_song:
+            # Create audio source with better error handling
+            try:
+                source = await YTDLSource.regather_stream(next_song, loop=self.bot.loop, volume=self.player.volume)
+            except Exception as e:
+                logger.error(f"Failed to create audio source: {e}")
+                await ctx.send(f"❌ Failed to load: **{next_song['title']}** - Skipping...")
+                # If in repeat mode and this song failed, turn off repeat mode
+                if self.player.repeat_mode:
+                    self.player.repeat_mode = False
+                    await ctx.send("🔁 Repeat mode disabled due to playback error")
+                await self._play_next(ctx)  # Try next song
                 return
-            
-            # Create audio source
-            source = await YTDLSource.regather_stream(next_song, loop=self.bot.loop, volume=self.player.volume)
             
             # Play with callback for next song
             def after_song(error):
                 if error:
                     logger.error(f'Player error: {error}')
+                    # Don't continue playing if there was an error
+                    self.player.is_playing = False
+                    return
                 
                 # Schedule next song only if still connected
                 if self.player.is_connected:
@@ -238,8 +274,9 @@ class MusicCog(commands.Cog, name="Music"):
             self.player.play(source, after=after_song)
             
             # Send now playing message
+            title = "🔁 Repeating" if self.player.repeat_mode else "🎵 Now Playing"
             embed = discord.Embed(
-                title="🎵 Now Playing",
+                title=title,
                 description=f"**{next_song['title']}**",
                 color=0x0099FF
             )
@@ -256,6 +293,9 @@ class MusicCog(commands.Cog, name="Music"):
             if self.queue.size() > 0:
                 embed.add_field(name="Queue", value=f"{self.queue.size()} songs", inline=True)
             
+            if self.player.repeat_mode:
+                embed.add_field(name="Repeat", value="🔁 On", inline=True)
+            
             if next_song.get('thumbnail'):
                 embed.set_thumbnail(url=next_song['thumbnail'])
             
@@ -263,8 +303,10 @@ class MusicCog(commands.Cog, name="Music"):
         
         except Exception as e:
             logger.error(f"Error playing next song: {e}")
-            await ctx.send(f"Error playing song: {str(e)}")
-            await self._play_next(ctx)  # Try next song
+            await ctx.send(f"❌ Error playing song: {str(e)}")
+            # Only try next song if we still have connection
+            if self.player.is_connected:
+                await self._play_next(ctx)  # Try next song
     
     @commands.command(name='skip', aliases=['s'])
     async def skip(self, ctx):
@@ -272,13 +314,23 @@ class MusicCog(commands.Cog, name="Music"):
         if not self.player.is_playing:
             return await ctx.send("Nothing is playing!")
         
+        # Turn off repeat mode when skipping
+        was_repeating = self.player.repeat_mode
+        if was_repeating:
+            self.player.repeat_mode = False
+        
         self.player.stop()
-        await ctx.send("⏭️ Skipped!")
+        
+        if was_repeating:
+            await ctx.send("⏭️ Skipped and disabled repeat mode!")
+        else:
+            await ctx.send("⏭️ Skipped!")
     
     @commands.command(name='stop')
     async def stop(self, ctx):
         """Stop playback and clear the queue"""
         self.queue.clear()
+        self.player.repeat_mode = False  # Turn off repeat mode
         self.player.stop()
         await ctx.send("⏹️ Stopped playback and cleared queue!")
     
@@ -355,6 +407,32 @@ class MusicCog(commands.Cog, name="Music"):
         
         await ctx.send(embed=embed)
     
+    @commands.command(name='repeat', aliases=['loop'])
+    async def repeat(self, ctx):
+        """Toggle repeat mode for the current song"""
+        if not self.player.current_song:
+            return await ctx.send("No song is currently playing!")
+        
+        new_state = self.player.toggle_repeat()
+        
+        embed = discord.Embed(
+            title="🔁 Repeat Mode",
+            description=f"Repeat is now **{'ON' if new_state else 'OFF'}**",
+            color=0x00FF00 if new_state else 0xFF0000
+        )
+        
+        if new_state:
+            embed.add_field(
+                name="Current Song",
+                value=f"**{self.player.current_song['title']}**",
+                inline=False
+            )
+            embed.set_footer(text="The current song will repeat until you turn off repeat mode or skip/stop.")
+        else:
+            embed.set_footer(text="The current song will finish and continue to the next song in queue.")
+        
+        await ctx.send(embed=embed)
+    
     @commands.command(name='nowplaying', aliases=['np'])
     async def now_playing(self, ctx):
         """Show information about the current song"""
@@ -421,13 +499,58 @@ class MusicCog(commands.Cog, name="Music"):
             return await ctx.send("Queue is empty!")
         
         if index < 1 or index > self.queue.size():
-            return await ctx.send(f"Invalid position! (1-{self.queue.size()})")
+            return await ctx.send(f"Invalid position! Use a number between 1 and {self.queue.size()}")
         
-        removed_song = self.queue.remove(index - 1)
+        removed_song = self.queue.remove(index - 1)  # Convert to 0-based index
         if removed_song:
             await ctx.send(f"🗑️ Removed: **{removed_song['title']}**")
         else:
-            await ctx.send("Could not remove song!")
+            await ctx.send("Could not remove that song!")
+    
+    @commands.command(name='reconnect')
+    async def reconnect(self, ctx):
+        """Manually reconnect to voice channel"""
+        if not ctx.author.voice:
+            return await ctx.send("You need to be in a voice channel!")
+        
+        # Disconnect first
+        if self.player.is_connected:
+            await self.player.disconnect()
+            await asyncio.sleep(1)
+        
+        # Reconnect
+        success = await self.player.connect(ctx.author.voice.channel)
+        if success:
+            await ctx.send("🔄 Successfully reconnected to voice channel!")
+        else:
+            await ctx.send("❌ Failed to reconnect to voice channel!")
+    
+    @commands.command(name='status')
+    async def voice_status(self, ctx):
+        """Check voice connection status"""
+        status = self.player.get_status()
+        
+        embed = discord.Embed(
+            title="🔊 Voice Status",
+            color=0x00FF00 if status['is_connected'] else 0xFF0000
+        )
+        
+        embed.add_field(name="Connected", value="✅ Yes" if status['is_connected'] else "❌ No", inline=True)
+        embed.add_field(name="Playing", value="✅ Yes" if status['is_playing'] else "❌ No", inline=True)
+        embed.add_field(name="Paused", value="✅ Yes" if status['is_paused'] else "❌ No", inline=True)
+        embed.add_field(name="Volume", value=f"{int(status['volume'] * 100)}%", inline=True)
+        embed.add_field(name="Channel", value=status['channel'] or "None", inline=True)
+        embed.add_field(name="Queue Size", value=str(self.queue.size()), inline=True)
+        embed.add_field(name="Repeat Mode", value="🔁 On" if status['repeat_mode'] else "❌ Off", inline=True)
+        
+        if status['current_song']:
+            embed.add_field(
+                name="Current Song", 
+                value=status['current_song']['title'][:50] + "..." if len(status['current_song']['title']) > 50 else status['current_song']['title'],
+                inline=False
+            )
+        
+        await ctx.send(embed=embed)
     
     @commands.command(name='disconnect', aliases=['dc', 'leave'])
     async def disconnect(self, ctx):

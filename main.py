@@ -11,10 +11,11 @@ import logging
 import asyncio
 from pathlib import Path
 from dotenv import load_dotenv
+import config
 
 # Set up logging
 logging.basicConfig(
-    level=logging.INFO,
+    level=getattr(logging, config.LOG_LEVEL.upper()),
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
         logging.FileHandler('bot.log', encoding='utf-8'),
@@ -27,7 +28,7 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 
 # Bot configuration
-DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
+DISCORD_TOKEN = config.DISCORD_TOKEN
 if not DISCORD_TOKEN:
     raise ValueError("No Discord token found. Please set DISCORD_TOKEN in .env file")
 
@@ -35,11 +36,12 @@ if not DISCORD_TOKEN:
 intents = discord.Intents.default()
 intents.message_content = True
 intents.voice_states = True
+intents.guilds = True
 
 class MusicBot(commands.Bot):
     def __init__(self):
         super().__init__(
-            command_prefix='!',
+            command_prefix=config.COMMAND_PREFIX,
             intents=intents,
             help_command=commands.DefaultHelpCommand()
         )
@@ -74,6 +76,23 @@ class MusicBot(commands.Bot):
                 name="!help for commands"
             )
         )
+    
+    async def on_voice_state_update(self, member, before, after):
+        """Handle voice state changes"""
+        # If the bot was disconnected from voice
+        if member == self.user and before.channel is not None and after.channel is None:
+            logger.warning("Bot was disconnected from voice channel")
+            
+            # Clean up music player state
+            music_cog = self.get_cog('Music')
+            if music_cog and hasattr(music_cog, 'player'):
+                # Type cast to access the player attribute safely
+                player = getattr(music_cog, 'player', None)
+                if player:
+                    player.voice_client = None
+                    player.is_playing = False
+                    player.is_paused = False
+                    player.current_song = None
     
     async def on_command_error(self, ctx, error):
         """Global error handler"""
