@@ -17,7 +17,7 @@ A feature-rich Discord bot that can play music from YouTube and automatically co
 ### 📱 Media Conversion Features
 - Automatic Twitter/X video conversion to MP4
 - TikTok video download and conversion
-- Smart video compression for Discord's 8MB limit
+- Smart video compression for Discord's 10MB limit
 - Manual conversion command
 - Support for mobile-friendly formats
 
@@ -230,7 +230,7 @@ The bot requires FFmpeg for audio processing. Make sure it's installed and avail
 - Check bot logs for specific error messages
 
 **File size errors:**
-- Videos are automatically compressed to fit Discord's 8MB limit
+- Videos are automatically compressed to fit Discord's 10MB limit
 - Very large videos may still fail to upload
 
 ### New Voice Connection Features
