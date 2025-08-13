@@ -26,27 +26,27 @@ class MediaHandler(commands.Cog, name="Media"):
     def __init__(self, bot):
         self.bot = bot
         self.rapidapi_key = os.getenv('RAPIDAPI_KEY')
-        
+
         # Create temp directory for media files
         self.temp_dir = Path(tempfile.gettempdir()) / 'discord_bot_media'
         self.temp_dir.mkdir(exist_ok=True)
-        
-        # Discord file size limit (8MB for regular users, 50MB for Nitro)
-        # Target 7MB to provide buffer below Discord's 8MB limit
-        self.max_file_size = 8 * 1024 * 1024  # 8MB in bytes
-        self.target_file_size = 7 * 1024 * 1024  # 7MB in bytes (target for compression)
-        
+
+        # Discord file size limit (working cap 9MB; regular user limit ~8MB, higher for Nitro)
+        # Target 8MB to provide ~1MB safety buffer below cap
+        self.max_file_size = 9 * 1024 * 1024  # 9MB in bytes
+        self.target_file_size = 8 * 1024 * 1024  # 8MB in bytes (compression target)
+
         # Download limits to prevent issues
         self.max_download_size = 500 * 1024 * 1024  # 500MB max download
-        
+
         # TikTok API configuration
         self.tiktok_api_url = "https://tiktok-download-without-watermark.p.rapidapi.com/analysis"
-        self.tiktok_headers = {
+        self.tiktok_headers = ({
             "x-rapidapi-host": "tiktok-download-without-watermark.p.rapidapi.com",
             "x-rapidapi-key": self.rapidapi_key
-        } if self.rapidapi_key else None
-        
-        # YouTube-dl options for Twitter with size limits
+        } if self.rapidapi_key else None)
+
+        # yt-dlp options with size limits
         self.ytdl_opts = {
             'format': 'best[ext=mp4]/best[height<=720]/best',  # More flexible format selection
             'outtmpl': str(self.temp_dir / '%(extractor)s_%(id)s.%(ext)s'),
@@ -54,11 +54,9 @@ class MediaHandler(commands.Cog, name="Media"):
             'no_warnings': True,
             'max_filesize': self.max_download_size,
         }
-        
-        # Cleanup old files on startup
+
+        # Startup cleanup tasks
         asyncio.create_task(self._cleanup_old_files())
-        
-        # Start periodic cleanup task
         asyncio.create_task(self._periodic_cleanup())
     
     @commands.Cog.listener()
@@ -1059,7 +1057,7 @@ class MediaHandler(commands.Cog, name="Media"):
             if "Request entity too large" in str(e) or "Payload Too Large" in str(e):
                 await message.reply(
                     f"❌ Video is too large to upload even after compression ({file_size // 1024 // 1024}MB).\n"
-                    f"Discord's limit is 8MB.\n",
+                    f"Limit is 9MB (try a shorter clip).\n",
                     delete_after=5
                 )
             else:
