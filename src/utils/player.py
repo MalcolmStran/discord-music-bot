@@ -141,6 +141,14 @@ class Player:
             except asyncio.TimeoutError:
                 logger.warning(f"Connection timeout on attempt {attempt + 1} (container: {is_container})")
                 
+            except discord.errors.ConnectionClosed as e:
+                logger.warning(f"Connection closed during connect (code {e.code})")
+                if e.code == 4006:  # Session invalid
+                    session_delay = 15 if is_container else 10
+                    logger.warning(f"Session error - waiting {session_delay}s before retry")
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(session_delay)
+                
             except discord.errors.ClientException as e:
                 if "already connected" in str(e).lower():
                     logger.warning("Already connected to voice - enhanced cleanup...")
@@ -156,14 +164,6 @@ class Player:
                     return False
                 else:
                     logger.warning(f"Discord client error on attempt {attempt + 1}: {e}")
-                    
-            except discord.errors.ConnectionClosed as e:
-                logger.warning(f"Connection closed during connect (code {e.code})")
-                if e.code == 4006:  # Session invalid
-                    session_delay = 15 if is_container else 10
-                    logger.warning(f"Session error - waiting {session_delay}s before retry")
-                    if attempt < max_retries - 1:
-                        await asyncio.sleep(session_delay)
                         
             except Exception as e:
                 logger.error(f"Unexpected error on attempt {attempt + 1}: {e}")
