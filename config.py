@@ -6,9 +6,9 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# Voice connection settings (container-optimized defaults)
-VOICE_CONNECTION_TIMEOUT = int(os.getenv('VOICE_CONNECTION_TIMEOUT', 15))  # Shorter timeout for containers
-VOICE_RECONNECT_ATTEMPTS = int(os.getenv('VOICE_RECONNECT_ATTEMPTS', 8))  # More attempts for containers
+# Voice connection settings
+VOICE_CONNECTION_TIMEOUT = int(os.getenv('VOICE_CONNECTION_TIMEOUT', 20))  # Connection timeout
+VOICE_RECONNECT_ATTEMPTS = int(os.getenv('VOICE_RECONNECT_ATTEMPTS', 5))  # Retry attempts
 VOICE_RETRY_DELAY = int(os.getenv('VOICE_RETRY_DELAY', 3))  # Base retry delay
 VOICE_AUTO_DISCONNECT_TIMEOUT = int(os.getenv('VOICE_AUTO_DISCONNECT_TIMEOUT', 300))
 VOICE_SESSION_TIMEOUT = int(os.getenv('VOICE_SESSION_TIMEOUT', 45))  # Session timeout
