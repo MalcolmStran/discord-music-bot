@@ -197,19 +197,31 @@ class MusicCog(commands.Cog, name="Music"):
             await progress_msg.edit(content=f"❌ Error processing playlist: {str(e)}")
     
     async def _ensure_voice_connection(self, ctx) -> bool:
-        """Ensure bot is connected to a voice channel with better error handling"""
+        """Ensure bot is connected to a voice channel with container-aware error handling"""
         if not ctx.author.voice:
             await ctx.send("You need to join a voice channel first!")
             return False
         
         target_channel = ctx.author.voice.channel
+        is_container = os.path.exists('/.dockerenv') or os.getenv('DOCKER_CONTAINER') == 'true'
         
         if not self.player.is_connected:
-            await ctx.send("🔗 Connecting to voice channel...")
+            if is_container:
+                await ctx.send("🔗 Connecting to voice channel... (container mode - may take longer)")
+            else:
+                await ctx.send("🔗 Connecting to voice channel...")
+            
             success = await self.player.connect(target_channel)
             if not success:
-                await ctx.send("❌ Could not connect to voice channel! This might be due to:")
-                await ctx.send("• Discord voice server issues\n• Bot permissions\n• Network connectivity")
+                error_msg = "❌ Could not connect to voice channel!"
+                if is_container:
+                    error_msg += " **Container detected** - this might be due to:"
+                    await ctx.send(error_msg)
+                    await ctx.send("• Docker networking restrictions\n• Voice gateway timeouts\n• Resource constraints\n• Session conflicts")
+                    await ctx.send("💡 **Container tips:** Use `!force-reconnect` or restart the container if issues persist.")
+                else:
+                    await ctx.send(error_msg + " This might be due to:")
+                    await ctx.send("• Discord voice server issues\n• Bot permissions\n• Network connectivity")
                 await ctx.send("Please try again in a few moments.")
                 return False
             await ctx.send(f"✅ Connected to **{target_channel.name}**")
@@ -217,13 +229,25 @@ class MusicCog(commands.Cog, name="Music"):
             # Ensure we're still properly connected
             success = await self.player.ensure_connection(target_channel)
             if not success:
-                await ctx.send("❌ Lost voice connection! Attempting to reconnect...")
+                if is_container:
+                    await ctx.send("❌ Lost voice connection! (container mode) Attempting enhanced reconnect...")
+                else:
+                    await ctx.send("❌ Lost voice connection! Attempting to reconnect...")
                 # Clear the connection and try again
                 await self.player.disconnect(force_cleanup=True)
-                await asyncio.sleep(2)
+                
+                # Container-specific delay
+                delay = 3 if is_container else 2
+                await asyncio.sleep(delay)
+                
                 success = await self.player.connect(target_channel)
                 if not success:
-                    await ctx.send("❌ Failed to reconnect. Please try the command again.")
+                    error_msg = "❌ Failed to reconnect."
+                    if is_container:
+                        error_msg += " Try `!force-reconnect` or restart the container."
+                    else:
+                        error_msg += " Please try the command again."
+                    await ctx.send(error_msg)
                     return False
                 await ctx.send(f"✅ Reconnected to **{target_channel.name}**")
         
@@ -637,22 +661,32 @@ class MusicCog(commands.Cog, name="Music"):
     @commands.command(name='force-reconnect', aliases=['freconnect'])
     @commands.has_permissions(administrator=True)
     async def force_reconnect(self, ctx):
-        """Force a voice reconnection (Admin only)"""
+        """Force a voice reconnection with container-optimized settings (Admin only)"""
         if not ctx.author.voice:
             return await ctx.send("❌ You need to be in a voice channel!")
         
-        await ctx.send("🔄 Forcing voice reconnection...")
+        is_container = os.path.exists('/.dockerenv') or os.getenv('DOCKER_CONTAINER') == 'true'
         
-        # Force disconnect first
+        if is_container:
+            await ctx.send("🔄 Forcing voice reconnection... (container mode - enhanced cleanup)")
+        else:
+            await ctx.send("🔄 Forcing voice reconnection...")
+        
+        # Force disconnect with extended cleanup for containers
         await self.player.disconnect(force_cleanup=True)
-        await asyncio.sleep(3)
+        cleanup_time = 5 if is_container else 3
+        await asyncio.sleep(cleanup_time)
         
         # Try to reconnect
         success = await self.player.connect(ctx.author.voice.channel)
         if success:
-            await ctx.send("✅ Successfully reconnected!")
+            env_info = " (container mode)" if is_container else ""
+            await ctx.send(f"✅ Successfully reconnected!{env_info}")
         else:
-            await ctx.send("❌ Failed to reconnect. Check the logs for details.")
+            error_msg = "❌ Failed to reconnect. Check the logs for details."
+            if is_container:
+                error_msg += "\n💡 **Container tip:** Consider restarting the container if reconnection issues persist."
+            await ctx.send(error_msg)
 
 async def setup(bot):
     await bot.add_cog(MusicCog(bot))

@@ -1,0 +1,30 @@
+version: '3.8'
+
+services:
+  discord-bot:
+    build: .
+    container_name: discord-music-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - DOCKER_CONTAINER=true
+      # Container-optimized voice settings
+      - VOICE_CONNECTION_TIMEOUT=15
+      - VOICE_RECONNECT_ATTEMPTS=8
+      - VOICE_RETRY_DELAY=3
+    volumes:
+      # Mount logs directory for persistence
+      - ./logs:/app/logs
+      # Keep downloads directory for temporary files
+      - bot-downloads:/app/downloads
+    # Optional: configure resource limits
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 256M
+
+volumes:
+  bot-downloads:

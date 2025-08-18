@@ -88,9 +88,40 @@ LOG_LEVEL=INFO
 ```
 
 ### 4. Run the Bot
+
+#### Standard Installation
 ```bash
 python main.py
 ```
+
+#### Docker Installation (Recommended for Servers)
+1. **Using Docker Compose (easiest):**
+```bash
+# Copy your .env file first
+cp .env.example .env
+# Edit .env with your settings
+
+# Run with docker-compose
+docker-compose up -d
+```
+
+2. **Using Docker directly:**
+```bash
+# Build the image
+docker build -t discord-music-bot .
+
+# Run the container
+docker run -d --name discord-music-bot \
+  --env-file .env \
+  -e DOCKER_CONTAINER=true \
+  discord-music-bot
+```
+
+**Docker Benefits:**
+- Consistent environment across different systems
+- Automatic container-optimized voice connection settings
+- Easier deployment and management
+- Built-in FFmpeg and dependencies
 
 ## Setup Instructions
 
@@ -223,6 +254,13 @@ The bot requires FFmpeg for audio processing. Make sure it's installed and avail
 - The bot now has improved retry logic for unstable connections
 - If issues persist, try `!disconnect` and `!play` again
 - Ensure the bot has "Connect" and "Speak" permissions in the voice channel
+
+**Docker/Container specific issues:**
+- The bot automatically detects container environments and adjusts settings
+- Use `!force-reconnect` for enhanced container reconnection logic
+- Error 4006 is more common in containers due to networking constraints
+- Consider restarting the container if voice issues persist
+- Ensure `DOCKER_CONTAINER=true` is set in your environment variables
 
 **Media conversion doesn't work:**
 - Check internet connection
