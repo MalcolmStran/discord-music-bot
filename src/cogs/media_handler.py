@@ -31,9 +31,9 @@ class MediaHandler(commands.Cog, name="Media"):
         self.temp_dir = Path(tempfile.gettempdir()) / 'discord_bot_media'
         self.temp_dir.mkdir(exist_ok=True)
 
-        # Discord file size limit (working cap 9MB; regular user limit ~8MB, higher for Nitro)
-        # Target 8MB to provide ~1MB safety buffer below cap
-        self.max_file_size = 9 * 1024 * 1024  # 9MB in bytes
+        # Discord file size limit (10MB for standard uploads; higher for Nitro)
+        # Target 8MB to provide a safety buffer and ensure reliable uploads
+        self.max_file_size = 10 * 1024 * 1024  # 10MB in bytes
         self.target_file_size = 8 * 1024 * 1024  # 8MB in bytes (compression target)
 
         # Download limits to prevent issues
@@ -81,11 +81,11 @@ class MediaHandler(commands.Cog, name="Media"):
                 
                 # Check for TikTok URLs
                 if self._is_tiktok_url(url):
-                    video_path = await self._download_tiktok_video(url)
+                    video_path = await self._download_tiktok_video(url, status_target=message)
                 
                 # Check for Twitter/X URLs
                 elif self._is_twitter_url(url):
-                    video_path = await self._download_twitter_video(url)
+                    video_path = await self._download_twitter_video(url, status_target=message)
                 
                 # Send the video if successfully downloaded
                 if video_path and os.path.exists(video_path):
@@ -190,15 +190,15 @@ class MediaHandler(commands.Cog, name="Media"):
             # Re-raise the original exception
             raise e
     
-    async def _download_tiktok_video(self, url: str) -> Optional[str]:
+    async def _download_tiktok_video(self, url: str, status_target: Optional[discord.Message] = None) -> Optional[str]:
         """Download TikTok video using RapidAPI with improved error handling"""
         if not self.rapidapi_key:
             logger.warning("No RapidAPI key provided for TikTok downloads")
             return None
 
-        return await self._safe_download_with_cleanup(self._download_tiktok_video_impl, url)
+        return await self._safe_download_with_cleanup(self._download_tiktok_video_impl, url, status_target=status_target)
     
-    async def _download_tiktok_video_impl(self, url: str) -> Optional[str]:
+    async def _download_tiktok_video_impl(self, url: str, status_target: Optional[discord.Message] = None) -> Optional[str]:
         """Implementation of TikTok video download"""
         try:
             # Make API request with timeout
@@ -254,7 +254,7 @@ class MediaHandler(commands.Cog, name="Media"):
             logger.info(f"TikTok video downloaded: {downloaded_size // 1024 // 1024}MB")
             
             # Check and compress if needed
-            return await self._process_video_file(str(unique_filename))
+            return await self._process_video_file(str(unique_filename), status_target=status_target)
         
         except requests.exceptions.Timeout:
             raise Exception("Download timeout - video may be too large")
@@ -264,11 +264,11 @@ class MediaHandler(commands.Cog, name="Media"):
             logger.error(f"TikTok download error: {e}")
             raise e
     
-    async def _download_twitter_video(self, url: str) -> Optional[str]:
+    async def _download_twitter_video(self, url: str, status_target: Optional[discord.Message] = None) -> Optional[str]:
         """Download Twitter video using yt-dlp with improved error handling"""
-        return await self._safe_download_with_cleanup(self._download_twitter_video_impl, url)
+        return await self._safe_download_with_cleanup(self._download_twitter_video_impl, url, status_target=status_target)
     
-    async def _download_twitter_video_impl(self, url: str) -> Optional[str]:
+    async def _download_twitter_video_impl(self, url: str, status_target: Optional[discord.Message] = None) -> Optional[str]:
         """Implementation of Twitter video download"""
         try:
             # Convert x.com to twitter.com for better compatibility
@@ -367,7 +367,7 @@ class MediaHandler(commands.Cog, name="Media"):
             logger.info(f"Twitter video downloaded: {actual_size // 1024 // 1024}MB")
             
             # Process the video file
-            return await self._process_video_file(str(actual_filename))
+            return await self._process_video_file(str(actual_filename), status_target=status_target)
         
         except yt_dlp.utils.DownloadError as e:
             if "Unsupported URL" in str(e) or "No video" in str(e):
@@ -386,7 +386,7 @@ class MediaHandler(commands.Cog, name="Media"):
             logger.error(f"Twitter download error: {e}")
             raise e
     
-    async def _download_twitter_video_fallback(self, url: str) -> Optional[str]:
+    async def _download_twitter_video_fallback(self, url: str, status_target: Optional[discord.Message] = None) -> Optional[str]:
         """Fallback Twitter download with most permissive settings"""
         try:
             logger.info(f"Attempting fallback download for Twitter URL: {url}")
@@ -461,13 +461,13 @@ class MediaHandler(commands.Cog, name="Media"):
             logger.info(f"Twitter fallback video downloaded: {actual_size // 1024 // 1024}MB")
             
             # Process the video file
-            return await self._process_video_file(str(actual_filename))
+            return await self._process_video_file(str(actual_filename), status_target=status_target)
             
         except Exception as e:
             logger.error(f"Twitter fallback download error: {e}")
             return None
     
-    async def _process_video_file(self, file_path: str) -> Optional[str]:
+    async def _process_video_file(self, file_path: str, status_target: Optional[discord.Message] = None) -> Optional[str]:
         """Process video file - compress if too large"""
         if not os.path.exists(file_path):
             return None
@@ -480,6 +480,12 @@ class MediaHandler(commands.Cog, name="Media"):
         
         # File is too large, try to compress
         logger.info(f"File too large ({file_size} bytes), attempting compression")
+        # Inform the user we're compressing if we have a message context
+        if status_target:
+            try:
+                await status_target.reply("🗜️ Compressing video to fit under the upload limit… this may take a minute.")
+            except Exception as notify_err:
+                logger.debug(f"Could not send compression notice: {notify_err}")
         return await self._compress_video(file_path)
     
     async def _compress_video(self, file_path: str) -> Optional[str]:
@@ -1029,7 +1035,7 @@ class MediaHandler(commands.Cog, name="Media"):
             # If file is still too large, try one final aggressive compression
             if file_size > self.max_file_size:
                 logger.info(f"Video still too large ({file_size} bytes), attempting final compression")
-                final_compressed_path = await self._final_aggressive_compression(video_path)
+                final_compressed_path = await self._final_aggressive_compression(video_path, status_target=message)
                 
                 if final_compressed_path and final_compressed_path != video_path:
                     # Use the newly compressed file
@@ -1055,9 +1061,10 @@ class MediaHandler(commands.Cog, name="Media"):
             logger.error(f"Discord upload error: {e}")
             # If upload fails due to size, provide helpful message
             if "Request entity too large" in str(e) or "Payload Too Large" in str(e):
+                limit_mb = self.max_file_size // 1024 // 1024
                 await message.reply(
                     f"❌ Video is too large to upload even after compression ({file_size // 1024 // 1024}MB).\n"
-                    f"Limit is 9MB (try a shorter clip).\n",
+                    f"Limit is {limit_mb}MB (try a shorter clip).\n",
                     delete_after=5
                 )
             else:
@@ -1081,7 +1088,7 @@ class MediaHandler(commands.Cog, name="Media"):
             except Exception as e:
                 logger.error(f"Error cleaning up file {video_path}: {e}")
     
-    async def _final_aggressive_compression(self, file_path: str) -> Optional[str]:
+    async def _final_aggressive_compression(self, file_path: str, status_target: Optional[discord.Message] = None) -> Optional[str]:
         """Final aggressive compression attempt using H.265 with maximum settings"""
         try:
             compressed_path = str(self.temp_dir / f'final_compressed_{uuid.uuid4()}.mp4')
@@ -1118,6 +1125,11 @@ class MediaHandler(commands.Cog, name="Media"):
             target_video_bitrate = max(target_video_bitrate, 80 * 1000)  # 80kbps minimum for H.265
             
             logger.info(f"Final aggressive H.265 compression: target={target_size_mb}MB, video_bitrate={target_video_bitrate//1000}kbps")
+            if status_target:
+                try:
+                    await status_target.reply("🔧 Performing a final pass to shrink the video further…")
+                except Exception as notify_err:
+                    logger.debug(f"Could not send final compression notice: {notify_err}")
             
             # Very aggressive H.265 settings for maximum compression
             stream = ffmpeg.input(file_path)
@@ -1221,9 +1233,9 @@ class MediaHandler(commands.Cog, name="Media"):
                 video_path = None
                 
                 if self._is_tiktok_url(url):
-                    video_path = await self._download_tiktok_video(url)
+                    video_path = await self._download_tiktok_video(url, status_target=ctx.message)
                 elif self._is_twitter_url(url):
-                    video_path = await self._download_twitter_video(url)
+                    video_path = await self._download_twitter_video(url, status_target=ctx.message)
                 else:
                     return await ctx.send("❌ Unsupported URL! Only TikTok and Twitter/X links are supported.")
                 
