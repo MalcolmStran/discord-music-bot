@@ -9,7 +9,7 @@ import os
 import asyncio
 import logging
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Dict
 import tempfile
 import sys
 
@@ -28,8 +28,9 @@ class MusicCog(commands.Cog, name="Music"):
     
     def __init__(self, bot):
         self.bot = bot
-        self.player = Player()
-        self.queue = Queue(max_size=config.MAX_QUEUE_SIZE)
+        # Per-guild state: each guild gets its own player and queue
+        self.players: Dict[int, Player] = {}
+        self.queues: Dict[int, Queue] = {}
         self.max_duration = config.MAX_SONG_DURATION
         
         # Create downloads directory
@@ -50,6 +51,18 @@ class MusicCog(commands.Cog, name="Music"):
             logger.error(f"Error in music command {ctx.command}: {error}")
             await ctx.send(f"An error occurred: {str(error)}")
     
+    def _get_player(self, guild: discord.Guild) -> Player:
+        """Get or create the Player for a guild"""
+        if guild.id not in self.players:
+            self.players[guild.id] = Player()
+        return self.players[guild.id]
+
+    def _get_queue(self, guild: discord.Guild) -> Queue:
+        """Get or create the Queue for a guild"""
+        if guild.id not in self.queues:
+            self.queues[guild.id] = Queue(max_size=config.MAX_QUEUE_SIZE)
+        return self.queues[guild.id]
+
     @commands.command(name='play', aliases=['p'])
     async def play(self, ctx, *, query: str):
         """Play a song or add it to the queue
@@ -57,10 +70,14 @@ class MusicCog(commands.Cog, name="Music"):
         Usage: !play <song name or URL>
         Example: !play Never Gonna Give You Up
         """
+        # Use per-guild state
+        player = self._get_player(ctx.guild)
+        queue = self._get_queue(ctx.guild)
+
         # Check queue size
-        if self.queue.is_full():
-            return await ctx.send(f"Queue is full ({self.queue.max_size} songs max)!")
-          # Ensure bot is connected to voice
+        if queue.is_full():
+            return await ctx.send(f"Queue is full ({queue.max_size} songs max)!")
+        # Ensure bot is connected to voice
         if not await self._ensure_voice_connection(ctx):
             return
         
@@ -73,7 +90,7 @@ class MusicCog(commands.Cog, name="Music"):
                     await self._handle_single_song(ctx, query)
                 
                 # Start playing if not already playing
-                if not self.player.is_playing and not self.queue.is_empty():
+                if not player.is_playing and not queue.is_empty():
                     await self._play_next(ctx)
             except Exception as e:
                 logger.error(f"Error in play command: {e}")
@@ -81,6 +98,7 @@ class MusicCog(commands.Cog, name="Music"):
     
     async def _handle_single_song(self, ctx, query: str):
         """Handle single song requests"""
+        queue = self._get_queue(ctx.guild)
         result = await YTDLSource.create_source(ctx, query, loop=self.bot.loop)
         
         if not result:
@@ -100,7 +118,7 @@ class MusicCog(commands.Cog, name="Music"):
             return await ctx.send(f"Song is too long! (Max: {self.max_duration//60} minutes)")
         
         # Add to queue
-        if self.queue.add(source):
+        if queue.add(source):
             embed = discord.Embed(
                 title="Added to Queue",
                 description=f"**{source['title']}**",
@@ -113,7 +131,7 @@ class MusicCog(commands.Cog, name="Music"):
             )
             embed.add_field(
                 name="Position", 
-                value=str(self.queue.size()), 
+                value=str(queue.size()), 
                 inline=True
             )
             
@@ -126,6 +144,7 @@ class MusicCog(commands.Cog, name="Music"):
     
     async def _handle_playlist(self, ctx, query: str):
         """Handle playlist requests"""
+        queue = self._get_queue(ctx.guild)
         # Show initial message
         progress_msg = await ctx.send("🎵 Processing playlist...")
         
@@ -138,7 +157,7 @@ class MusicCog(commands.Cog, name="Music"):
             if isinstance(first_source, list) and first_source:
                 first_song = first_source[0]
                 if first_song.get('duration', 0) <= self.max_duration:
-                    self.queue.add(first_song)
+                    queue.add(first_song)
                     await progress_msg.edit(content=f"✅ Added first song: **{first_song['title']}**\nProcessing remaining playlist...")
             
             # Process full playlist in background
@@ -150,6 +169,7 @@ class MusicCog(commands.Cog, name="Music"):
     async def _process_full_playlist(self, ctx, query: str, progress_msg):
         """Process full playlist in background"""
         try:
+            queue = self._get_queue(ctx.guild)
             # Get full playlist
             sources = await YTDLSource.create_source(ctx, query, loop=self.bot.loop)
             
@@ -162,7 +182,7 @@ class MusicCog(commands.Cog, name="Music"):
             total_songs = len(sources)
             
             for i, source in enumerate(sources[1:], 2):  # Start from second song
-                if self.queue.is_full():
+                if queue.is_full():
                     break
                 
                 # Check duration
@@ -171,7 +191,7 @@ class MusicCog(commands.Cog, name="Music"):
                     continue
                 
                 # Add to queue
-                if self.queue.add(source):
+                if queue.add(source):
                     added_count += 1
                 
                 # Update progress every 5 songs
@@ -188,7 +208,7 @@ class MusicCog(commands.Cog, name="Music"):
             summary += f"📥 Added: **{added_count}** songs\n"
             if skipped_count > 0:
                 summary += f"⏭️ Skipped: **{skipped_count}** songs (too long)\n"
-            summary += f"📊 Queue: **{self.queue.size()}/{self.queue.max_size}**"
+            summary += f"📊 Queue: **{queue.size()}/{queue.max_size}**"
             
             await progress_msg.edit(content=summary)
         
@@ -198,6 +218,7 @@ class MusicCog(commands.Cog, name="Music"):
     
     async def _ensure_voice_connection(self, ctx) -> bool:
         """Ensure bot is connected to a voice channel with container-aware error handling"""
+        player = self._get_player(ctx.guild)
         if not ctx.author.voice:
             await ctx.send("You need to join a voice channel first!")
             return False
@@ -205,13 +226,13 @@ class MusicCog(commands.Cog, name="Music"):
         target_channel = ctx.author.voice.channel
         is_container = os.path.exists('/.dockerenv') or os.getenv('DOCKER_CONTAINER') == 'true'
         
-        if not self.player.is_connected:
+        if not player.is_connected:
             if is_container:
                 await ctx.send("🔗 Connecting to voice channel... (container mode - may take longer)")
             else:
                 await ctx.send("🔗 Connecting to voice channel...")
             
-            success = await self.player.connect(target_channel)
+            success = await player.connect(target_channel)
             if not success:
                 error_msg = "❌ Could not connect to voice channel!"
                 if is_container:
@@ -227,20 +248,20 @@ class MusicCog(commands.Cog, name="Music"):
             await ctx.send(f"✅ Connected to **{target_channel.name}**")
         else:
             # Ensure we're still properly connected
-            success = await self.player.ensure_connection(target_channel)
+            success = await player.ensure_connection(target_channel)
             if not success:
                 if is_container:
                     await ctx.send("❌ Lost voice connection! (container mode) Attempting enhanced reconnect...")
                 else:
                     await ctx.send("❌ Lost voice connection! Attempting to reconnect...")
                 # Clear the connection and try again
-                await self.player.disconnect(force_cleanup=True)
+                await player.disconnect(force_cleanup=True)
                 
                 # Container-specific delay
                 delay = 3 if is_container else 2
                 await asyncio.sleep(delay)
                 
-                success = await self.player.connect(target_channel)
+                success = await player.connect(target_channel)
                 if not success:
                     error_msg = "❌ Failed to reconnect."
                     if is_container:
@@ -255,21 +276,23 @@ class MusicCog(commands.Cog, name="Music"):
     
     async def _play_next(self, ctx):
         """Play the next song in the queue"""
+        player = self._get_player(ctx.guild)
+        queue = self._get_queue(ctx.guild)
         # Check if we should repeat the current song
-        if self.player.repeat_mode and self.player.current_song:
-            next_song = self.player.current_song
+        if player.repeat_mode and player.current_song:
+            next_song = player.current_song
         else:
-            if self.queue.is_empty():
-                self.player.is_playing = False
-                self.player.start_disconnect_timer(300)  # 5 minutes
+            if queue.is_empty():
+                player.is_playing = False
+                player.start_disconnect_timer(300)  # 5 minutes
                 return
             
-            next_song = self.queue.get_next()
+            next_song = queue.get_next()
             if not next_song:
                 return
         
         # Check if still connected to voice
-        if not self.player.is_connected:
+        if not player.is_connected:
             logger.error("Error playing next song: Not connected to voice.")
             # Try to reconnect if user is still in voice
             if ctx.author.voice:
@@ -284,13 +307,13 @@ class MusicCog(commands.Cog, name="Music"):
         try:
             # Create audio source with better error handling
             try:
-                source = await YTDLSource.regather_stream(next_song, loop=self.bot.loop, volume=self.player.volume)
+                source = await YTDLSource.regather_stream(next_song, loop=self.bot.loop, volume=player.volume)
             except Exception as e:
                 logger.error(f"Failed to create audio source: {e}")
                 await ctx.send(f"❌ Failed to load: **{next_song['title']}** - Skipping...")
                 # If in repeat mode and this song failed, turn off repeat mode
-                if self.player.repeat_mode:
-                    self.player.repeat_mode = False
+                if player.repeat_mode:
+                    player.repeat_mode = False
                     await ctx.send("🔁 Repeat mode disabled due to playback error")
                 await self._play_next(ctx)  # Try next song
                 return
@@ -300,18 +323,18 @@ class MusicCog(commands.Cog, name="Music"):
                 if error:
                     logger.error(f'Player error: {error}')
                     # Don't continue playing if there was an error
-                    self.player.is_playing = False
+                    player.is_playing = False
                     return
                 
                 # Schedule next song only if still connected
-                if self.player.is_connected:
+                if player.is_connected:
                     asyncio.run_coroutine_threadsafe(self._play_next(ctx), self.bot.loop)
             
-            self.player.current_song = next_song
-            self.player.play(source, after=after_song)
+            player.current_song = next_song
+            player.play(source, after=after_song)
             
             # Send now playing message
-            title = "🔁 Repeating" if self.player.repeat_mode else "🎵 Now Playing"
+            title = "🔁 Repeating" if player.repeat_mode else "🎵 Now Playing"
             embed = discord.Embed(
                 title=title,
                 description=f"**{next_song['title']}**",
@@ -327,10 +350,10 @@ class MusicCog(commands.Cog, name="Music"):
                 inline=True
             )
             
-            if self.queue.size() > 0:
-                embed.add_field(name="Queue", value=f"{self.queue.size()} songs", inline=True)
+            if queue.size() > 0:
+                embed.add_field(name="Queue", value=f"{queue.size()} songs", inline=True)
             
-            if self.player.repeat_mode:
+            if player.repeat_mode:
                 embed.add_field(name="Repeat", value="🔁 On", inline=True)
             
             if next_song.get('thumbnail'):
@@ -342,21 +365,22 @@ class MusicCog(commands.Cog, name="Music"):
             logger.error(f"Error playing next song: {e}")
             await ctx.send(f"❌ Error playing song: {str(e)}")
             # Only try next song if we still have connection
-            if self.player.is_connected:
+            if player.is_connected:
                 await self._play_next(ctx)  # Try next song
     
     @commands.command(name='skip', aliases=['s'])
     async def skip(self, ctx):
         """Skip the current song"""
-        if not self.player.is_playing:
+        player = self._get_player(ctx.guild)
+        if not player.is_playing:
             return await ctx.send("Nothing is playing!")
         
         # Turn off repeat mode when skipping
-        was_repeating = self.player.repeat_mode
+        was_repeating = player.repeat_mode
         if was_repeating:
-            self.player.repeat_mode = False
+            player.repeat_mode = False
         
-        self.player.stop()
+        player.stop()
         
         if was_repeating:
             await ctx.send("⏭️ Skipped and disabled repeat mode!")
@@ -366,52 +390,58 @@ class MusicCog(commands.Cog, name="Music"):
     @commands.command(name='stop')
     async def stop(self, ctx):
         """Stop playback and clear the queue"""
-        self.queue.clear()
-        self.player.repeat_mode = False  # Turn off repeat mode
-        self.player.stop()
+        queue = self._get_queue(ctx.guild)
+        player = self._get_player(ctx.guild)
+        queue.clear()
+        player.repeat_mode = False  # Turn off repeat mode
+        player.stop()
         await ctx.send("⏹️ Stopped playback and cleared queue!")
     
     @commands.command(name='pause')
     async def pause(self, ctx):
         """Pause the current song"""
-        if not self.player.is_playing:
+        player = self._get_player(ctx.guild)
+        if not player.is_playing:
             return await ctx.send("Nothing is playing!")
         
-        if self.player.is_paused:
+        if player.is_paused:
             return await ctx.send("Already paused!")
         
-        self.player.pause()
+        player.pause()
         await ctx.send("⏸️ Paused!")
     
     @commands.command(name='resume')
     async def resume(self, ctx):
         """Resume paused playback"""
-        if not self.player.is_paused:
+        player = self._get_player(ctx.guild)
+        if not player.is_paused:
             return await ctx.send("Not paused!")
         
-        self.player.resume()
+        player.resume()
         await ctx.send("▶️ Resumed!")
     
     @commands.command(name='volume', aliases=['vol'])
     async def volume(self, ctx, volume: Optional[int] = None):
         """Set or show the volume (0-100)"""
+        player = self._get_player(ctx.guild)
         if volume is None:
-            return await ctx.send(f"Current volume: {int(self.player.volume * 100)}%")
+            return await ctx.send(f"Current volume: {int(player.volume * 100)}%")
         
         if not 0 <= volume <= 100:
             return await ctx.send("Volume must be between 0 and 100!")
         
-        self.player.set_volume(volume / 100)
+        player.set_volume(volume / 100)
         await ctx.send(f"🔊 Volume set to {volume}%")
     
     @commands.command(name='queue', aliases=['q'])
     async def show_queue(self, ctx, page: int = 1):
         """Show the current queue"""
-        if self.queue.is_empty():
+        queue = self._get_queue(ctx.guild)
+        if queue.is_empty():
             return await ctx.send("Queue is empty!")
         
         songs_per_page = 10
-        queue_list = self.queue.current_queue()
+        queue_list = queue.current_queue()
         total_pages = (len(queue_list) + songs_per_page - 1) // songs_per_page
         
         if page < 1 or page > total_pages:
@@ -434,7 +464,7 @@ class MusicCog(commands.Cog, name="Music"):
         embed.description = queue_text
         
         # Add queue info
-        queue_info = self.queue.get_queue_info()
+        queue_info = queue.get_queue_info()
         embed.add_field(
             name="Queue Info",
             value=f"Songs: {queue_info['size']}/{queue_info['max_size']}\n"
@@ -447,10 +477,11 @@ class MusicCog(commands.Cog, name="Music"):
     @commands.command(name='repeat', aliases=['loop'])
     async def repeat(self, ctx):
         """Toggle repeat mode for the current song"""
-        if not self.player.current_song:
+        player = self._get_player(ctx.guild)
+        if not player.current_song:
             return await ctx.send("No song is currently playing!")
         
-        new_state = self.player.toggle_repeat()
+        new_state = player.toggle_repeat()
         
         embed = discord.Embed(
             title="🔁 Repeat Mode",
@@ -461,7 +492,7 @@ class MusicCog(commands.Cog, name="Music"):
         if new_state:
             embed.add_field(
                 name="Current Song",
-                value=f"**{self.player.current_song['title']}**",
+                value=f"**{player.current_song['title']}**",
                 inline=False
             )
             embed.set_footer(text="The current song will repeat until you turn off repeat mode or skip/stop.")
@@ -473,10 +504,11 @@ class MusicCog(commands.Cog, name="Music"):
     @commands.command(name='nowplaying', aliases=['np'])
     async def now_playing(self, ctx):
         """Show information about the current song"""
-        if not self.player.is_playing or not self.player.current_song:
+        player = self._get_player(ctx.guild)
+        if not player.is_playing or not player.current_song:
             return await ctx.send("Nothing is playing!")
         
-        song = self.player.current_song
+        song = player.current_song
         embed = discord.Embed(
             title="🎵 Currently Playing",
             description=f"**{song['title']}**",
@@ -492,10 +524,11 @@ class MusicCog(commands.Cog, name="Music"):
             inline=True
         )
         
-        embed.add_field(name="Volume", value=f"{int(self.player.volume * 100)}%", inline=True)
+        embed.add_field(name="Volume", value=f"{int(player.volume * 100)}%", inline=True)
         
-        if self.queue.size() > 0:
-            next_song = self.queue.peek_next()
+        queue = self._get_queue(ctx.guild)
+        if queue.size() > 0:
+            next_song = queue.peek_next()
             if next_song:
                 embed.add_field(
                     name="Up Next", 
@@ -514,31 +547,34 @@ class MusicCog(commands.Cog, name="Music"):
     @commands.command(name='clear')
     async def clear_queue(self, ctx):
         """Clear the queue"""
-        if self.queue.is_empty():
+        queue = self._get_queue(ctx.guild)
+        if queue.is_empty():
             return await ctx.send("Queue is already empty!")
         
-        self.queue.clear()
+        queue.clear()
         await ctx.send("🗑️ Queue cleared!")
     
     @commands.command(name='shuffle')
     async def shuffle_queue(self, ctx):
         """Shuffle the queue"""
-        if self.queue.size() < 2:
+        queue = self._get_queue(ctx.guild)
+        if queue.size() < 2:
             return await ctx.send("Need at least 2 songs in queue to shuffle!")
         
-        self.queue.shuffle()
+        queue.shuffle()
         await ctx.send("🔀 Queue shuffled!")
     
     @commands.command(name='remove', aliases=['rm'])
     async def remove_song(self, ctx, index: int):
         """Remove a song from the queue by its position"""
-        if self.queue.is_empty():
+        queue = self._get_queue(ctx.guild)
+        if queue.is_empty():
             return await ctx.send("Queue is empty!")
         
-        if index < 1 or index > self.queue.size():
-            return await ctx.send(f"Invalid position! Use a number between 1 and {self.queue.size()}")
+        if index < 1 or index > queue.size():
+            return await ctx.send(f"Invalid position! Use a number between 1 and {queue.size()}")
         
-        removed_song = self.queue.remove(index - 1)  # Convert to 0-based index
+        removed_song = queue.remove(index - 1)  # Convert to 0-based index
         if removed_song:
             await ctx.send(f"🗑️ Removed: **{removed_song['title']}**")
         else:
@@ -551,12 +587,13 @@ class MusicCog(commands.Cog, name="Music"):
             return await ctx.send("You need to be in a voice channel!")
         
         # Disconnect first
-        if self.player.is_connected:
-            await self.player.disconnect()
+        player = self._get_player(ctx.guild)
+        if player.is_connected:
+            await player.disconnect()
             await asyncio.sleep(1)
         
         # Reconnect
-        success = await self.player.connect(ctx.author.voice.channel)
+        success = await player.connect(ctx.author.voice.channel)
         if success:
             await ctx.send("🔄 Successfully reconnected to voice channel!")
         else:
@@ -565,7 +602,9 @@ class MusicCog(commands.Cog, name="Music"):
     @commands.command(name='status')
     async def voice_status(self, ctx):
         """Check voice connection status"""
-        status = self.player.get_status()
+        queue = self._get_queue(ctx.guild)
+        player = self._get_player(ctx.guild)
+        status = player.get_status()
         
         embed = discord.Embed(
             title="🔊 Voice Status",
@@ -577,7 +616,7 @@ class MusicCog(commands.Cog, name="Music"):
         embed.add_field(name="Paused", value="✅ Yes" if status['is_paused'] else "❌ No", inline=True)
         embed.add_field(name="Volume", value=f"{int(status['volume'] * 100)}%", inline=True)
         embed.add_field(name="Channel", value=status['channel'] or "None", inline=True)
-        embed.add_field(name="Queue Size", value=str(self.queue.size()), inline=True)
+        embed.add_field(name="Queue Size", value=str(queue.size()), inline=True)
         embed.add_field(name="Repeat Mode", value="🔁 On" if status['repeat_mode'] else "❌ Off", inline=True)
         
         if status['current_song']:
@@ -592,11 +631,13 @@ class MusicCog(commands.Cog, name="Music"):
     @commands.command(name='disconnect', aliases=['dc', 'leave'])
     async def disconnect(self, ctx):
         """Disconnect the bot from the voice channel"""
-        if not self.player.is_connected:
+        player = self._get_player(ctx.guild)
+        if not player.is_connected:
             return await ctx.send("Not connected to a voice channel!")
         
-        await self.player.disconnect()
-        self.queue.clear()
+        await player.disconnect()
+        queue = self._get_queue(ctx.guild)
+        queue.clear()
         await ctx.send("👋 Disconnected!")
     
     @commands.command(name='voice-debug', aliases=['vdebug'])
@@ -640,7 +681,8 @@ class MusicCog(commands.Cog, name="Music"):
             )
         
         # Check player state
-        player_status = self.player.get_status()
+        player = self._get_player(ctx.guild)
+        player_status = player.get_status()
         embed.add_field(
             name="Player State", 
             value=f"Connected: {player_status['is_connected']}\nPlaying: {player_status['is_playing']}\nChannel: {player_status['channel'] or 'None'}", 
@@ -673,12 +715,13 @@ class MusicCog(commands.Cog, name="Music"):
             await ctx.send("🔄 Forcing voice reconnection...")
         
         # Force disconnect with extended cleanup for containers
-        await self.player.disconnect(force_cleanup=True)
+        player = self._get_player(ctx.guild)
+        await player.disconnect(force_cleanup=True)
         cleanup_time = 5 if is_container else 3
         await asyncio.sleep(cleanup_time)
         
         # Try to reconnect
-        success = await self.player.connect(ctx.author.voice.channel)
+        success = await player.connect(ctx.author.voice.channel)
         if success:
             env_info = " (container mode)" if is_container else ""
             await ctx.send(f"✅ Successfully reconnected!{env_info}")
