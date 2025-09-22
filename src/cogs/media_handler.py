@@ -9,6 +9,7 @@ import os
 import requests
 import re
 import yt_dlp
+from yt_dlp.utils import DownloadError
 import uuid
 import tempfile
 import subprocess
@@ -16,12 +17,13 @@ import logging
 import ffmpeg
 import asyncio
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List, Dict, Any
 
 logger = logging.getLogger(__name__)
 
 class MediaHandler(commands.Cog, name="Media"):
     """Handles media conversion from Twitter and TikTok links"""
+    _status_messages: Dict[int, List[discord.Message]]
     
     def __init__(self, bot):
         self.bot = bot
@@ -54,6 +56,9 @@ class MediaHandler(commands.Cog, name="Media"):
             'no_warnings': True,
             'max_filesize': self.max_download_size,
         }
+
+        # Cache for status messages to clean up after posting
+        self._status_messages = {}
 
         # Startup cleanup tasks
         asyncio.create_task(self._cleanup_old_files())
@@ -280,7 +285,7 @@ class MediaHandler(commands.Cog, name="Media"):
             unique_filename = self.temp_dir / f'{filename_base}.%(ext)s'
             
             # Configure yt-dlp options with more flexible format selection
-            ytdl_opts = {
+            ytdl_opts: Dict[str, Any] = {
                 'format': 'best[ext=mp4]/best[height<=720]/best',  # Flexible format selection
                 'outtmpl': str(unique_filename),
                 'quiet': True,
@@ -293,7 +298,7 @@ class MediaHandler(commands.Cog, name="Media"):
             }
             
             # Download using yt-dlp with timeout
-            with yt_dlp.YoutubeDL(ytdl_opts) as ydl:
+            with yt_dlp.YoutubeDL(ytdl_opts) as ydl:  # type: ignore[arg-type]
                 # Extract info first to check if video exists and size
                 try:
                     info = await asyncio.wait_for(
@@ -368,8 +373,8 @@ class MediaHandler(commands.Cog, name="Media"):
             
             # Process the video file
             return await self._process_video_file(str(actual_filename), status_target=status_target)
-        
-        except yt_dlp.utils.DownloadError as e:
+
+        except DownloadError as e:
             if "Unsupported URL" in str(e) or "No video" in str(e):
                 logger.info(f"No video found in Twitter URL: {url}")
                 return None
@@ -378,10 +383,10 @@ class MediaHandler(commands.Cog, name="Media"):
             elif "Requested format is not available" in str(e):
                 logger.warning(f"Format not available for Twitter URL: {url}")
                 # Try with even more permissive format
-                return await self._download_twitter_video_fallback(url)
+                return await self._download_twitter_video_fallback(url, status_target=status_target)
             logger.error(f"Twitter download error: {e}")
             raise e
-        
+
         except Exception as e:
             logger.error(f"Twitter download error: {e}")
             raise e
@@ -396,7 +401,7 @@ class MediaHandler(commands.Cog, name="Media"):
             unique_filename = self.temp_dir / f'{filename_base}.%(ext)s'
             
             # Most permissive yt-dlp options
-            ytdl_opts = {
+            ytdl_opts: Dict[str, Any] = {
                 'format': 'worst/best',  # Accept any available format
                 'outtmpl': str(unique_filename),
                 'quiet': False,  # Enable output for debugging
@@ -410,7 +415,7 @@ class MediaHandler(commands.Cog, name="Media"):
             }
             
             # Download using yt-dlp with timeout
-            with yt_dlp.YoutubeDL(ytdl_opts) as ydl:
+            with yt_dlp.YoutubeDL(ytdl_opts) as ydl:  # type: ignore[arg-type]
                 try:
                     await asyncio.wait_for(
                         asyncio.get_event_loop().run_in_executor(
@@ -483,7 +488,8 @@ class MediaHandler(commands.Cog, name="Media"):
         # Inform the user we're compressing if we have a message context
         if status_target:
             try:
-                await status_target.reply("🗜️ Compressing video to fit under the upload limit… this may take a minute.")
+                notice = await status_target.reply("🗜️ Compressing video to fit under the upload limit… this may take a minute.")
+                self._status_messages.setdefault(status_target.id, []).append(notice)
             except Exception as notify_err:
                 logger.debug(f"Could not send compression notice: {notify_err}")
         return await self._compress_video(file_path)
@@ -1053,7 +1059,18 @@ class MediaHandler(commands.Cog, name="Media"):
             discord_file = discord.File(video_path)
             
             # Send the file
-            await message.reply(file=discord_file)
+            sent_message = await message.reply(file=discord_file)
+            
+            # Clean up any compression status messages linked to this message
+            try:
+                pending = self._status_messages.pop(message.id, [])
+                for m in pending:
+                    try:
+                        await m.delete()
+                    except Exception as del_err:
+                        logger.debug(f"Could not delete status message: {del_err}")
+            except Exception as cleanup_err:
+                logger.debug(f"Status message cleanup failed: {cleanup_err}")
             
             logger.info(f"Successfully sent video file: {video_path} ({file_size} bytes)")
         
@@ -1127,7 +1144,8 @@ class MediaHandler(commands.Cog, name="Media"):
             logger.info(f"Final aggressive H.265 compression: target={target_size_mb}MB, video_bitrate={target_video_bitrate//1000}kbps")
             if status_target:
                 try:
-                    await status_target.reply("🔧 Performing a final pass to shrink the video further…")
+                    final_notice = await status_target.reply("🔧 Performing a final pass to shrink the video further…")
+                    self._status_messages.setdefault(status_target.id, []).append(final_notice)
                 except Exception as notify_err:
                     logger.debug(f"Could not send final compression notice: {notify_err}")
             
