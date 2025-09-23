@@ -25,9 +25,3 @@ DOWNLOAD_DIR = os.getenv('DOWNLOAD_DIR', './downloads')
 
 # Logging level
 LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO')
-
-# xAI / Grok settings
-XAI_API_KEY = os.getenv('XAI_API_KEY')
-# Default history depth and reply surrounding context
-AI_HISTORY_COUNT = int(os.getenv('AI_HISTORY_COUNT', 10))
-AI_REPLY_SURROUND = int(os.getenv('AI_REPLY_SURROUND', 2))

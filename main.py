@@ -63,13 +63,6 @@ class MusicBot(commands.Bot):
             logger.info("Media handler cog loaded successfully")
         except Exception as e:
             logger.error(f"Failed to load media handler cog: {e}")
-        
-        # Load AI chat cog
-        try:
-            await self.load_extension('src.cogs.ai_chat')
-            logger.info("AI chat cog loaded successfully")
-        except Exception as e:
-            logger.error(f"Failed to load AI chat cog: {e}")
     
     async def on_ready(self):
         """Called when bot is ready"""
