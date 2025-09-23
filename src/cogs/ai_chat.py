@@ -125,13 +125,23 @@ class AIChat(commands.Cog, name="AI"):
                 if not SearchParameters:
                     await message.reply("⚠️ AI is not fully configured. Missing xAI SDK.")
                     return
+                # Determine if the user explicitly requested sources/citations
+                lp = (prompt or "").lower()
+                citations_requested = any(
+                    key in lp for key in [
+                        "cite", "citations", "sources", "source list", "references", "reference", "links", "urls",
+                        "show sources", "include sources", "give sources", "give links", "where did you get this",
+                    ]
+                )
+
                 # Prefer explicit sources via helpers; otherwise omit to use defaults
                 web_src = self._xai_chat.get("web_source")
                 news_src = self._xai_chat.get("news_source")
                 x_src = self._xai_chat.get("x_source")
                 search_kwargs = {
                     "mode": "on",
-                    "return_citations": True,
+                    # Only request citations from API when explicitly asked to
+                    "return_citations": citations_requested,
                     "max_search_results": 10,
                 }
                 if web_src and news_src and x_src:
@@ -142,12 +152,13 @@ class AIChat(commands.Cog, name="AI"):
                     search_parameters=SearchParameters(**search_kwargs),
                 )
 
-                # System prompt to guide behavior
+                # System prompt to guide behavior: strictly use only immediate context provided
                 chat.append(
                     self._xai_chat["system"](
                         "You are Lenna, a helpful Discord assistant. "
-                        "Answer clearly and concisely. Cite sources when using Live Search only if relevant. "
-                        "Be robust to informal tone and extract intent from short prompts."
+                        "Answer clearly and concisely. Only include sources/citations if the user explicitly asks for them. "
+                        "Only use the recent messages included below (limited history and any reply surroundings). "
+                        "Do not bring in earlier, unrelated channel messages beyond this provided context."
                     )
                 )
 
@@ -176,17 +187,18 @@ class AIChat(commands.Cog, name="AI"):
                 response = await asyncio.to_thread(chat.sample)
                 content = response.content if hasattr(response, "content") else str(response)
 
-                # Append citations if available
-                citations = getattr(response, "citations", None)
-                if citations:
-                    # De-duplicate and format citations to avoid Discord embeds
-                    uniq: List[str] = []
-                    for u in citations:
-                        if isinstance(u, str) and u and u not in uniq:
-                            uniq.append(u)
-                    if uniq:
-                        citations_block = "Sources:\n" + "```\n" + "\n".join(uniq) + "\n```"
-                        content = f"{content}\n\n{citations_block}"
+                # Append citations only if explicitly requested
+                if citations_requested:
+                    citations = getattr(response, "citations", None)
+                    if citations:
+                        # De-duplicate and format citations to avoid Discord embeds
+                        uniq: List[str] = []
+                        for u in citations:
+                            if isinstance(u, str) and u and u not in uniq:
+                                uniq.append(u)
+                        if uniq:
+                            citations_block = "Sources:\n" + "```\n" + "\n".join(uniq) + "\n```"
+                            content = f"{content}\n\n{citations_block}"
 
                 # Respect Discord 2000 char limit
                 await self._send_long_reply(message, content)
@@ -214,6 +226,7 @@ class AIChat(commands.Cog, name="AI"):
             msgs = []
 
         # Include reply target and its surrounding messages
+        reply_context_ids: set[int] = set()
         try:
             if message.reference and message.reference.message_id:
                 replied = await message.channel.fetch_message(message.reference.message_id)
@@ -223,6 +236,7 @@ class AIChat(commands.Cog, name="AI"):
 
                 combined_ids = {m.id for m in msgs}
                 for m in before_msgs + [replied] + after_msgs:
+                    reply_context_ids.add(m.id)
                     if m.id not in combined_ids:
                         msgs.append(m)
         except Exception as e:
@@ -236,8 +250,28 @@ class AIChat(commands.Cog, name="AI"):
                 ordered_msgs.append(m)
                 seen.add(m.id)
 
-        # Extract contents and image URLs
+        # Filter to immediate, relevant context only
+        bot_user = self.bot.user
+        filtered_msgs: List[discord.Message] = []
         for m in ordered_msgs:
+            include = False
+            if m.id in reply_context_ids:
+                include = True
+            elif m.author.id == message.author.id:
+                include = True
+            elif bot_user and m.author.id == bot_user.id:
+                include = True
+            else:
+                try:
+                    if bot_user and bot_user in (m.mentions or []):
+                        include = True
+                except Exception:
+                    pass
+            if include:
+                filtered_msgs.append(m)
+
+        # Extract contents and image URLs
+        for m in filtered_msgs:
             txt = (m.content or "").strip()
             # Truncate overly long context lines
             if len(txt) > 800:
