@@ -8,6 +8,7 @@ import os
 import logging
 import asyncio
 from typing import List, Dict, Optional, Tuple, Any
+import re
 
 import discord
 from discord.ext import commands
@@ -109,16 +110,39 @@ class AIChat(commands.Cog, name="AI"):
 
                 # Build labeled image list from context messages
                 labeled_images: List[Tuple[str, str]] = []
+                all_links: List[str] = []
                 for entry in ctx_entries:
                     label = f"M{entry['index']} by {entry['author']}"
                     for url in entry.get("images", []):
                         labeled_images.append((label, url))
+                    for link in entry.get("links", []) or []:
+                        all_links.append(link)
 
                 # Include images on the mention message itself (labeled as CURRENT)
                 try:
+                    # attachments images
                     for att in message.attachments:
                         if _is_image_attachment(att):
                             labeled_images.append(("CURRENT", att.url))
+                    # embed images and links
+                    for emb in message.embeds:
+                        try:
+                            if emb.image and emb.image.url:
+                                labeled_images.append(("CURRENT", emb.image.url))
+                        except Exception:
+                            pass
+                        try:
+                            if emb.thumbnail and emb.thumbnail.url:
+                                labeled_images.append(("CURRENT", emb.thumbnail.url))
+                        except Exception:
+                            pass
+                        try:
+                            if emb.url:
+                                all_links.append(emb.url)
+                        except Exception:
+                            pass
+                    # links from the message text
+                    all_links.extend(self._extract_links_from_text(message.content or ""))
                 except Exception:
                     pass
 
@@ -181,7 +205,17 @@ class AIChat(commands.Cog, name="AI"):
                 chat.append(self._xai_chat["system"](" ".join(sys_lines)))
 
                 # Provide a clearly delimited transcript block so the model knows message boundaries
-                transcript = self._format_context_transcript(ctx_entries, image_summaries, primary_index)
+                # Deduplicate links while preserving order
+                seen_links: set[str] = set()
+                dedup_links: List[str] = []
+                for u in all_links:
+                    if not u:
+                        continue
+                    if u not in seen_links:
+                        dedup_links.append(u)
+                        seen_links.add(u)
+
+                transcript = self._format_context_transcript(ctx_entries, image_summaries, primary_index, dedup_links)
                 if transcript:
                     chat.append(self._xai_chat["user"](transcript))
 
@@ -218,8 +252,8 @@ class AIChat(commands.Cog, name="AI"):
 
     async def _collect_context(self, message: discord.Message) -> Tuple[List[Dict[str, Any]], Optional[int]]:
         """Collect last N messages (excluding the mention) and optional surrounding reply context.
-        Returns a list of structured entries with clear per-message boundaries and images.
-        Each entry: { index, id, author, is_bot, timestamp, content, images } and the primary index if replying.
+        Returns a list of structured entries with clear per-message boundaries, embeds, links, and images.
+        Each entry: { index, id, author, is_bot, timestamp, content, embed_text, links, images } and the primary index if replying.
         """
 
         # Last N messages before the mention
@@ -279,15 +313,83 @@ class AIChat(commands.Cog, name="AI"):
 
         # Build structured context entries with indexes
         entries: List[Dict[str, Any]] = []
+        url_pattern = re.compile(r"https?://\S+", re.IGNORECASE)
         for idx, m in enumerate(filtered_msgs, start=1):
             txt = (m.content or "").strip()
             # Truncate overly long context lines
             if len(txt) > 800:
                 txt = txt[:800] + "…"
             images: List[str] = []
+            links: List[str] = []
+            embed_text_parts: List[str] = []
             for att in m.attachments:
                 if _is_image_attachment(att):
                     images.append(att.url)
+            # Extract from embeds
+            try:
+                for emb in m.embeds:
+                    # textual parts
+                    try:
+                        if emb.title:
+                            embed_text_parts.append(f"title: {emb.title}")
+                    except Exception:
+                        pass
+                    try:
+                        if emb.description:
+                            embed_text_parts.append(f"description: {emb.description}")
+                    except Exception:
+                        pass
+                    try:
+                        if getattr(emb, 'fields', None):
+                            for fld in emb.fields:
+                                try:
+                                    embed_text_parts.append(f"field: {fld.name} -> {fld.value}")
+                                except Exception:
+                                    continue
+                    except Exception:
+                        pass
+                    try:
+                        if emb.footer and getattr(emb.footer, 'text', None):
+                            embed_text_parts.append(f"footer: {emb.footer.text}")
+                    except Exception:
+                        pass
+                    try:
+                        if emb.author and getattr(emb.author, 'name', None):
+                            embed_text_parts.append(f"author: {emb.author.name}")
+                    except Exception:
+                        pass
+                    # images
+                    try:
+                        if emb.image and emb.image.url:
+                            images.append(emb.image.url)
+                    except Exception:
+                        pass
+                    try:
+                        if emb.thumbnail and emb.thumbnail.url:
+                            images.append(emb.thumbnail.url)
+                    except Exception:
+                        pass
+                    # links
+                    try:
+                        if emb.url:
+                            links.append(emb.url)
+                    except Exception:
+                        pass
+                    # any links in description/title text
+                    try:
+                        if emb.description:
+                            for u in url_pattern.findall(emb.description):
+                                links.append(u)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            # Extract URLs from message text
+            try:
+                for u in url_pattern.findall(m.content or ""):
+                    links.append(u)
+            except Exception:
+                pass
             author = getattr(m.author, "display_name", None) or getattr(m.author, "name", "Unknown")
             try:
                 ts = m.created_at.isoformat()
@@ -300,6 +402,8 @@ class AIChat(commands.Cog, name="AI"):
                 "is_bot": bool(m.author.bot),
                 "timestamp": ts,
                 "content": txt,
+                "embed_text": "\n".join(embed_text_parts) if embed_text_parts else "",
+                "links": links,
                 "images": images,
             })
 
@@ -348,9 +452,10 @@ class AIChat(commands.Cog, name="AI"):
         ctx_entries: List[Dict[str, Any]],
         image_summaries: Optional[List[Tuple[str, str]]] = None,
         primary_index: Optional[int] = None,
+        links_to_fetch: Optional[List[str]] = None,
     ) -> str:
         """Create a clearly delimited transcript of recent context with per-message boundaries.
-        Includes message indexes, authors, timestamps, and image URLs; followed by per-message image summaries.
+        Includes message indexes, authors, timestamps, embed text, links, and image URLs; followed by per-message image summaries.
         """
         if not ctx_entries:
             return ""
@@ -387,6 +492,15 @@ class AIChat(commands.Cog, name="AI"):
                 lines.append(content)
             else:
                 lines.append("text: (no text)")
+            embed_text = (entry.get("embed_text") or "").strip()
+            if embed_text:
+                lines.append("embed:")
+                lines.append(embed_text)
+            msg_links: List[str] = entry.get("links", []) or []
+            if msg_links:
+                lines.append("links:")
+                for u in msg_links:
+                    lines.append(f"- {u}")
             imgs: List[str] = entry.get("images", []) or []
             if imgs:
                 lines.append("images:")
@@ -406,6 +520,10 @@ class AIChat(commands.Cog, name="AI"):
                 # Avoid giant blocks
                 s = summ if len(summ) <= 600 else (summ[:600] + "…")
                 lines.append(f"- [{label}] {s}")
+        if links_to_fetch:
+            lines.append("LINKS TO FETCH (open and analyze via web):")
+            for u in links_to_fetch:
+                lines.append(f"- {u}")
         lines.append("=== CONTEXT END ===")
         return "\n".join(lines)
 
@@ -421,6 +539,15 @@ class AIChat(commands.Cog, name="AI"):
             lines.append(content)
         else:
             lines.append("text: (no text)")
+        embed_text = (entry.get("embed_text") or "").strip()
+        if embed_text:
+            lines.append("embed:")
+            lines.append(embed_text)
+        msg_links: List[str] = entry.get("links", []) or []
+        if msg_links:
+            lines.append("links:")
+            for u in msg_links:
+                lines.append(f"- {u}")
         imgs: List[str] = entry.get("images", []) or []
         if imgs:
             lines.append("images:")
@@ -428,6 +555,15 @@ class AIChat(commands.Cog, name="AI"):
                 lines.append(f"- {u}")
         lines.append("-----")
         return lines
+
+    def _extract_links_from_text(self, text: str) -> List[str]:
+        """Extract HTTP/HTTPS URLs from text."""
+        if not text:
+            return []
+        try:
+            return re.findall(r"https?://\S+", text, flags=re.IGNORECASE)
+        except Exception:
+            return []
 
     async def _send_long_reply(self, message: discord.Message, content: str):
         if not content:
