@@ -104,21 +104,28 @@ class AIChat(commands.Cog, name="AI"):
     async def _handle_ai_request(self, message: discord.Message, prompt: str):
         async with message.channel.typing():
             try:
-                # 1) Collect recent context and any images
-                ctx_messages, image_urls = await self._collect_context(message)
+                # 1) Collect recent context with per-message boundaries and any images
+                ctx_entries = await self._collect_context(message)
 
-                # Include images on the mention message itself
+                # Build labeled image list from context messages
+                labeled_images: List[Tuple[str, str]] = []
+                for entry in ctx_entries:
+                    label = f"M{entry['index']} by {entry['author']}"
+                    for url in entry.get("images", []):
+                        labeled_images.append((label, url))
+
+                # Include images on the mention message itself (labeled as CURRENT)
                 try:
                     for att in message.attachments:
                         if _is_image_attachment(att):
-                            image_urls.append(att.url)
+                            labeled_images.append(("CURRENT", att.url))
                 except Exception:
                     pass
 
-                # 2) Use Grok 2 Vision to summarize images into text context
-                image_summaries = []
-                if image_urls:
-                    image_summaries = await self._summarize_images_with_vision(prompt, image_urls)
+                # 2) Use Grok 2 Vision to summarize images into text context, grouped by message label
+                image_summaries: List[Tuple[str, str]] = []
+                if labeled_images:
+                    image_summaries = await self._summarize_images_with_vision(prompt, labeled_images)
 
                 # 3) Build Grok 4 chat with Live Search enabled
                 SearchParameters = self._xai_chat.get("SearchParameters")
@@ -162,22 +169,10 @@ class AIChat(commands.Cog, name="AI"):
                     )
                 )
 
-                # Add recent conversation context (last N messages)
-                for author_is_bot, content in ctx_messages:
-                    if not content:
-                        continue
-                    if author_is_bot:
-                        chat.append(self._xai_chat["assistant"](content))
-                    else:
-                        chat.append(self._xai_chat["user"](content))
-
-                # Include any image summaries as extra context
-                if image_summaries:
-                    chat.append(
-                        self._xai_chat["user"](
-                            "Image context from recent messages:\n" + "\n".join(f"- {s}" for s in image_summaries)
-                        )
-                    )
+                # Provide a clearly delimited transcript block so the model knows message boundaries
+                transcript = self._format_context_transcript(ctx_entries, image_summaries)
+                if transcript:
+                    chat.append(self._xai_chat["user"](transcript))
 
                 # Finally, the user's mention prompt
                 chat.append(self._xai_chat["user"](prompt))
@@ -210,12 +205,11 @@ class AIChat(commands.Cog, name="AI"):
                 except Exception:
                     pass
 
-    async def _collect_context(self, message: discord.Message) -> Tuple[List[Tuple[bool, str]], List[str]]:
+    async def _collect_context(self, message: discord.Message) -> List[Dict[str, Any]]:
         """Collect last N messages (excluding the mention) and optional surrounding reply context.
-        Returns list of (author_is_bot, content) and image URLs found.
+        Returns a list of structured entries with clear per-message boundaries and images.
+        Each entry: { index, id, author, is_bot, timestamp, content, images }
         """
-        context: List[Tuple[bool, str]] = []
-        image_urls: List[str] = []
 
         # Last N messages before the mention
         try:
@@ -270,27 +264,43 @@ class AIChat(commands.Cog, name="AI"):
             if include:
                 filtered_msgs.append(m)
 
-        # Extract contents and image URLs
-        for m in filtered_msgs:
+        # Build structured context entries with indexes
+        entries: List[Dict[str, Any]] = []
+        for idx, m in enumerate(filtered_msgs, start=1):
             txt = (m.content or "").strip()
             # Truncate overly long context lines
             if len(txt) > 800:
                 txt = txt[:800] + "…"
-            context.append((m.author.bot, txt))
+            images: List[str] = []
             for att in m.attachments:
                 if _is_image_attachment(att):
-                    image_urls.append(att.url)
+                    images.append(att.url)
+            author = getattr(m.author, "display_name", None) or getattr(m.author, "name", "Unknown")
+            ts = None
+            try:
+                ts = m.created_at.isoformat()
+            except Exception:
+                ts = ""
+            entries.append({
+                "index": idx,
+                "id": str(m.id),
+                "author": str(author),
+                "is_bot": bool(m.author.bot),
+                "timestamp": ts,
+                "content": txt,
+                "images": images,
+            })
 
-        return context, image_urls
+        return entries
 
-    async def _summarize_images_with_vision(self, prompt: str, image_urls: List[str]) -> List[str]:
+    async def _summarize_images_with_vision(self, prompt: str, labeled_image_urls: List[Tuple[str, str]]) -> List[Tuple[str, str]]:
         """Use Grok 2 Vision to extract concise context from images.
-        Returns a list of short bullet summaries (strings).
+        Accepts a list of (label, url) pairs and returns a list of (label, summary).
         """
-        summaries: List[str] = []
+        summaries: List[Tuple[str, str]] = []
         try:
-            # Process up to 5 images to control cost
-            for url in image_urls[:5]:
+            # Process up to 6 images to control cost
+            for label, url in labeled_image_urls[:6]:
                 chat = self._client.chat.create(model=self.model_vision)
                 chat.append(
                     self._xai_chat["user"](
@@ -305,10 +315,47 @@ class AIChat(commands.Cog, name="AI"):
                     # Keep it short
                     if len(text) > 300:
                         text = text[:300] + "…"
-                    summaries.append(text)
+                    summaries.append((label, text))
         except Exception as e:
             logger.debug(f"Vision summarization failed: {e}")
         return summaries
+
+    def _format_context_transcript(
+        self,
+        ctx_entries: List[Dict[str, Any]],
+        image_summaries: Optional[List[Tuple[str, str]]] = None,
+    ) -> str:
+        """Create a clearly delimited transcript of recent context with per-message boundaries.
+        Includes message indexes, authors, timestamps, and image URLs; followed by per-message image summaries.
+        """
+        if not ctx_entries:
+            return ""
+        lines: List[str] = []
+        lines.append("=== CONTEXT START ===")
+        for entry in ctx_entries:
+            lines.append(
+                f"[M{entry['index']}] author={entry['author']} bot={entry['is_bot']} id={entry['id']} time={entry['timestamp']}"
+            )
+            content = entry.get("content", "").strip()
+            if content:
+                lines.append("text:")
+                lines.append(content)
+            else:
+                lines.append("text: (no text)")
+            imgs: List[str] = entry.get("images", []) or []
+            if imgs:
+                lines.append("images:")
+                for u in imgs:
+                    lines.append(f"- {u}")
+            lines.append("-----")
+        if image_summaries:
+            lines.append("Image summaries by message:")
+            for label, summ in image_summaries:
+                # Avoid giant blocks
+                s = summ if len(summ) <= 600 else (summ[:600] + "…")
+                lines.append(f"- [{label}] {s}")
+        lines.append("=== CONTEXT END ===")
+        return "\n".join(lines)
 
     async def _send_long_reply(self, message: discord.Message, content: str):
         if not content:
