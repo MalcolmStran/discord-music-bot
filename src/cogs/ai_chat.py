@@ -55,7 +55,7 @@ class AIChat(commands.Cog, name="AI"):
                     assistant as x_assistant,
                     image as x_image,
                 )
-                from xai_sdk.search import SearchParameters  # type: ignore
+                from xai_sdk.search import SearchParameters, web_source, news_source, x_source  # type: ignore
                 # Longer timeout for reasoning
                 self._client = Client(api_key=self.api_key, timeout=3600)
                 self._xai_chat = {
@@ -64,6 +64,9 @@ class AIChat(commands.Cog, name="AI"):
                     "assistant": x_assistant,
                     "image": x_image,
                     "SearchParameters": SearchParameters,
+                    "web_source": web_source,
+                    "news_source": news_source,
+                    "x_source": x_source,
                 }
                 self.enabled = True
             except Exception as e:
@@ -122,22 +125,28 @@ class AIChat(commands.Cog, name="AI"):
                 if not SearchParameters:
                     await message.reply("⚠️ AI is not fully configured. Missing xAI SDK.")
                     return
+                # Prefer explicit sources via helpers; otherwise omit to use defaults
+                web_src = self._xai_chat.get("web_source")
+                news_src = self._xai_chat.get("news_source")
+                x_src = self._xai_chat.get("x_source")
+                search_kwargs = {
+                    "mode": "on",
+                    "return_citations": True,
+                    "max_search_results": 10,
+                }
+                if web_src and news_src and x_src:
+                    search_kwargs["sources"] = [web_src(), news_src(), x_src()]
+
                 chat = self._client.chat.create(
                     model=self.model_text,
-                    search_parameters=SearchParameters(
-                        mode="on",  # Always enable live search
-                        return_citations=True,
-                        # Enable web/news/X sources explicitly
-                        sources=[{"type": "web"}, {"type": "news"}, {"type": "x"}],
-                        max_search_results=10,
-                    ),
+                    search_parameters=SearchParameters(**search_kwargs),
                 )
 
                 # System prompt to guide behavior
                 chat.append(
                     self._xai_chat["system"](
-                        "You are Grok, a helpful Discord assistant. "
-                        "Answer clearly and concisely. Cite sources when using Live Search. "
+                        "You are Lenna, a helpful Discord assistant. "
+                        "Answer clearly and concisely. Cite sources when using Live Search only if relevant. "
                         "Be robust to informal tone and extract intent from short prompts."
                     )
                 )
@@ -163,13 +172,21 @@ class AIChat(commands.Cog, name="AI"):
                 chat.append(self._xai_chat["user"](prompt))
 
                 # 4) Sample response
-                response = chat.sample()
+                # Offload blocking Grok call to a thread to avoid blocking the Discord event loop
+                response = await asyncio.to_thread(chat.sample)
                 content = response.content if hasattr(response, "content") else str(response)
 
                 # Append citations if available
                 citations = getattr(response, "citations", None)
                 if citations:
-                    content = f"{content}\n\nSources:\n" + "\n".join(f"- {url}" for url in citations)
+                    # De-duplicate and format citations to avoid Discord embeds
+                    uniq: List[str] = []
+                    for u in citations:
+                        if isinstance(u, str) and u and u not in uniq:
+                            uniq.append(u)
+                    if uniq:
+                        citations_block = "Sources:\n" + "```\n" + "\n".join(uniq) + "\n```"
+                        content = f"{content}\n\n{citations_block}"
 
                 # Respect Discord 2000 char limit
                 await self._send_long_reply(message, content)
@@ -247,7 +264,8 @@ class AIChat(commands.Cog, name="AI"):
                         self._xai_chat["image"](url)
                     )
                 )
-                resp = chat.sample()
+                # Offload blocking call
+                resp = await asyncio.to_thread(chat.sample)
                 text = getattr(resp, "content", "").strip()
                 if text:
                     # Keep it short
@@ -273,13 +291,35 @@ class AIChat(commands.Cog, name="AI"):
             try:
                 if i == 0:
                     sent = await message.reply(chunk)
+                    # Suppress embeds to avoid link preview spam
+                    await self._suppress_message_embeds(sent)
                 else:
                     if sent is not None:
-                        await message.channel.send(chunk, reference=sent)
+                        follow = await message.channel.send(chunk, reference=sent)
+                        await self._suppress_message_embeds(follow)
                     else:
-                        await message.channel.send(chunk)
+                        follow = await message.channel.send(chunk)
+                        await self._suppress_message_embeds(follow)
             except Exception as e:
                 logger.debug(f"Failed to send chunk {i}: {e}")
+
+    async def _suppress_message_embeds(self, msg: discord.Message) -> None:
+        """Try to suppress embeds on a message to prevent auto-embed spam."""
+        try:
+            # discord.py supports edit(suppress=True)
+            await msg.edit(suppress=True)
+            return
+        except Exception:
+            pass
+        try:
+            # Some versions expose suppress_embeds API (may be sync)
+            suppress = getattr(msg, "suppress_embeds", None)
+            if callable(suppress):
+                result = suppress(True)
+                if asyncio.iscoroutine(result):
+                    await result
+        except Exception:
+            pass
 
 
 async def setup(bot: commands.Bot):
