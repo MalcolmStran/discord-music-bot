@@ -105,7 +105,7 @@ class AIChat(commands.Cog, name="AI"):
         async with message.channel.typing():
             try:
                 # 1) Collect recent context with per-message boundaries and any images
-                ctx_entries = await self._collect_context(message)
+                ctx_entries, primary_index = await self._collect_context(message)
 
                 # Build labeled image list from context messages
                 labeled_images: List[Tuple[str, str]] = []
@@ -125,6 +125,12 @@ class AIChat(commands.Cog, name="AI"):
                 # 2) Use Grok 2 Vision to summarize images into text context, grouped by message label
                 image_summaries: List[Tuple[str, str]] = []
                 if labeled_images:
+                    # Ensure primary message images (if any) are summarized first
+                    if primary_index is not None:
+                        def primary_first(t: Tuple[str, str]) -> Tuple[int, str]:
+                            lbl, _ = t
+                            return (0 if lbl.startswith(f"M{primary_index} ") or lbl.startswith("CURRENT") else 1, lbl)
+                        labeled_images.sort(key=primary_first)
                     image_summaries = await self._summarize_images_with_vision(prompt, labeled_images)
 
                 # 3) Build Grok 4 chat with Live Search enabled
@@ -160,17 +166,22 @@ class AIChat(commands.Cog, name="AI"):
                 )
 
                 # System prompt to guide behavior: strictly use only immediate context provided
-                chat.append(
-                    self._xai_chat["system"](
-                        "You are Lenna, a helpful Discord assistant. "
-                        "Answer clearly and concisely. Only include sources/citations if the user explicitly asks for them. "
-                        "Only use the recent messages included below (limited history and any reply surroundings). "
-                        "Do not bring in earlier, unrelated channel messages beyond this provided context."
+                sys_lines = [
+                    "You are Lenna, a helpful Discord assistant.",
+                    "Answer clearly and concisely.",
+                    "Only include sources/citations if the user explicitly asks for them.",
+                    "Only use the recent messages included below (limited history and any reply surroundings).",
+                    "Do not bring in earlier, unrelated channel messages beyond this provided context.",
+                ]
+                if primary_index is not None:
+                    sys_lines.append(
+                        f"The user is replying to the message labeled [M{primary_index}] — treat this as the PRIMARY MESSAGE. "
+                        "Use other messages only if they add necessary context or resolve ambiguity."
                     )
-                )
+                chat.append(self._xai_chat["system"](" ".join(sys_lines)))
 
                 # Provide a clearly delimited transcript block so the model knows message boundaries
-                transcript = self._format_context_transcript(ctx_entries, image_summaries)
+                transcript = self._format_context_transcript(ctx_entries, image_summaries, primary_index)
                 if transcript:
                     chat.append(self._xai_chat["user"](transcript))
 
@@ -205,10 +216,10 @@ class AIChat(commands.Cog, name="AI"):
                 except Exception:
                     pass
 
-    async def _collect_context(self, message: discord.Message) -> List[Dict[str, Any]]:
+    async def _collect_context(self, message: discord.Message) -> Tuple[List[Dict[str, Any]], Optional[int]]:
         """Collect last N messages (excluding the mention) and optional surrounding reply context.
         Returns a list of structured entries with clear per-message boundaries and images.
-        Each entry: { index, id, author, is_bot, timestamp, content, images }
+        Each entry: { index, id, author, is_bot, timestamp, content, images } and the primary index if replying.
         """
 
         # Last N messages before the mention
@@ -221,9 +232,11 @@ class AIChat(commands.Cog, name="AI"):
 
         # Include reply target and its surrounding messages
         reply_context_ids: set[int] = set()
+        replied_id: Optional[int] = None
         try:
             if message.reference and message.reference.message_id:
                 replied = await message.channel.fetch_message(message.reference.message_id)
+                replied_id = replied.id
 
                 before_msgs = [m async for m in message.channel.history(limit=self.reply_surround, before=replied)]
                 after_msgs = [m async for m in message.channel.history(limit=self.reply_surround, after=replied, oldest_first=True)]
@@ -237,7 +250,7 @@ class AIChat(commands.Cog, name="AI"):
             logger.debug(f"Failed to fetch reply surroundings: {e}")
 
         # De-duplicate while preserving order
-        seen: set = set()
+        seen: set[int] = set()
         ordered_msgs: List[discord.Message] = []
         for m in msgs:
             if m.id not in seen:
@@ -276,7 +289,6 @@ class AIChat(commands.Cog, name="AI"):
                 if _is_image_attachment(att):
                     images.append(att.url)
             author = getattr(m.author, "display_name", None) or getattr(m.author, "name", "Unknown")
-            ts = None
             try:
                 ts = m.created_at.isoformat()
             except Exception:
@@ -291,7 +303,18 @@ class AIChat(commands.Cog, name="AI"):
                 "images": images,
             })
 
-        return entries
+        # Determine primary index (the replied-to message), if present
+        primary_index: Optional[int] = None
+        if replied_id is not None:
+            for e in entries:
+                if e.get("id") == str(replied_id):
+                    try:
+                        primary_index = int(e.get("index") or 0)
+                    except Exception:
+                        primary_index = None
+                    break
+
+        return entries, primary_index
 
     async def _summarize_images_with_vision(self, prompt: str, labeled_image_urls: List[Tuple[str, str]]) -> List[Tuple[str, str]]:
         """Use Grok 2 Vision to extract concise context from images.
@@ -324,6 +347,7 @@ class AIChat(commands.Cog, name="AI"):
         self,
         ctx_entries: List[Dict[str, Any]],
         image_summaries: Optional[List[Tuple[str, str]]] = None,
+        primary_index: Optional[int] = None,
     ) -> str:
         """Create a clearly delimited transcript of recent context with per-message boundaries.
         Includes message indexes, authors, timestamps, and image URLs; followed by per-message image summaries.
@@ -332,7 +356,28 @@ class AIChat(commands.Cog, name="AI"):
             return ""
         lines: List[str] = []
         lines.append("=== CONTEXT START ===")
+        # Emit PRIMARY MESSAGE first if available
+        primary_entry: Optional[Dict[str, Any]] = None
+        if primary_index is not None:
+            for entry in ctx_entries:
+                try:
+                    if int(entry.get("index", -1)) == primary_index:
+                        primary_entry = entry
+                        break
+                except Exception:
+                    continue
+        if primary_entry is not None:
+            lines.append("PRIMARY MESSAGE:")
+            lines.extend(self._format_single_entry(primary_entry))
+
+        # Additional context
+        lines.append("ADDITIONAL CONTEXT:")
         for entry in ctx_entries:
+            try:
+                if primary_entry is not None and primary_index is not None and int(entry.get("index", -1)) == primary_index:
+                    continue
+            except Exception:
+                pass
             lines.append(
                 f"[M{entry['index']}] author={entry['author']} bot={entry['is_bot']} id={entry['id']} time={entry['timestamp']}"
             )
@@ -350,12 +395,39 @@ class AIChat(commands.Cog, name="AI"):
             lines.append("-----")
         if image_summaries:
             lines.append("Image summaries by message:")
-            for label, summ in image_summaries:
+            # Primary-first ordering for summaries too
+            ordered = image_summaries
+            if primary_index is not None:
+                def prim_sort(t: Tuple[str, str]) -> Tuple[int, str]:
+                    lbl, _ = t
+                    return (0 if lbl.startswith(f"M{primary_index} ") or lbl.startswith("CURRENT") else 1, lbl)
+                ordered = sorted(image_summaries, key=prim_sort)
+            for label, summ in ordered:
                 # Avoid giant blocks
                 s = summ if len(summ) <= 600 else (summ[:600] + "…")
                 lines.append(f"- [{label}] {s}")
         lines.append("=== CONTEXT END ===")
         return "\n".join(lines)
+
+    def _format_single_entry(self, entry: Dict[str, Any]) -> List[str]:
+        """Helper to format a single message entry for the transcript."""
+        lines: List[str] = []
+        lines.append(
+            f"[M{entry['index']}] author={entry['author']} bot={entry['is_bot']} id={entry['id']} time={entry['timestamp']}"
+        )
+        content = (entry.get("content") or "").strip()
+        if content:
+            lines.append("text:")
+            lines.append(content)
+        else:
+            lines.append("text: (no text)")
+        imgs: List[str] = entry.get("images", []) or []
+        if imgs:
+            lines.append("images:")
+            for u in imgs:
+                lines.append(f"- {u}")
+        lines.append("-----")
+        return lines
 
     async def _send_long_reply(self, message: discord.Message, content: str):
         if not content:
