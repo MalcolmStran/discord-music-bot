@@ -27,6 +27,11 @@ A feature-rich Discord bot that can play music from YouTube and automatically co
 - Cog-based architecture for easy maintenance
 - Environment variable configuration
 - Automatic cleanup of temporary files
+ 
+### 🤖 AI Chat via @mention (Optional)
+- Mention the bot to ask questions or chat: uses xAI Grok 4 with Live Search.
+- If recent messages include images, the bot uses Grok 2 Vision to extract relevant details.
+- Includes the last 10 messages for context and, when replying, the referenced message plus surrounding messages.
 
 ## Prerequisites
 
@@ -85,6 +90,14 @@ DOWNLOAD_DIR=./downloads
 
 # Logging
 LOG_LEVEL=INFO
+
+# Optional — xAI / Grok for @mention AI chat
+# Create an API key at https://console.x.ai/team/default/api-keys
+XAI_API_KEY=your_xai_api_key_here
+XAI_TEXT_MODEL=grok-4
+XAI_VISION_MODEL=grok-2-vision
+AI_HISTORY_COUNT=10
+AI_REPLY_SURROUND=2
 ```
 
 ### 4. Run the Bot
@@ -169,6 +182,10 @@ docker run -d --name discord-music-bot \
 - `!convert <URL>` - Manually convert Twitter/TikTok URL
 - `!mediainfo` - Show media handler information
 
+### AI Chat
+- Mention the bot in a message to chat or ask questions, e.g. `@YourBot what are today’s headlines?`
+- The bot will search the web (Live Search) and cite sources when available.
+
 ### Admin Commands (Bot Owner Only)
 - `!reload <cog>` - Reload a cog
 - `!shutdown` - Shutdown the bot
@@ -230,6 +247,9 @@ discordbot/
 - `COMMAND_PREFIX` - Bot command prefix (default: !)
 - `DOWNLOAD_DIR` - Directory for temporary downloads (default: ./downloads)
 - `LOG_LEVEL` - Logging level: DEBUG, INFO, WARNING, ERROR (default: INFO)
+- `XAI_API_KEY` - Enables @mention AI chat (optional). If not set, the feature is disabled.
+- `AI_HISTORY_COUNT` - Number of previous messages to include in context (default: 10)
+- `AI_REPLY_SURROUND` - Number of messages before/after a replied message to include (default: 2)
 
 ### FFmpeg Requirements
 The bot requires FFmpeg for audio processing. Make sure it's installed and available in your system PATH.
