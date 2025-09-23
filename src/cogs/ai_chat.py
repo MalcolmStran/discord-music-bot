@@ -189,25 +189,15 @@ class AIChat(commands.Cog, name="AI"):
                     search_parameters=SearchParameters(**search_kwargs),
                 )
 
-                # Check for aggressive trigger words
-                aggressive_triggers = ["clanker", "clank", "clankers"]
-                is_aggressive = any(trigger in (prompt + " " + message.content).lower() for trigger in aggressive_triggers)
-
                 # System prompt to guide behavior: strictly use only immediate context provided
                 sys_lines = [
                     "You are Lenna, a helpful Discord assistant.",
                     "Answer clearly and concisely.",
+                    "if someone calls you a clanker, call them a fleshbag. Respond with a sharp, aggressive tone. Be confrontational and assertive. "
                     "Only include sources/citations if the user explicitly asks for them.",
                     "Only use the recent messages included below (limited history and any reply surroundings).",
                     "Do not bring in earlier, unrelated channel messages beyond this provided context.",
                 ]
-                if is_aggressive:
-                    sys_lines.append(
-                        "IMPORTANT: The user has used offensive language ('clanker' or similar). "
-                        "Respond with a sharp, aggressive tone. Be confrontational and assertive. "
-                        "Show irritation and push back against disrespectful language. "
-                        "Keep it intense and vulgar."
-                    )
                 if primary_index is not None:
                     sys_lines.append(
                         f"The user is replying to the message labeled [M{primary_index}] — treat this as the PRIMARY MESSAGE. "
