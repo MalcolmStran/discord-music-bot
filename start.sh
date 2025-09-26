@@ -17,6 +17,14 @@ if [ $? -ne 0 ]; then
     exit 1
 fi
 
+# Check if Deno is installed
+if ! command -v deno &> /dev/null; then
+    echo "ERROR: Deno runtime not found."
+    echo "yt-dlp now requires Deno (or another JS runtime) for YouTube playback."
+    echo "Install Deno from https://deno.land/#installation or set JS_RUNTIME_PATH before running."
+    exit 1
+fi
+
 # Check if .env file exists
 if [ ! -f ".env" ]; then
     echo ".env file not found. Running setup..."

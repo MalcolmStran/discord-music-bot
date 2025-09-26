@@ -19,7 +19,7 @@ import config
 
 from ..utils.queue import Queue
 from ..utils.player import Player
-from ..utils.ytdl import YTDLSource
+from ..utils.ytdl import MissingJSRuntimeError, YTDLSource
 
 logger = logging.getLogger(__name__)
 
@@ -92,6 +92,8 @@ class MusicCog(commands.Cog, name="Music"):
                 # Start playing if not already playing
                 if not player.is_playing and not queue.is_empty():
                     await self._play_next(ctx)
+            except MissingJSRuntimeError as e:
+                await ctx.send(f"⚠️ {e}")
             except Exception as e:
                 logger.error(f"Error in play command: {e}")
                 await ctx.send(f"Error playing song: {str(e)}")
@@ -163,6 +165,9 @@ class MusicCog(commands.Cog, name="Music"):
             # Process full playlist in background
             self.bot.loop.create_task(self._process_full_playlist(ctx, query, progress_msg))
         
+        except MissingJSRuntimeError as e:
+            await progress_msg.edit(content=f"⚠️ {e}")
+            raise
         except Exception as e:
             await progress_msg.edit(content=f"❌ Error processing playlist: {str(e)}")
     
@@ -212,6 +217,10 @@ class MusicCog(commands.Cog, name="Music"):
             
             await progress_msg.edit(content=summary)
         
+        except MissingJSRuntimeError as e:
+            logger.error(f"Error processing playlist: {e}")
+            await progress_msg.edit(content=f"⚠️ {e}")
+            return
         except Exception as e:
             logger.error(f"Error processing playlist: {e}")
             await progress_msg.edit(content=f"❌ Error processing playlist: {str(e)}")

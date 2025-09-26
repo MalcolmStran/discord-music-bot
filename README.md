@@ -35,7 +35,12 @@ A feature-rich Discord bot that can play music from YouTube and automatically co
 2. **FFmpeg** - Required for audio processing
    - Windows: Download from [ffmpeg.org](https://ffmpeg.org/download.html)
    - Add FFmpeg to your system PATH
-3. **Git** (optional, for cloning)
+3. **Deno 1.41+** - JavaScript runtime required by yt-dlp for YouTube playback
+   - Windows: `winget install deno.deno` or download from [deno.land](https://deno.land/#installation)
+   - macOS: `brew install deno`
+   - Linux: Use your package manager or the install script on deno.land
+   - Ensure `deno` is available in your PATH before running the bot
+4. **Git** (optional, for cloning)
 
 ### Python Dependencies
 All Python dependencies are listed in `requirements.txt` and will be installed automatically.
@@ -82,6 +87,10 @@ DEFAULT_VOLUME=0.5
 # Bot Settings
 COMMAND_PREFIX=!
 DOWNLOAD_DIR=./downloads
+
+# JavaScript Runtime for yt-dlp
+JS_RUNTIME=deno
+JS_RUNTIME_PATH=
 
 # Logging
 LOG_LEVEL=INFO
@@ -198,6 +207,8 @@ discordbot/
 - `DEFAULT_VOLUME` - Default volume level 0.0-1.0 (default: 0.5)
 - `COMMAND_PREFIX` - Bot command prefix (default: !)
 - `DOWNLOAD_DIR` - Directory for temporary downloads (default: ./downloads)
+- `JS_RUNTIME` - Name of the JavaScript runtime for yt-dlp (default: deno)
+- `JS_RUNTIME_PATH` - Absolute path to the runtime if not in PATH (optional)
 - `LOG_LEVEL` - Logging level: DEBUG, INFO, WARNING, ERROR (default: INFO)
 
 ### FFmpeg Requirements
@@ -214,6 +225,7 @@ The bot requires FFmpeg for audio processing. Make sure it's installed and avail
 
 **Music commands fail:**
 - Ensure FFmpeg is installed and in PATH
+- Make sure Deno (or another supported JavaScript runtime) is installed and accessible
 - Check if the bot has voice permissions
 - Verify you're in a voice channel
 

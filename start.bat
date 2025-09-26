@@ -11,6 +11,16 @@ if errorlevel 1 (
     exit /b 1
 )
 
+REM Check if Deno (JS runtime) is installed
+deno --version >nul 2>&1
+if errorlevel 1 (
+    echo ERROR: Deno runtime not found.
+    echo yt-dlp now requires Deno (or another JS runtime) for YouTube playback.
+    echo Install Deno from https://deno.land/#installation or set JS_RUNTIME_PATH in your environment.
+    pause
+    exit /b 1
+)
+
 REM Check if .env file exists
 if not exist ".env" (
     echo .env file not found. Running setup...

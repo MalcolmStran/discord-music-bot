@@ -37,6 +37,33 @@ def check_ffmpeg():
     print("- Linux: sudo apt install ffmpeg")
     return False
 
+def check_js_runtime():
+    """Check for a JavaScript runtime required by yt-dlp (Deno, Node, etc.)"""
+    runtime_env = os.environ.get('JS_RUNTIME')
+    runtime_path = os.environ.get('JS_RUNTIME_PATH')
+
+    if runtime_path:
+        candidate = Path(runtime_path).expanduser()
+        if candidate.exists():
+            print(f"✅ JavaScript runtime found at {candidate}")
+            return True
+        else:
+            print(f"⚠️ JS_RUNTIME_PATH is set to '{candidate}', but the file does not exist")
+
+    search_names = [runtime_env] if runtime_env else []
+    if 'deno' not in search_names:
+        search_names.append('deno')
+
+    for name in filter(None, search_names):
+        if shutil.which(name):
+            print(f"✅ JavaScript runtime available: {name}")
+            return True
+
+    print("❌ JavaScript runtime not found!")
+    print("yt-dlp now requires a JS runtime like Deno to process YouTube videos.")
+    print("Install Deno (recommended) from https://deno.land/#installation or set JS_RUNTIME_PATH in your environment.")
+    return False
+
 def install_requirements():
     """Install Python requirements"""
     try:
@@ -139,6 +166,11 @@ def main():
     if not check_ffmpeg():
         print("\n⚠️ FFmpeg is required but not found.")
         response = input("Continue setup anyway? (y/N): ").lower().strip()
+        if response != 'y':
+            return False
+
+    if not check_js_runtime():
+        response = input("Continue setup without configuring a JS runtime? (y/N): ").lower().strip()
         if response != 'y':
             return False
     
