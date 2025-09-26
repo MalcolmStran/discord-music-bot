@@ -23,5 +23,13 @@ DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
 COMMAND_PREFIX = os.getenv('COMMAND_PREFIX', '!')
 DOWNLOAD_DIR = os.getenv('DOWNLOAD_DIR', './downloads')
 
+# JavaScript runtime settings for yt-dlp
+JS_RUNTIME_PATH = os.getenv('JS_RUNTIME_PATH')
+JS_RUNTIME_CANDIDATES = [
+	candidate.strip()
+	for candidate in os.getenv('JS_RUNTIME_CANDIDATES', '').split(',')
+	if candidate.strip()
+]
+
 # Logging level
 LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO')

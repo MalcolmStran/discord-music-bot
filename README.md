@@ -35,7 +35,11 @@ A feature-rich Discord bot that can play music from YouTube and automatically co
 2. **FFmpeg** - Required for audio processing
    - Windows: Download from [ffmpeg.org](https://ffmpeg.org/download.html)
    - Add FFmpeg to your system PATH
-3. **Git** (optional, for cloning)
+3. **JavaScript runtime (Node.js recommended)** - yt-dlp now requires an external JS engine
+   - Windows/macOS/Linux: Install [Node.js](https://nodejs.org/) LTS and ensure `node` is available in your PATH
+   - Alternatively you can use [Deno](https://deno.com), [Bun](https://bun.sh), or another compatible runtime
+   - Verify the installation with `node --version`
+4. **Git** (optional, for cloning)
 
 ### Python Dependencies
 All Python dependencies are listed in `requirements.txt` and will be installed automatically.
@@ -82,6 +86,10 @@ DEFAULT_VOLUME=0.5
 # Bot Settings
 COMMAND_PREFIX=!
 DOWNLOAD_DIR=./downloads
+
+# yt-dlp JavaScript runtime overrides (optional)
+# JS_RUNTIME_PATH="C:/Program Files/nodejs/node.exe"
+# JS_RUNTIME_CANDIDATES=node,nodejs,bun,deno
 
 # Logging
 LOG_LEVEL=INFO
@@ -230,6 +238,8 @@ discordbot/
 - `COMMAND_PREFIX` - Bot command prefix (default: !)
 - `DOWNLOAD_DIR` - Directory for temporary downloads (default: ./downloads)
 - `LOG_LEVEL` - Logging level: DEBUG, INFO, WARNING, ERROR (default: INFO)
+- `JS_RUNTIME_PATH` - Absolute path to a JavaScript runtime executable if it's not in PATH
+- `JS_RUNTIME_CANDIDATES` - Comma-separated list of runtime names to probe when resolving the JS engine
 
 ### FFmpeg Requirements
 The bot requires FFmpeg for audio processing. Make sure it's installed and available in your system PATH.
@@ -247,6 +257,8 @@ The bot requires FFmpeg for audio processing. Make sure it's installed and avail
 - Ensure FFmpeg is installed and in PATH
 - Check if the bot has voice permissions
 - Verify you're in a voice channel
+- Confirm a JavaScript runtime (Node.js, Deno, Bun, etc.) is installed and accessible
+- If you see "yt-dlp now requires a JavaScript runtime", install Node.js or set `JS_RUNTIME_PATH`
 
 **Voice connection issues (Error 4006):**
 - Use `!reconnect` command to manually reconnect

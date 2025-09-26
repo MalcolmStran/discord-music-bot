@@ -2,19 +2,25 @@
 YouTube-DL source handling for the music bot
 """
 
+import os
+import shutil
 import discord
 import yt_dlp
 import asyncio
 import logging
 import re
 import tempfile
+from functools import lru_cache
 from pathlib import Path
-from typing import Dict, List, Union, Optional, Any
+from typing import Dict, List, Union, Optional, Any, cast
+
+from config import JS_RUNTIME_PATH, JS_RUNTIME_CANDIDATES
+from yt_dlp.utils import DownloadError
 
 logger = logging.getLogger(__name__)
 
 # YouTube-DL options
-YTDL_FORMAT_OPTIONS = {
+YTDL_FORMAT_OPTIONS: Dict[str, Any] = {
     'format': 'bestaudio/best',
     'extractaudio': True,
     'audioformat': 'mp3',
@@ -30,6 +36,84 @@ YTDL_FORMAT_OPTIONS = {
     'source_address': '0.0.0.0',
     'extract_flat': False,
 }
+
+DEFAULT_JS_RUNTIME_CANDIDATES = (
+    'node',
+    'nodejs',
+    'bun',
+    'deno',
+    'quickjs',
+    'qjs',
+    'gjs',
+)
+
+
+class MissingJavaScriptRuntime(RuntimeError):
+    """Raised when no supported JavaScript runtime is available for yt-dlp."""
+
+
+def _is_executable(path: Path) -> bool:
+    return path.is_file() and os.access(str(path), os.X_OK)
+
+
+def _inject_runtime_directory(runtime_path: Path) -> None:
+    runtime_dir = str(runtime_path.parent.resolve())
+    current_path = os.environ.get('PATH', '')
+    path_entries = [entry.strip() for entry in current_path.split(os.pathsep) if entry]
+    if runtime_dir not in path_entries:
+        os.environ['PATH'] = os.pathsep.join([runtime_dir] + path_entries)
+
+
+def _iter_runtime_candidates() -> List[str]:
+    candidates: List[str] = []
+    if JS_RUNTIME_PATH:
+        candidates.append(JS_RUNTIME_PATH)
+    if JS_RUNTIME_CANDIDATES:
+        candidates.extend(JS_RUNTIME_CANDIDATES)
+    for default_candidate in DEFAULT_JS_RUNTIME_CANDIDATES:
+        if default_candidate not in candidates:
+            candidates.append(default_candidate)
+    return candidates
+
+
+@lru_cache(maxsize=1)
+def ensure_js_runtime() -> Path:
+    """Ensure a compatible JavaScript runtime exists for yt-dlp."""
+    candidates = _iter_runtime_candidates()
+    for candidate in candidates:
+        if not candidate:
+            continue
+
+        candidate_path = Path(candidate).expanduser()
+        if candidate_path.exists():
+            if _is_executable(candidate_path):
+                _inject_runtime_directory(candidate_path)
+                logger.debug("Using JavaScript runtime at %s", candidate_path)
+                return candidate_path
+            continue
+
+        resolved = shutil.which(candidate)
+        if resolved:
+            resolved_path = Path(resolved)
+            if _is_executable(resolved_path):
+                _inject_runtime_directory(resolved_path)
+                logger.debug("Using JavaScript runtime '%s' resolved to %s", candidate, resolved_path)
+                return resolved_path
+
+    message = (
+        "yt-dlp now requires a JavaScript runtime (for example Node.js) to decipher YouTube signatures. "
+        "Install Node.js, Deno, Bun, or another supported runtime and make sure it is available in PATH, "
+        "or set JS_RUNTIME_PATH / JS_RUNTIME_CANDIDATES in your environment."
+    )
+    logger.error(message)
+    raise MissingJavaScriptRuntime(message)
+
+
+def _require_js_runtime() -> Path:
+    try:
+        return ensure_js_runtime()
+    except MissingJavaScriptRuntime as exc:
+        raise Exception(str(exc))
 
 class YTDLSource(discord.PCMVolumeTransformer):
     def __init__(self, source, *, data, volume=0.5):
@@ -47,9 +131,10 @@ class YTDLSource(discord.PCMVolumeTransformer):
     async def create_source(cls, ctx, search: str, *, loop=None, playlist_items=None):
         """Create a source from a search query or URL"""
         loop = loop or asyncio.get_event_loop()
+        _require_js_runtime()
         
         # Prepare YTDL options
-        ytdl_opts = YTDL_FORMAT_OPTIONS.copy()
+        ytdl_opts: Dict[str, Any] = YTDL_FORMAT_OPTIONS.copy()
         if playlist_items:
             ytdl_opts['playliststart'] = 1
             ytdl_opts['playlistend'] = int(playlist_items)
@@ -60,7 +145,7 @@ class YTDLSource(discord.PCMVolumeTransformer):
                 ytdl_opts['extract_flat'] = True
                 
                 # Extract playlist info first
-                ytdl = yt_dlp.YoutubeDL(ytdl_opts)
+                ytdl = yt_dlp.YoutubeDL(ytdl_opts)  # type: ignore[arg-type]
                 partial_data = await loop.run_in_executor(
                     None, lambda: ytdl.extract_info(search, download=False)
                 )
@@ -92,7 +177,9 @@ class YTDLSource(discord.PCMVolumeTransformer):
                         )
                         
                         if entry_data:
-                            processed_entries.append(cls._format_song_data(entry_data))
+                            processed_entries.append(
+                                cls._format_song_data(cast(Dict[str, Any], entry_data))
+                            )
                     
                     except Exception as e:
                         logger.error(f"Error processing playlist entry: {e}")
@@ -102,7 +189,7 @@ class YTDLSource(discord.PCMVolumeTransformer):
             
             else:
                 # Single video or search
-                ytdl = yt_dlp.YoutubeDL(ytdl_opts)
+                ytdl = yt_dlp.YoutubeDL(ytdl_opts)  # type: ignore[arg-type]
                 data = await loop.run_in_executor(
                     None, lambda: ytdl.extract_info(search, download=False)
                 )
@@ -118,12 +205,13 @@ class YTDLSource(discord.PCMVolumeTransformer):
                         raise Exception("No results found")
                     
                     # Return first result for search
-                    return cls._format_song_data(entries[0])
+                    first_entry = cast(Dict[str, Any], entries[0])
+                    return cls._format_song_data(first_entry)
                 else:
                     # Direct video
-                    return cls._format_song_data(data)
+                    return cls._format_song_data(cast(Dict[str, Any], data))
         
-        except yt_dlp.utils.DownloadError as e:
+        except DownloadError as e:
             error_msg = str(e)
             if "Video unavailable" in error_msg:
                 raise Exception("Video is unavailable")
@@ -159,14 +247,16 @@ class YTDLSource(discord.PCMVolumeTransformer):
     async def regather_stream(cls, song_data: Dict[str, Any], *, loop=None, volume=0.5):
         """Regather the stream URL for playback"""
         loop = loop or asyncio.get_event_loop()
+        _require_js_runtime()
         
         try:
             # Check if we have a direct URL that's still valid
-            if song_data.get('url'):
+            stream_url = song_data.get('url')
+            if stream_url:
                 try:
                     return cls(
                         discord.FFmpegPCMAudio(
-                            song_data['url'], 
+                            str(stream_url), 
                             before_options='-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
                             options='-vn'
                         ),
@@ -181,25 +271,28 @@ class YTDLSource(discord.PCMVolumeTransformer):
             if not webpage_url:
                 raise Exception("No URL available for regathering")
             
-            ytdl_opts = YTDL_FORMAT_OPTIONS.copy()
-            ytdl = yt_dlp.YoutubeDL(ytdl_opts)
+            ytdl_opts: Dict[str, Any] = YTDL_FORMAT_OPTIONS.copy()
+            ytdl = yt_dlp.YoutubeDL(ytdl_opts)  # type: ignore[arg-type]
             
             data = await loop.run_in_executor(
                 None, lambda: ytdl.extract_info(webpage_url, download=False)
             )
-            
-            if not data or not data.get('url'):
+            data_dict = cast(Dict[str, Any], data) if data else None
+            if not data_dict or not data_dict.get('url'):
                 raise Exception("Could not regather stream URL")
             
             # Update song data with fresh URL
             song_data.update({
-                'url': data.get('url'),
-                'formats': data.get('formats', [])
+                'url': data_dict.get('url'),
+                'formats': data_dict.get('formats', [])
             })
+            refreshed_url = data_dict.get('url')
+            if not refreshed_url:
+                raise Exception("Could not resolve refreshed stream URL")
             
             return cls(
                 discord.FFmpegPCMAudio(
-                    data['url'], 
+                    str(refreshed_url), 
                     before_options='-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
                     options='-vn'
                 ),
