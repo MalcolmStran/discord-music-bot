@@ -43,13 +43,53 @@ class MusicCog(commands.Cog, name="Music"):
             raise commands.NoPrivateMessage('Music commands cannot be used in DMs')
         return True
     
+    @commands.Cog.listener()
+    async def on_voice_state_update(self, member, before, after):
+        """Handle voice state changes — auto-leave if alone in channel"""
+        # Only handle events in guilds
+        if not member.guild:
+            return
+        
+        # Get the bot's voice client for this guild
+        bot_voice = member.guild.voice_client
+        if not bot_voice or not bot_voice.is_connected():
+            return
+        
+        # Check if the event is about someone leaving the bot's channel
+        # (before.channel is the bot's channel AND after.channel is different/None)
+        if before.channel != after.channel:
+            bot_channel = bot_voice.channel
+            # Someone left the bot's channel (or moved to another)
+            if before.channel == bot_channel:
+                # Count non-bot members in the channel
+                humans = [m for m in bot_channel.members if not m.bot]
+                if len(humans) == 0:
+                    # Nobody left but the bot — disconnect after 5 seconds
+                    player = self._get_player(member.guild)
+                    logger.info(f"Last human left voice channel in {member.guild.name}, scheduling disconnect in 5s")
+                    await asyncio.sleep(5)
+                    # Double-check after sleep
+                    if bot_voice and bot_voice.is_connected() and bot_voice.channel == bot_channel:
+                        humans_now = [m for m in bot_channel.members if not m.bot]
+                        if len(humans_now) == 0:
+                            await player.disconnect()
+                            # Try to send a goodbye message to the last text channel
+                            # (we don't track last text channel, so skip for now)
+                            logger.info(f"Auto-disconnected from empty voice channel in {member.guild.name}")
+    
     async def cog_command_error(self, ctx, error):
         """Handle cog-specific errors"""
         if isinstance(error, commands.NoPrivateMessage):
             await ctx.send("Music commands can only be used in servers!")
-        else:
-            logger.error(f"Error in music command {ctx.command}: {error}")
-            await ctx.send(f"An error occurred: {str(error)}")
+            return
+        
+        # Let MissingRequiredArgument propagate to the global handler in main.py
+        # (prevents double replies — the global handler already covers all commands)
+        if isinstance(error, commands.MissingRequiredArgument):
+            return
+        
+        logger.error(f"Error in music command {ctx.command}: {error}")
+        await ctx.send(f"An error occurred: {str(error)}")
     
     def _get_player(self, guild: discord.Guild) -> Player:
         """Get or create the Player for a guild"""
@@ -284,7 +324,7 @@ class MusicCog(commands.Cog, name="Music"):
         else:
             if queue.is_empty():
                 player.is_playing = False
-                player.start_disconnect_timer(300)  # 5 minutes
+                player.start_disconnect_timer(config.VOICE_AUTO_DISCONNECT_TIMEOUT)
                 return
             
             next_song = queue.get_next()

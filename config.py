@@ -10,7 +10,7 @@ load_dotenv()
 VOICE_CONNECTION_TIMEOUT = int(os.getenv('VOICE_CONNECTION_TIMEOUT', 15))  # Shorter timeout for containers
 VOICE_RECONNECT_ATTEMPTS = int(os.getenv('VOICE_RECONNECT_ATTEMPTS', 8))  # More attempts for containers
 VOICE_RETRY_DELAY = int(os.getenv('VOICE_RETRY_DELAY', 3))  # Base retry delay
-VOICE_AUTO_DISCONNECT_TIMEOUT = int(os.getenv('VOICE_AUTO_DISCONNECT_TIMEOUT', 300))
+VOICE_AUTO_DISCONNECT_TIMEOUT = int(os.getenv('VOICE_AUTO_DISCONNECT_TIMEOUT', 120))
 VOICE_SESSION_TIMEOUT = int(os.getenv('VOICE_SESSION_TIMEOUT', 45))  # Session timeout
 
 # Music settings

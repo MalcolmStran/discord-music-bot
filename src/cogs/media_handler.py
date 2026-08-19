@@ -18,6 +18,7 @@ import ffmpeg
 import asyncio
 from pathlib import Path
 from typing import Optional, List, Dict, Any
+from ..utils import settings
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +70,10 @@ class MediaHandler(commands.Cog, name="Media"):
         """Auto-convert media links in messages with improved error handling"""
         # Ignore bot messages and DMs
         if message.author.bot or not message.guild:
+            return
+        
+        # Skip media conversion if disabled for this server
+        if not settings.is_media_conversion_enabled(message.guild.id):
             return
         
         # Extract URLs from message
@@ -1246,6 +1251,10 @@ class MediaHandler(commands.Cog, name="Media"):
         
         Usage: !convert <URL>
         """
+        # Respect per-guild media conversion setting
+        if ctx.guild and not settings.is_media_conversion_enabled(ctx.guild.id):
+            return await ctx.send("🚫 Media conversion is disabled in this server. Use `!media-toggle` (admin) to enable it.")
+        
         async with ctx.typing():
             try:
                 video_path = None
@@ -1275,6 +1284,23 @@ class MediaHandler(commands.Cog, name="Media"):
                 else:
                     await ctx.send(f"❌ Error converting video: {str(e)}")
     
+    @commands.command(name='media-toggle')
+    @commands.has_permissions(administrator=True)
+    async def media_toggle(self, ctx):
+        """Toggle media conversion (Twitter/TikTok) on/off for this server. Admin only.
+        
+        Usage: !media-toggle
+        """
+        guild_id = ctx.guild.id
+        current = settings.is_media_conversion_enabled(guild_id)
+        new_state = not current
+        settings.set_media_conversion_enabled(guild_id, new_state)
+        
+        if new_state:
+            await ctx.send("✅ Media conversion is now **ENABLED** for this server. Twitter and TikTok links will be converted to MP4.")
+        else:
+            await ctx.send("🚫 Media conversion is now **DISABLED** for this server. The bot will only act as a music bot here.")
+    
     @commands.command(name='mediainfo')
     async def media_info(self, ctx):
         """Show media handler information and statistics"""
@@ -1286,6 +1312,11 @@ class MediaHandler(commands.Cog, name="Media"):
         # Service status
         tiktok_status = "✅ Available" if self.rapidapi_key else "❌ No API key"
         twitter_status = "✅ Available"
+        
+        guild_id = ctx.guild.id if ctx.guild else None
+        if guild_id is not None:
+            enabled = settings.is_media_conversion_enabled(guild_id)
+            embed.add_field(name="Media Conversion", value="✅ Enabled" if enabled else "🚫 Disabled", inline=True)
         
         embed.add_field(name="TikTok Support", value=tiktok_status, inline=True)
         embed.add_field(name="Twitter/X Support", value=twitter_status, inline=True)

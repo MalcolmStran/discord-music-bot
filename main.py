@@ -43,7 +43,7 @@ class MusicBot(commands.Bot):
         super().__init__(
             command_prefix=config.COMMAND_PREFIX,
             intents=intents,
-            help_command=commands.DefaultHelpCommand()
+            help_command=None  # We'll define our own
         )
     
     async def setup_hook(self):
@@ -117,11 +117,18 @@ class MusicBot(commands.Bot):
             return  # Ignore command not found errors
         
         if isinstance(error, commands.MissingRequiredArgument):
-            await ctx.send(f"Missing required argument: {error.param}")
+            cmd_name = ctx.command.name if ctx.command else "that command"
+            friendly = {
+                'play': "🎵 Please provide a song name or URL!\n**Usage:** `!play <song name or URL>`\n**Example:** `!play Never Gonna Give You Up`",
+                'convert': "📺 Please provide a URL to convert!\n**Usage:** `!convert <Twitter/X or TikTok URL>`",
+                'remove': "🗑️ Please provide a queue position to remove!\n**Usage:** `!remove <position>`\n**Example:** `!remove 3`",
+            }
+            await ctx.send(friendly.get(cmd_name, f"⚠️ Missing required argument for `!{cmd_name}`: `{error.param.name}`"))
             return
         
         if isinstance(error, commands.BadArgument):
-            await ctx.send(f"Bad argument: {error}")
+            cmd_name = ctx.command.name if ctx.command else "that command"
+            await ctx.send(f"⚠️ Invalid argument for `!{cmd_name}`. Check `!help` for usage.")
             return
         
         logger.error(f"Unhandled error in command {ctx.command}: {error}")
@@ -150,6 +157,51 @@ def main():
         await ctx.send('Shutting down...')
         logger.info('Bot shutting down by owner command')
         await bot.close()
+    
+    @bot.command(name='help')
+    async def help_command(ctx):
+        """Show this help message"""
+        embed = discord.Embed(
+            title="🎵 Music Bot Commands",
+            description="A feature-rich Discord music bot with optional Twitter/TikTok media conversion.",
+            color=0x3498db
+        )
+        
+        # Music commands
+        music_cmds = (
+            "**!play** `<query>` — Play a song or add it to the queue\n"
+            "**!skip** — Skip the current song\n"
+            "**!stop** — Stop playback and clear queue\n"
+            "**!pause** / **!resume** — Pause or resume playback\n"
+            "**!queue** — Show the current queue\n"
+            "**!nowplaying** — Show what's currently playing\n"
+            "**!volume** `<0-100>` — Adjust playback volume\n"
+            "**!join** / **!leave** — Join or leave your voice channel\n"
+            "**!loop** — Toggle repeat mode"
+        )
+        embed.add_field(name="🎶 Music", value=music_cmds, inline=False)
+        
+        # Media conversion commands
+        media_cmds = (
+            "**!convert** `<url>` — Manually convert a Twitter/X or TikTok link to MP4\n"
+            "**!media-toggle** — *(Admin only)* Enable/disable media conversion for this server\n"
+            "**!mediainfo** — Show media conversion status and limits"
+        )
+        embed.add_field(name="📺 Media Conversion", value=media_cmds, inline=False)
+        
+        # Admin commands
+        admin_cmds = (
+            "**!voice-debug** — Debug voice connection issues\n"
+            "**!force-reconnect** — Force a voice channel reconnection\n"
+            "**!media-cleanup** — Clean up temporary media files\n"
+            "**!media-status** — Show disk usage and handler status"
+        )
+        embed.add_field(name="🔧 Admin", value=admin_cmds, inline=False)
+        
+        # Per-server note
+        embed.set_footer(text="Media conversion is per-server: use !media-toggle to disable it on servers that only want music.")
+        
+        await ctx.send(embed=embed)
     
     try:
         assert DISCORD_TOKEN is not None, "DISCORD_TOKEN cannot be None"

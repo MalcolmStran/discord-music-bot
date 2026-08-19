@@ -69,113 +69,40 @@ class Player:
         return self.repeat_mode
     
     async def connect(self, channel: discord.VoiceChannel) -> bool:
-        """Connect to a voice channel with Docker-optimized retry logic"""
-        max_retries = config.VOICE_RECONNECT_ATTEMPTS
-        retry_delay = config.VOICE_RETRY_DELAY
-        timeout = config.VOICE_CONNECTION_TIMEOUT
+        """Connect to a voice channel with minimal interference to discord.py"""
+        # Let discord.py handle most of the connection logic
+        # We just wrap it with basic error handling and cleanup
         
-        # Detect if running in container (Docker/containerized environment)
-        is_container = os.path.exists('/.dockerenv') or os.getenv('DOCKER_CONTAINER') == 'true'
+        logger.info(f"Connecting to voice channel: {channel.name}")
         
-        if is_container:
-            # Container-specific adjustments
-            max_retries = max(max_retries, 8)  # More retries in containers
-            timeout = min(timeout, 15)  # Shorter timeout to fail faster
-            logger.info("Container environment detected - using optimized settings")
-        
-        for attempt in range(max_retries):
+        # Disconnect any existing connection
+        if self.voice_client:
             try:
-                # Enhanced cleanup for containers
-                if self.voice_client:
-                    try:
-                        if self.voice_client.is_connected():
-                            await self.voice_client.disconnect(force=True)
-                        # Longer cleanup in containers
-                        cleanup_time = 4 if is_container else 2
-                        await asyncio.sleep(cleanup_time)
-                    except Exception as cleanup_error:
-                        logger.warning(f"Cleanup error: {cleanup_error}")
-                    finally:
-                        self.voice_client = None
-                
-                # Progressive delay with container-specific adjustments
-                if attempt > 0:
-                    base_delay = retry_delay + (2 if is_container else 0)
-                    delay = base_delay * (1.5 ** (attempt - 1))  # More gradual backoff
-                    delay = min(delay, 20)  # Cap at 20 seconds
-                    logger.info(f"Waiting {delay:.1f} seconds before retry...")
-                    await asyncio.sleep(delay)
-                
-                logger.info(f"Attempting to connect to {channel.name} (attempt {attempt + 1}/{max_retries})")
-                
-                # Container-optimized connection parameters
-                connect_timeout = timeout - 2 if is_container else timeout
-                wait_timeout = connect_timeout + 8 if is_container else timeout + 5
-                
-                # Connect with optimized settings
-                self.voice_client = await asyncio.wait_for(
-                    channel.connect(
-                        timeout=connect_timeout,
-                        reconnect=False,  # Handle reconnection manually
-                        self_deaf=True
-                    ),
-                    timeout=wait_timeout
-                )
-                
-                # Post-connection validation with container-specific checks
-                if self.voice_client and self.voice_client.is_connected():
-                    # Additional validation for containers
-                    if is_container:
-                        await asyncio.sleep(1)  # Let connection stabilize
-                        if not self.voice_client.is_connected():
-                            logger.warning("Connection became unstable immediately after connect")
-                            continue
-                    
-                    logger.info(f"Successfully connected to voice channel: {channel.name}")
-                    self._cancel_disconnect_timer()
-                    return True
-                else:
-                    logger.warning("Connection established but not properly connected")
-                    continue
-                
-            except asyncio.TimeoutError:
-                logger.warning(f"Connection timeout on attempt {attempt + 1} (container: {is_container})")
-                
-            except discord.errors.ConnectionClosed as e:
-                logger.warning(f"Connection closed during connect (code {e.code})")
-                if e.code == 4006:  # Session invalid
-                    session_delay = 15 if is_container else 10
-                    logger.warning(f"Session error - waiting {session_delay}s before retry")
-                    if attempt < max_retries - 1:
-                        await asyncio.sleep(session_delay)
-                
-            except discord.errors.ClientException as e:
-                if "already connected" in str(e).lower():
-                    logger.warning("Already connected to voice - enhanced cleanup...")
-                    if self.voice_client:
-                        try:
-                            await self.voice_client.disconnect(force=True)
-                            await asyncio.sleep(4 if is_container else 3)
-                        except:
-                            pass
-                        self.voice_client = None
-                elif "opus" in str(e).lower():
-                    logger.error("Opus library not loaded - voice will not work properly")
-                    return False
-                else:
-                    logger.warning(f"Discord client error on attempt {attempt + 1}: {e}")
-                        
+                await self.voice_client.disconnect(force=True)
+                await asyncio.sleep(2)
             except Exception as e:
-                logger.error(f"Unexpected error on attempt {attempt + 1}: {e}")
-                # Enhanced session error handling for containers
-                if "4006" in str(e) or "session" in str(e).lower():
-                    session_delay = 15 if is_container else 10
-                    logger.warning(f"Session error detected - waiting {session_delay}s before retry")
-                    if attempt < max_retries - 1:
-                        await asyncio.sleep(session_delay)
+                logger.warning(f"Cleanup error: {e}")
+            finally:
+                self.voice_client = None
         
-        logger.error(f"Failed to connect after {max_retries} attempts (container: {is_container})")
-        return False
+        try:
+            # Connect using discord.py's defaults
+            # reconnect=True lets it handle session management
+            # self_deaf=False to avoid session invalidation
+            self.voice_client = await channel.connect(reconnect=True, self_deaf=False)
+            
+            if self.voice_client and self.voice_client.is_connected():
+                logger.info(f"Successfully connected to {channel.name}")
+                self._cancel_disconnect_timer()
+                return True
+            else:
+                logger.error("Connection failed - not properly connected")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Connection error: {e}")
+            self.voice_client = None
+            return False
     
     async def disconnect(self, force_cleanup=False):
         """Disconnect from voice channel with improved cleanup"""
