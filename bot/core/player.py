@@ -41,6 +41,8 @@ class GuildPlayer:
 
         self.current: Optional[Track] = None
         self.started_at: float = 0.0
+        self._paused_at: float = 0.0
+        self._paused_total: float = 0.0
         self.text_channel: Optional[discord.abc.Messageable] = None
         self.now_playing_msg: Optional[discord.Message] = None
 
@@ -48,6 +50,7 @@ class GuildPlayer:
         self._wake = asyncio.Event()      # set when something is added to the queue
         self._finished = asyncio.Event()  # set when the current track ends
         self._task: Optional[asyncio.Task] = None
+        self._np_task: Optional[asyncio.Task] = None   # live "now playing" updater
         self._skip_requested = False
         self._lock = asyncio.Lock()
 
@@ -126,6 +129,7 @@ class GuildPlayer:
         vc = self.voice
         if vc and vc.is_playing():
             vc.pause()
+            self._paused_at = time.monotonic()
             return True
         return False
 
@@ -133,6 +137,9 @@ class GuildPlayer:
         vc = self.voice
         if vc and vc.is_paused():
             vc.resume()
+            if self._paused_at:
+                self._paused_total += time.monotonic() - self._paused_at
+                self._paused_at = 0.0
             return True
         return False
 
@@ -155,7 +162,8 @@ class GuildPlayer:
     def position(self) -> float:
         if not self.current or not self.started_at:
             return 0.0
-        return time.monotonic() - self.started_at
+        now = self._paused_at or time.monotonic()
+        return max(0.0, now - self.started_at - self._paused_total)
 
     def _stop_current(self) -> None:
         vc = self.voice
@@ -233,6 +241,8 @@ class GuildPlayer:
 
         self.current = track
         self.started_at = time.monotonic()
+        self._paused_at = 0.0
+        self._paused_total = 0.0
         try:
             vc.play(self._source, after=_after)
         except discord.ClientException as e:
@@ -240,8 +250,11 @@ class GuildPlayer:
             self._finished.set()
             return
         await self._announce_now_playing(track)
+        self._np_task = self.bot.loop.create_task(self._update_now_playing())
         await self._finished.wait()
+        self._np_task.cancel()
         self._source = None
+        await self._finalize_now_playing()
         # ffmpeg dying immediately (403 on the CDN url, geo-block, etc.) looks like a 1-second track
         if time.monotonic() - self.started_at < 3 and not self._skip_requested and (track.duration or 0) > 10:
             log.warning("[%s] %s ended after <3s — stream probably failed", self.guild.name, track.title)
@@ -273,9 +286,39 @@ class GuildPlayer:
         except Exception as e:
             log.debug("now playing announce failed: %s", e)
 
+    async def _update_now_playing(self) -> None:
+        """Edit the announce message every 15 s so its position bar is live."""
+        try:
+            while True:
+                await asyncio.sleep(15)
+                if not self.now_playing_msg or not self.current:
+                    return
+                try:
+                    await self.now_playing_msg.edit(embed=self.now_playing_embed())
+                except discord.NotFound:
+                    self.now_playing_msg = None
+                    return
+                except discord.HTTPException as e:
+                    log.debug("now playing edit failed: %s", e)
+        except asyncio.CancelledError:
+            pass
+
+    async def _finalize_now_playing(self) -> None:
+        """Freeze the announce as 'Played' when the track ends (so old messages don't lie)."""
+        msg, track = self.now_playing_msg, self.current
+        if not msg or not track:
+            return
+        try:
+            e = discord.Embed(title="✅ Played", description=f"**[{track.title}]({track.webpage_url})**", color=0x99AAB5)
+            e.add_field(name="Duration", value=track.pretty_duration, inline=True)
+            await msg.edit(embed=e)
+        except discord.HTTPException:
+            pass
+
     def now_playing_embed(self, track: Optional[Track] = None) -> discord.Embed:
         track = track or self.current
-        title = "🔁 Repeating" if self.loop_mode is LoopMode.ONE else "🎵 Now playing"
+        paused = self.is_paused
+        title = "⏸️ Paused" if paused else "🔁 Repeating" if self.loop_mode is LoopMode.ONE else "🎵 Now playing"
         if not track:
             return discord.Embed(title="Nothing playing", color=0x99AAB5)
         e = discord.Embed(title=title, description=f"**[{track.title}]({track.webpage_url})**", color=0x1DB954)
