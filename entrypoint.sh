@@ -1,7 +1,11 @@
 #!/bin/bash
-# Fix permissions on the downloads volume (mounted as root at runtime)
-if [ -d /app/downloads ]; then
-    chown -R app:app /app/downloads 2>/dev/null || true
+set -e
+# Volumes are mounted root-owned; make them writable by the unprivileged user.
+chown -R app:app /app/downloads /app/logs 2>/dev/null || true
+# YouTube breaks yt-dlp every few weeks; refresh it at start unless disabled.
+if [ "${YTDLP_AUTO_UPDATE:-true}" = "true" ]; then
+    timeout 90 pip install --quiet --no-cache-dir --upgrade yt-dlp 2>/dev/null \
+        && echo "yt-dlp: $(python -c 'import yt_dlp;print(yt_dlp.version.__version__)')" \
+        || echo "yt-dlp self-update skipped (offline?)"
 fi
-# Drop to app user and run the bot
-exec su -s /bin/bash app -c 'cd /app && exec python main.py'
+exec setpriv --reuid=app --regid=app --init-groups env HOME=/home/app python -m bot

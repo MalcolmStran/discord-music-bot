@@ -1,31 +1,23 @@
-version: '3.8'
-
 services:
   discord-bot:
     build: .
+    image: discord-music-bot:2
     container_name: discord-music-bot
     restart: unless-stopped
-    network_mode: "host"
+    network_mode: "host"          # voice UDP + simplest NAT story
     env_file:
       - .env
     environment:
       - DOCKER_CONTAINER=true
-      # Container-optimized voice settings
-      - VOICE_CONNECTION_TIMEOUT=15
-      - VOICE_RECONNECT_ATTEMPTS=8
-      - VOICE_RETRY_DELAY=3
+      - YTDLP_AUTO_UPDATE=true
     volumes:
-      # Mount logs directory for persistence
       - ./logs:/app/logs
-      # Keep downloads directory for temporary files
-      - bot-downloads:/app/downloads
-    # Optional: configure resource limits
+      - bot-downloads:/app/downloads   # temp media + guild settings (persisted)
     deploy:
       resources:
         limits:
-          memory: 512M
-        reservations:
-          memory: 256M
+          memory: 768M      # two concurrent x265 encodes need headroom
+    stop_grace_period: 20s
 
 volumes:
   bot-downloads:
