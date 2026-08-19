@@ -12,7 +12,7 @@ Everything works both as `!cmd` and `/cmd`.
 
 | Music | |
 |---|---|
-| `/play <query\|url\|playlist>` (`!p`) | search term, video URL or playlist URL |
+| `/play <query\|url\|playlist>` (`!p`) | search term, video URL, playlist URL, or **Spotify** track/album/playlist link |
 | `/skip` `/stop` `/pause` `/resume` | |
 | `/queue [page]` (`!q`) · `/nowplaying` (`!np`) | |
 | `/volume [0-150]` | live, no restart of the track |
@@ -62,4 +62,5 @@ tests/test_core.py offline unit tests (run inside the image: pip install pytest;
 * **Voice**: minimal `channel.connect(reconnect=True)`; discord.py handles resumes. Retry loops around it caused the 4006/4017 errors in the past — don't add them back.
 * **Playlists** resolve flat (one yt-dlp call, ~1 s for 100 items); stream URLs are fetched right before each track plays.
 * **Compression ladder** (`core/video.py`): x264 veryfast source-res → x264 480p → x265 ultrafast 480p. Two-pass, target = 97 % of `guild.filesize_limit`. Measured on rock5: a 3.4-min 720p clip 17.5 MB → 7.7 MB in ~75 s. Encodes are bounded by `MAX_CONCURRENT_ENCODES` (default 2) — never unbounded.
+* **Spotify links** (`core/spotify.py`): Spotify audio is DRM'd, so links are resolved to metadata (keyless, via the public embed page — tracks, albums, playlists up to ~50–100 items; set `SPOTIFY_CLIENT_ID/SECRET` for full lists via the Web API) and each track is matched on YouTube *when it's about to play*, so a 50-track playlist queues instantly.
 * **yt-dlp needs a JS runtime** for YouTube; the image ships Node. If YouTube breaks, the start-up self-update usually fixes it; otherwise set `YTDL_COOKIES_FILE`.

@@ -42,3 +42,11 @@ def test_helpers():
     assert classify("https://vm.tiktok.com/ZM1/") == "tiktok"
     assert classify("https://youtube.com/watch?v=1") is None
     assert normalise("https://fxtwitter.com/a/status/1).", "twitter") == "https://x.com/a/status/1"
+
+
+def test_spotify_parse():
+    from bot.core.spotify import parse, is_spotify
+    assert parse("https://open.spotify.com/track/4PTG3Z6ehGkBFwjybzWkR8?si=abc") == ("track", "4PTG3Z6ehGkBFwjybzWkR8")
+    assert parse("https://open.spotify.com/intl-de/album/5ht7ItJgpBH7W6vJ5BqpPr") == ("album", "5ht7ItJgpBH7W6vJ5BqpPr")
+    assert parse("spotify:playlist:37i9dQZF1DXcBWIGoYBM5M") == ("playlist", "37i9dQZF1DXcBWIGoYBM5M")
+    assert not is_spotify("https://youtu.be/x")

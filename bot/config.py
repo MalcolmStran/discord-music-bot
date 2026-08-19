@@ -49,6 +49,8 @@ class Config:
     max_concurrent_encodes: int = 2        # ffmpeg jobs at once (lesson: never unbounded)
     encode_timeout_seconds: int = 600
     rapidapi_key: str | None = None        # optional TikTok fallback
+    spotify_client_id: str | None = None   # optional: full playlists via Web API (else embed page, ~50-100 tracks)
+    spotify_client_secret: str | None = None
 
     # paths
     download_dir: Path = Path("./downloads")
@@ -85,6 +87,8 @@ class Config:
             max_concurrent_encodes=max(1, _int("MAX_CONCURRENT_ENCODES", 2)),
             encode_timeout_seconds=_int("ENCODE_TIMEOUT_SECONDS", 600),
             rapidapi_key=(os.getenv("RAPIDAPI_KEY") or "").strip() or None,
+            spotify_client_id=(os.getenv("SPOTIFY_CLIENT_ID") or "").strip() or None,
+            spotify_client_secret=(os.getenv("SPOTIFY_CLIENT_SECRET") or "").strip() or None,
             download_dir=Path(os.getenv("DOWNLOAD_DIR", "./downloads")),
             ytdl_cookies_file=Path(cookies) if cookies else None,
             log_level=os.getenv("LOG_LEVEL", "INFO").upper(),

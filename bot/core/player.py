@@ -309,7 +309,7 @@ class GuildPlayer:
         if not msg or not track:
             return
         try:
-            e = discord.Embed(title="✅ Played", description=f"**[{track.title}]({track.webpage_url})**", color=0x99AAB5)
+            e = discord.Embed(title="✅ Played", description=f"**[{track.title}]({track.link})**", color=0x99AAB5)
             e.add_field(name="Duration", value=track.pretty_duration, inline=True)
             await msg.edit(embed=e)
         except discord.HTTPException:
@@ -321,7 +321,7 @@ class GuildPlayer:
         title = "⏸️ Paused" if paused else "🔁 Repeating" if self.loop_mode is LoopMode.ONE else "🎵 Now playing"
         if not track:
             return discord.Embed(title="Nothing playing", color=0x99AAB5)
-        e = discord.Embed(title=title, description=f"**[{track.title}]({track.webpage_url})**", color=0x1DB954)
+        e = discord.Embed(title=title, description=f"**[{track.title}]({track.link})**", color=0x1DB954)
         if track.uploader:
             e.add_field(name="Uploader", value=track.uploader, inline=True)
         e.add_field(name="Duration", value=track.pretty_duration, inline=True)

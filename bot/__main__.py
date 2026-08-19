@@ -13,6 +13,7 @@ from discord.ext import commands
 
 from .config import Config
 from .core.settings import GuildSettings
+from .core.spotify import Spotify
 from .core.ytdl import YTDL
 
 EXTENSIONS = ("bot.cogs.music", "bot.cogs.media")
@@ -43,6 +44,7 @@ class MusicBot(commands.Bot):
                          allowed_mentions=discord.AllowedMentions(everyone=False, roles=False))
         self.cfg = cfg
         self.ytdl = YTDL(cookies_file=cfg.ytdl_cookies_file)
+        self.spotify = Spotify(cfg.spotify_client_id, cfg.spotify_client_secret, max_tracks=cfg.max_queue_size)
         self.settings = GuildSettings(cfg.data_dir / "guild_settings.json", media_default=cfg.media_enabled_default)
         self.log = logging.getLogger("bot")
 
@@ -85,7 +87,7 @@ def build_help(bot: MusicBot) -> None:
         p = bot.cfg.prefix
         e = discord.Embed(title="🎵 Music bot", description=f"Slash commands work too — type `/`. Prefix: `{p}`", color=0x5865F2)
         e.add_field(name="Music", inline=False, value=(
-            f"`{p}play <query|url|playlist>` (`{p}p`) · `{p}skip` · `{p}stop` · `{p}pause` · `{p}resume`\n"
+            f"`{p}play <query|url|playlist|spotify link>` (`{p}p`) · `{p}skip` · `{p}stop` · `{p}pause` · `{p}resume`\n"
             f"`{p}queue [page]` (`{p}q`) · `{p}nowplaying` (`{p}np`) · `{p}volume [0-150]`\n"
             f"`{p}loop [off|one|all]` · `{p}shuffle` · `{p}remove <n>` · `{p}move <a> <b>` · `{p}clear`\n"
             f"`{p}join` · `{p}leave` · `{p}status`"))

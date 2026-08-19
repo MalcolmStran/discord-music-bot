@@ -10,6 +10,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from ..core.player import GuildPlayer, LoopMode
+from ..core.spotify import Spotify, is_spotify
 from ..core.ytdl import YTDL, fmt_duration, looks_like_url
 
 log = logging.getLogger(__name__)
@@ -26,6 +27,7 @@ class Music(commands.Cog):
         self.bot = bot
         self.cfg = bot.cfg                      # type: ignore[attr-defined]
         self.ytdl: YTDL = bot.ytdl              # type: ignore[attr-defined]
+        self.spotify: Spotify = bot.spotify     # type: ignore[attr-defined]
         self.players: dict[int, GuildPlayer] = {}
 
     # ------------------------------------------------------------ helpers
@@ -96,7 +98,7 @@ class Music(commands.Cog):
 
     # ----------------------------------------------------------- commands
     @commands.hybrid_command(name="play", aliases=["p"], description="Play a song/URL or add it to the queue")
-    @app_commands.describe(query="Song name, YouTube/SoundCloud/etc. URL, or playlist URL")
+    @app_commands.describe(query="Song name, YouTube/SoundCloud URL, playlist URL, or Spotify track/album/playlist link")
     async def play(self, ctx: commands.Context, *, query: str):
         player = self.player(ctx.guild)  # type: ignore[arg-type]
         if player.queue.is_full:
@@ -105,7 +107,10 @@ class Music(commands.Cog):
             return
         async with ctx.typing():   # defers the interaction for slash invocations
             try:
-                tracks = await self.ytdl.resolve(query, requester_id=ctx.author.id)
+                if is_spotify(query):
+                    tracks = await self.spotify.resolve(query, requester_id=ctx.author.id)
+                else:
+                    tracks = await self.ytdl.resolve(query, requester_id=ctx.author.id)
             except LookupError as e:
                 return await ctx.send(f"❌ {e}")
             except Exception as e:
@@ -120,7 +125,9 @@ class Music(commands.Cog):
             t = tracks[0]
             pos = len(player.queue) if player.current else 0
             e = discord.Embed(title="➕ Added to queue" if pos else "▶️ Playing next",
-                              description=f"**[{t.title}]({t.webpage_url})**", color=0x5865F2)
+                              description=f"**[{t.title}]({t.link})**", color=0x5865F2)
+            if t.extractor == "spotify":
+                e.set_footer(text="Spotify link → playing the YouTube match")
             e.add_field(name="Duration", value=t.pretty_duration, inline=True)
             if pos:
                 e.add_field(name="Position", value=str(pos), inline=True)
@@ -128,7 +135,7 @@ class Music(commands.Cog):
                 e.set_thumbnail(url=t.thumbnail)
             await ctx.send(embed=e)
         else:
-            msg = f"📃 Added **{added}** tracks"
+            msg = f"📃 Added **{added}** tracks" + (" from Spotify (YouTube matches found as they play)" if tracks[0].extractor == "spotify" else "")
             if added < len(tracks):
                 msg += f" (queue full, {len(tracks) - added} dropped)"
             if too_long:

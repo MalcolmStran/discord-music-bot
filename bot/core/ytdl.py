@@ -51,7 +51,13 @@ class Track:
     extractor: Optional[str] = None
     stream_url: Optional[str] = None   # filled lazily
     http_headers: dict[str, str] = field(default_factory=dict, repr=False)  # headers yt-dlp says the CDN wants
+    search_query: Optional[str] = None  # set for Spotify etc.: resolve to a YouTube video lazily
+    source_url: Optional[str] = None    # original link (e.g. open.spotify.com/...) for display
     extra: dict[str, Any] = field(default_factory=dict, repr=False)
+
+    @property
+    def link(self) -> str:
+        return self.webpage_url or self.source_url or ""
 
     @property
     def pretty_duration(self) -> str:
@@ -130,6 +136,8 @@ class YTDL:
 
     async def fetch_stream(self, track: Track) -> Track:
         """Resolve (or refresh) a *streamable* URL for a track, trying YT clients in order."""
+        if not track.webpage_url and track.search_query:
+            await self._resolve_search(track)
         is_yt = "youtube" in (track.extractor or "").lower() or "youtu" in track.webpage_url
         clients = list(YT_CLIENT_ORDER) if is_yt else ["default"]
         now = time.monotonic()
@@ -162,7 +170,8 @@ class YTDL:
                 continue
             track.stream_url = url
             track.http_headers = hdrs
-            track.title = info.get("title") or track.title
+            if not track.search_query:                      # keep Spotify's "Title — Artist" as-is
+                track.title = info.get("title") or track.title
             track.duration = int(info.get("duration") or track.duration or 0)
             track.thumbnail = info.get("thumbnail") or track.thumbnail
             track.uploader = info.get("uploader") or info.get("channel") or track.uploader
@@ -170,6 +179,25 @@ class YTDL:
                 log.debug("using YT client %s for %s (format %s)", client, track.title, info.get("format_id"))
             return track
         raise LookupError(last_err or "Could not load stream.")
+
+    async def _resolve_search(self, track: Track) -> None:
+        """Spotify/other metadata-only tracks: find the matching YouTube video by search."""
+        q = f"ytsearch1:{track.search_query}"
+        try:
+            info = await asyncio.to_thread(self._flat.extract_info, q, False)
+        except DownloadError as e:
+            raise LookupError(_friendly(str(e))) from e
+        entries = [e for e in (info or {}).get("entries", []) if e]
+        if not entries:
+            raise LookupError(f"No YouTube match for “{track.search_query}”.")
+        hit = entries[0]
+        url = hit.get("webpage_url") or hit.get("url") or ""
+        if url and not looks_like_url(url):
+            url = f"https://www.youtube.com/watch?v={url}"
+        track.webpage_url = url
+        track.extractor = "youtube"
+        track.thumbnail = track.thumbnail or hit.get("thumbnail")
+        log.info("spotify → youtube: %r → %s", track.search_query, hit.get("title"))
 
     @staticmethod
     async def _url_streamable(url: str, headers: dict[str, str]) -> bool:
