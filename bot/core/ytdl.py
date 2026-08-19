@@ -13,10 +13,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
+import aiohttp
 import discord
 import yt_dlp
 from yt_dlp.utils import DownloadError
@@ -29,6 +31,14 @@ _PLAYLIST_HINT = re.compile(r"[?&]list=|/playlist\?|/sets/|/album/", re.I)
 FFMPEG_BEFORE = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -nostdin"
 FFMPEG_OPTS = "-vn -loglevel error"
 
+# YouTube keeps changing which "player client" hands out URLs that a plain HTTP client (ffmpeg)
+# may fetch. Observed 2026-08-19: the default client's googlevideo URLs 403 for anything that
+# isn't a ≤1 MiB Range request (PO-token enforcement), while the `android` client's progressive
+# URLs stream fine. So we try clients in order and verify the URL with a tiny Range probe before
+# handing it to ffmpeg; a client that fails is skipped for a while.
+YT_CLIENT_ORDER = ("default", "android")
+YT_CLIENT_PENALTY_SECONDS = 600
+
 
 @dataclass
 class Track:
@@ -40,6 +50,7 @@ class Track:
     requester_id: Optional[int] = None
     extractor: Optional[str] = None
     stream_url: Optional[str] = None   # filled lazily
+    http_headers: dict[str, str] = field(default_factory=dict, repr=False)  # headers yt-dlp says the CDN wants
     extra: dict[str, Any] = field(default_factory=dict, repr=False)
 
     @property
@@ -78,15 +89,23 @@ class YTDL:
             "ignoreerrors": "only_download",
             "default_search": "ytsearch",
             "source_address": "0.0.0.0",
-            "extractor_args": {"youtube": {"player_client": ["default", "android"]}},
             "logger": _QuietLogger(),
         }
         if cookies_file and cookies_file.exists():
             base["cookiefile"] = str(cookies_file)
         self._opts = base
-        # separate instances: flat (for resolving) and full (for stream urls)
+        # separate instances: flat (for resolving) and full (for stream urls, one per YT client)
         self._flat = yt_dlp.YoutubeDL({**base, "extract_flat": "in_playlist", "playlistend": max_playlist})
         self._full = yt_dlp.YoutubeDL({**base, "noplaylist": True})
+        self._full_by_client: dict[str, yt_dlp.YoutubeDL] = {"default": self._full}
+        self._client_bad_until: dict[str, float] = {}
+
+    def _full_for(self, client: str) -> yt_dlp.YoutubeDL:
+        if client not in self._full_by_client:
+            opts = {**self._opts, "noplaylist": True,
+                    "extractor_args": {"youtube": {"player_client": [client]}}}
+            self._full_by_client[client] = yt_dlp.YoutubeDL(opts)
+        return self._full_by_client[client]
 
     # --- resolving --------------------------------------------------------
     async def resolve(self, query: str, requester_id: Optional[int] = None) -> list[Track]:
@@ -110,25 +129,59 @@ class YTDL:
         return tracks
 
     async def fetch_stream(self, track: Track) -> Track:
-        """Resolve (or refresh) the direct stream URL for a track."""
+        """Resolve (or refresh) a *streamable* URL for a track, trying YT clients in order."""
+        is_yt = "youtube" in (track.extractor or "").lower() or "youtu" in track.webpage_url
+        clients = list(YT_CLIENT_ORDER) if is_yt else ["default"]
+        now = time.monotonic()
+        ordered = [c for c in clients if self._client_bad_until.get(c, 0) <= now] + \
+                  [c for c in clients if self._client_bad_until.get(c, 0) > now]
+        last_err: Optional[str] = None
+        for client in ordered:
+            try:
+                info = await asyncio.to_thread(self._full_for(client).extract_info, track.webpage_url, False)
+            except DownloadError as e:
+                last_err = _friendly(str(e))
+                log.info("extract via %s failed for %s: %s", client, track.webpage_url, last_err)
+                continue
+            if not info:
+                continue
+            url = info.get("url")
+            if not url and info.get("requested_formats"):
+                url = info["requested_formats"][0].get("url")
+            if not url:
+                last_err = "No playable stream found."
+                continue
+            hdrs = info.get("http_headers") or {}
+            if not hdrs and info.get("requested_formats"):
+                hdrs = info["requested_formats"][0].get("http_headers") or {}
+            hdrs = {k: v for k, v in hdrs.items() if k.lower() in ("user-agent", "referer", "origin", "cookie", "accept-language")}
+            if is_yt and not await self._url_streamable(url, hdrs):
+                log.info("client %s gave a URL ffmpeg can't fetch (403) — trying next", client)
+                self._client_bad_until[client] = time.monotonic() + YT_CLIENT_PENALTY_SECONDS
+                last_err = "YouTube rejected the stream URL."
+                continue
+            track.stream_url = url
+            track.http_headers = hdrs
+            track.title = info.get("title") or track.title
+            track.duration = int(info.get("duration") or track.duration or 0)
+            track.thumbnail = info.get("thumbnail") or track.thumbnail
+            track.uploader = info.get("uploader") or info.get("channel") or track.uploader
+            if client != "default":
+                log.debug("using YT client %s for %s (format %s)", client, track.title, info.get("format_id"))
+            return track
+        raise LookupError(last_err or "Could not load stream.")
+
+    @staticmethod
+    async def _url_streamable(url: str, headers: dict[str, str]) -> bool:
+        """Plain (non-Range) GET like ffmpeg does; 2xx = fine. Network errors → assume fine."""
         try:
-            info = await asyncio.to_thread(self._full.extract_info, track.webpage_url, False)
-        except DownloadError as e:
-            raise LookupError(_friendly(str(e))) from e
-        if not info:
-            raise LookupError("Could not load stream.")
-        url = info.get("url")
-        if not url and info.get("requested_formats"):
-            url = info["requested_formats"][0].get("url")
-        if not url:
-            raise LookupError("No playable stream found.")
-        track.stream_url = url
-        # fill in anything the flat pass didn't have
-        track.title = info.get("title") or track.title
-        track.duration = int(info.get("duration") or track.duration or 0)
-        track.thumbnail = info.get("thumbnail") or track.thumbnail
-        track.uploader = info.get("uploader") or info.get("channel") or track.uploader
-        return track
+            timeout = aiohttp.ClientTimeout(total=8)
+            async with aiohttp.ClientSession(timeout=timeout, headers=headers) as s:
+                async with s.get(url) as r:
+                    return r.status < 400
+        except Exception as e:
+            log.debug("stream probe error (%s) — assuming ok", e)
+            return True
 
     @staticmethod
     def _to_track(info: dict[str, Any], requester_id: Optional[int]) -> Track:
@@ -150,8 +203,18 @@ class YTDL:
     def make_source(track: Track, volume: float) -> discord.PCMVolumeTransformer:
         if not track.stream_url:
             raise RuntimeError("track has no stream url")
-        src = discord.FFmpegPCMAudio(track.stream_url, before_options=FFMPEG_BEFORE, options=FFMPEG_OPTS)
+        # googlevideo (and others) 403 unless ffmpeg presents the same UA/headers yt-dlp used
+        before = FFMPEG_BEFORE
+        if track.http_headers:
+            hdr_blob = "".join(f"{k}: {v}\r\n" for k, v in track.http_headers.items())
+            before += f" -headers {_shq(hdr_blob)}"
+        src = discord.FFmpegPCMAudio(track.stream_url, before_options=before, options=FFMPEG_OPTS)
         return discord.PCMVolumeTransformer(src, volume=volume)
+
+
+def _shq(s: str) -> str:
+    """discord.py splits before_options with shlex — quote a single argument safely."""
+    return "'" + s.replace("'", "'\\''") + "'"
 
 
 class _QuietLogger:

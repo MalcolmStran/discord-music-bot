@@ -242,6 +242,12 @@ class GuildPlayer:
         await self._announce_now_playing(track)
         await self._finished.wait()
         self._source = None
+        # ffmpeg dying immediately (403 on the CDN url, geo-block, etc.) looks like a 1-second track
+        if time.monotonic() - self.started_at < 3 and not self._skip_requested and (track.duration or 0) > 10:
+            log.warning("[%s] %s ended after <3s — stream probably failed", self.guild.name, track.title)
+            await self._announce(f"⚠️ Couldn't stream **{track.title}** (source rejected the connection). Skipping.")
+            if self.loop_mode is LoopMode.ONE:
+                self.loop_mode = LoopMode.OFF
 
     # --------------------------------------------------------------- output
     async def _announce(self, text: str) -> None:
