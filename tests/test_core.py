@@ -139,3 +139,26 @@ def test_classify_rejects_host_smuggling(url):
 ])
 def test_normalise(raw, expected):
     assert normalise(raw, "twitter") == expected
+
+
+# ----------------------------------------------------- persisted guild settings
+def test_volume_and_loop_round_trip(tmp_path: Path):
+    """They used to be in-memory only, so every restart silently reset them."""
+    p = tmp_path / "s.json"
+    s = GuildSettings(p)
+    s.set(42, "volume", 0.75)
+    s.set(42, "loop_mode", "all")
+    reloaded = GuildSettings(p)
+    assert reloaded.get(42, "volume") == 0.75
+    assert reloaded.get(42, "loop_mode") == "all"
+    assert reloaded.get(99, "volume") is None      # untouched guilds keep the default
+
+
+def test_settings_reserves_guild_zero_for_bookkeeping(tmp_path: Path):
+    """The bot stores its own state (the slash-command signature) under guild id 0."""
+    p = tmp_path / "s.json"
+    s = GuildSettings(p)
+    s.set(0, "command_signature", "abc")
+    s.set(1, "media_enabled", False)
+    assert GuildSettings(p).get(0, "command_signature") == "abc"
+    assert GuildSettings(p).media_enabled(1) is False

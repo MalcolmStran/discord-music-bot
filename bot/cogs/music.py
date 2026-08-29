@@ -38,6 +38,7 @@ class Music(commands.Cog):
         self.cfg = bot.cfg                      # type: ignore[attr-defined]
         self.ytdl: YTDL = bot.ytdl              # type: ignore[attr-defined]
         self.spotify: Spotify = bot.spotify     # type: ignore[attr-defined]
+        self.settings = bot.settings            # type: ignore[attr-defined]
         self.players: dict[int, GuildPlayer] = {}
         self._alone_checks: set[int] = set()   # guilds with a pending "is anyone left?" check
 
@@ -47,8 +48,20 @@ class Music(commands.Cog):
         if p is None:
             p = GuildPlayer(self.bot, guild, self.ytdl, max_queue=self.cfg.max_queue_size,
                             default_volume=self.cfg.default_volume, idle_seconds=self.cfg.idle_disconnect_seconds)
+            self._restore(guild.id, p)
             self.players[guild.id] = p
         return p
+
+    def _restore(self, guild_id: int, player: GuildPlayer) -> None:
+        """Reapply settings saved by a previous run — they used to reset on every restart."""
+        volume = self.settings.get(guild_id, "volume")
+        if isinstance(volume, (int, float)):
+            player.set_volume(float(volume))
+        mode = self.settings.get(guild_id, "loop_mode")
+        try:
+            player.loop_mode = LoopMode(mode)
+        except ValueError:
+            pass
 
     @staticmethod
     def _thinking(ctx: commands.Context):
@@ -260,6 +273,7 @@ class Music(commands.Cog):
         if not 0 <= level <= 150:
             return await ctx.send("Volume must be 0–150.")
         player.set_volume(level / 100)
+        await self.settings.set_async(ctx.guild.id, "volume", player.volume)  # type: ignore[union-attr]
         await ctx.send(f"🔊 Volume set to {level}%.")
 
     @commands.hybrid_command(name="queue", aliases=["q"], description="Show the queue")
@@ -308,6 +322,7 @@ class Music(commands.Cog):
             player.loop_mode = LoopMode(mode.lower())
         except ValueError:
             return await ctx.send("Use `off`, `one` or `all`.")
+        await self.settings.set_async(ctx.guild.id, "loop_mode", player.loop_mode.value)  # type: ignore[union-attr]
         icon = {"off": "➡️", "one": "🔂", "all": "🔁"}[player.loop_mode.value]
         await ctx.send(f"{icon} Loop: **{player.loop_mode.value}**")
 

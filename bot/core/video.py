@@ -316,9 +316,12 @@ def build_pass_args(src: Path, out: Path, step: EncodeStep, vbr: int, abr: int,
               "-preset", step.preset, "-pix_fmt", "yuv420p", *vf, "-passlogfile", passlog]
     x265 = []
     if step.vcodec == "libx265":
-        # libx265 ignores -passlogfile and writes ./x265_2pass.log in the process CWD, so
-        # parallel encodes corrupt each other's stats. Name the file explicitly instead.
-        # (The stale x265_2pass.log* entry in .gitignore is the scar from this.)
+        # libx265 does not read ffmpeg's -passlogfile. With -pass 1/-pass 2 alone ffmpeg
+        # writes an empty passlog and x265 reports neither stats-write nor stats-read, so
+        # the "two-pass" silently degrades into two independent single-pass encodes and the
+        # first pass is wasted CPU. Passing stats= and pass= through -x265-params is what
+        # actually turns it on (verified on ffmpeg 6.1.1/x265 3.5); it also gives each job
+        # its own stats file rather than x265's default ./x265_2pass.log.
         common += ["-tag:v", "hvc1"]
         x265 = [f"stats={passlog}-x265.log"]
     pass1 = ["ffmpeg", *common,

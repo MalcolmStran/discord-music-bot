@@ -64,8 +64,10 @@ def test_no_ladder_rung_puts_opus_in_an_mp4():
 
 
 def test_x265_gets_an_explicit_stats_file():
-    """libx265 ignores -passlogfile and writes ./x265_2pass.log in the process CWD, so
-    two concurrent encodes corrupted each other's stats."""
+    """libx265 does not read ffmpeg's -passlogfile. Without stats= and pass= in
+    -x265-params, x265 reports neither stats-write nor stats-read and the two-pass
+    silently becomes two independent single-pass encodes (verified against ffmpeg 6.1.1).
+    The explicit path also keeps concurrent jobs off x265's default ./x265_2pass.log."""
     step = EncodeStep("libx265", "aac", 480, 0.88, "ultrafast")
     p1, p2 = build_pass_args("in.mp4", "out.mp4", step, 300_000, 64_000, 1080, "/tmp/job_pass")
     for argv in (p1, p2):
@@ -73,6 +75,19 @@ def test_x265_gets_an_explicit_stats_file():
         assert "stats=/tmp/job_pass-x265.log" in argv[i + 1]
     assert "pass=1" in p1[p1.index("-x265-params") + 1]
     assert "pass=2" in p2[p2.index("-x265-params") + 1]
+
+
+def test_x265_stats_path_is_unique_per_job():
+    """Two concurrent encodes must not share a stats file."""
+    step = EncodeStep("libx265", "aac", 480, 0.88, "ultrafast")
+    a = build_pass_args("i", "a.mp4", step, 1, 1, 1080, "/tmp/enc_aaaa_pass")
+    b = build_pass_args("i", "b.mp4", step, 1, 1, 1080, "/tmp/enc_bbbb_pass")
+
+    def stats(argv):
+        return next(p for p in argv[argv.index("-x265-params") + 1].split(":") if p.startswith("stats="))
+
+    assert stats(a[0]) != stats(b[0])
+    assert "x265_2pass.log" not in stats(a[0])
 
 
 def test_x264_does_not_get_x265_params():

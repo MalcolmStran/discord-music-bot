@@ -50,3 +50,53 @@ def test_scales_to_a_large_playlist():
     tracks = [t(f"s{i}", 100) for i in range(2000)] + [t(f"l{i}", 99999) for i in range(2000)]
     playable, too_long = split_too_long(tracks, MAX)
     assert len(playable) == 2000 and len(too_long) == 2000
+
+
+# ------------------------------------------------- restoring persisted settings
+class _Settings(dict):
+    def get(self, guild_id, key, default=None):   # matches GuildSettings.get
+        return dict.get(self, (guild_id, key), default)
+
+
+class _Player:
+    def __init__(self):
+        from bot.core.player import LoopMode
+        self.volume = 0.5
+        self.loop_mode = LoopMode.OFF
+
+    def set_volume(self, v):
+        self.volume = max(0.0, min(2.0, v))
+
+
+def restore(stored):
+    """Drive Music._restore without building a real cog."""
+    from bot.cogs.music import Music
+    cog = Music.__new__(Music)
+    cog.settings = _Settings(stored)
+    p = _Player()
+    Music._restore(cog, 1, p)
+    return p
+
+
+def test_restores_saved_volume_and_loop():
+    from bot.core.player import LoopMode
+    p = restore({(1, "volume"): 0.75, (1, "loop_mode"): "all"})
+    assert p.volume == 0.75 and p.loop_mode is LoopMode.ALL
+
+
+def test_missing_settings_leave_defaults():
+    from bot.core.player import LoopMode
+    p = restore({})
+    assert p.volume == 0.5 and p.loop_mode is LoopMode.OFF
+
+
+def test_corrupt_settings_do_not_break_player_creation():
+    """A hand-edited settings file must not stop the guild's player from being created."""
+    from bot.core.player import LoopMode
+    p = restore({(1, "volume"): "loud", (1, "loop_mode"): "sideways"})
+    assert p.volume == 0.5 and p.loop_mode is LoopMode.OFF
+
+
+def test_restored_volume_is_clamped():
+    p = restore({(1, "volume"): 99.0})
+    assert p.volume <= 2.0

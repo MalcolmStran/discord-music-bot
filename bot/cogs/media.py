@@ -218,6 +218,7 @@ class Media(commands.Cog):
     @app_commands.describe(url="Twitter/X or TikTok link")
     @commands.guild_only()
     async def convert(self, ctx: commands.Context, url: str):
+        url = url.strip().lstrip("<").rstrip(">")   # users paste <link> to suppress the embed
         if not self.settings.media_enabled(ctx.guild.id):  # type: ignore[union-attr]
             return await ctx.send("🚫 Media conversion is disabled on this server (`/media-toggle` to enable).")
         kind = classify(url)
