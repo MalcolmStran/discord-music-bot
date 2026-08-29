@@ -11,14 +11,24 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY requirements.txt .
+COPY requirements.txt requirements-dev.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY bot/ ./bot/
+# the README and CI both say to run the suite inside the image, so it has to be here
+COPY tests/ ./tests/
+COPY pyproject.toml ./
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh \
     && useradd --create-home --shell /usr/sbin/nologin app \
     && mkdir -p /app/downloads /app/logs && chown -R app:app /app
+
+# `python -m bot` exits on an unrecoverable error, so restart:unless-stopped covers a crash.
+# This catches the other failure mode: the process alive but the gateway connection dead.
+HEALTHCHECK --interval=60s --timeout=10s --start-period=90s --retries=3 \
+    CMD python -c "import os,pathlib,sys,time; \
+p=pathlib.Path(os.environ.get('LOG_DIR') or '/app/logs')/'healthy'; \
+sys.exit(0 if p.exists() and time.time()-p.stat().st_mtime < 180 else 1)"
 
 # entrypoint starts as root (fixes volume ownership, optional yt-dlp self-update) then drops to `app`
 ENTRYPOINT ["/usr/bin/tini", "--", "/entrypoint.sh"]

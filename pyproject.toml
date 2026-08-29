@@ -1,0 +1,43 @@
+[project]
+name = "discord-music-bot"
+version = "2.0.0"
+description = "Discord music bot + Twitter/X & TikTok link-to-MP4 converter"
+requires-python = ">=3.11"
+dynamic = ["dependencies"]
+
+[tool.setuptools.dynamic]
+dependencies = { file = ["requirements.txt"] }
+
+[tool.setuptools.packages.find]
+include = ["bot*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --strict-markers"
+asyncio_mode = "auto"
+filterwarnings = [
+    # discord.py imports audioop, which 3.13 deprecates; not ours to fix
+    "ignore::DeprecationWarning:discord",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "ASYNC", "C4", "RUF"]
+ignore = [
+    "E501",      # long lines are the house style here
+    "B008",
+    "RUF001",    # the UI strings are full of deliberate unicode (— · ≤ →)
+    "RUF002",
+    "RUF003",
+    "UP045",     # keep the existing Optional[X] style rather than churn 48 annotations
+    "UP007",
+    "UP042",     # LoopMode(str, Enum) is deliberate and works on 3.11
+    "ASYNC109",  # explicit `timeout` params are the interface we want here
+    "ASYNC240",  # small stat()/mkdir() calls off the loop are not worth a thread hop
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E731"]

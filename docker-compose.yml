@@ -9,14 +9,15 @@ services:
       - .env
     environment:
       - DOCKER_CONTAINER=true
-      - YTDLP_AUTO_UPDATE=true
+      # .env wins: hard-coding it here overrode YTDLP_AUTO_UPDATE=false in .env, which the
+      # README documents as the way to turn the start-up self-update off
+      - YTDLP_AUTO_UPDATE=${YTDLP_AUTO_UPDATE:-true}
     volumes:
       - ./logs:/app/logs
       - bot-downloads:/app/downloads   # temp media + guild settings (persisted)
-    deploy:
-      resources:
-        limits:
-          memory: 768M      # two concurrent x265 encodes need headroom
+    # `deploy.resources` is swarm-only and is ignored by `docker compose up`, so the cap
+    # was never actually applied. mem_limit is the compose-v2 key.
+    mem_limit: 768m         # two concurrent x265 encodes need headroom
     stop_grace_period: 20s
 
 volumes:
