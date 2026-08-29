@@ -1,0 +1,17 @@
+# Keep the build context (and the image) free of host state. Stale __pycache__ in
+# particular carries absolute host paths into pytest's assertion-rewrite cache.
+# Nested paths need the **/ prefix; a bare "__pycache__/" only matches the root.
+.git
+.github
+**/__pycache__
+**/*.py[cod]
+.pytest_cache
+.ruff_cache
+.venv
+venv
+env
+logs
+downloads
+temp
+.env
+*.log

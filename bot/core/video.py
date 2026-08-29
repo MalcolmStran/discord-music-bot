@@ -58,17 +58,26 @@ class EncodeStep:
 LADDER = [
     EncodeStep("libx264", "aac", None, 0.92, "veryfast"),
     EncodeStep("libx264", "aac", 480, 0.90, "veryfast"),
-    EncodeStep("libx265", "libopus", 480, 0.88, "ultrafast"),
+    EncodeStep("libx265", "aac", 480, 0.88, "ultrafast"),
 ]
+
+# Below this the picture is mush and the file still will not shrink much, so a target that
+# needs less than this is treated as impossible rather than encoded and thrown away.
+MIN_VIDEO_BITRATE = 120_000
 
 _encode_sem: Optional[asyncio.Semaphore] = None
 _download_sem: Optional[asyncio.Semaphore] = None
 
 
 def configure(max_concurrent_encodes: int, max_concurrent_downloads: int = 3) -> None:
+    """Install the global concurrency caps. Idempotent: replacing a live semaphore would
+    let jobs already holding the old one run alongside jobs holding the new one, quietly
+    doubling the cap every time the cog is reloaded."""
     global _encode_sem, _download_sem
-    _encode_sem = asyncio.Semaphore(max_concurrent_encodes)
-    _download_sem = asyncio.Semaphore(max_concurrent_downloads)
+    if _encode_sem is None:
+        _encode_sem = asyncio.Semaphore(max_concurrent_encodes)
+    if _download_sem is None:
+        _download_sem = asyncio.Semaphore(max_concurrent_downloads)
 
 
 def _sem(kind: str) -> asyncio.Semaphore:
@@ -90,30 +99,67 @@ async def download(url: str, workdir: Path, max_bytes: int, *, cookies_file: Opt
         "quiet": True, "no_warnings": True, "noprogress": True,
         "noplaylist": True,
         "max_filesize": max_bytes,
-        "nocheckcertificate": True,
         "retries": 3,
         "logger": _Quiet(),
     }
     if cookies_file and cookies_file.exists():
         opts["cookiefile"] = str(cookies_file)
+    too_big = False
     async with _sem("download"):
+        def _run() -> None:
+            with yt_dlp.YoutubeDL(opts) as ydl:      # closing it releases yt-dlp's sockets
+                ydl.download([url])
         try:
-            await asyncio.to_thread(lambda: yt_dlp.YoutubeDL(opts).download([url]))
+            await asyncio.to_thread(_run)
         except DownloadError as e:
             msg = str(e)
             if "tiktok" in url.lower() and rapidapi_key:
                 log.info("yt-dlp failed for TikTok (%s); trying RapidAPI fallback", msg[:80])
-                return await _tiktok_rapidapi(url, stem.with_suffix(".mp4"), max_bytes, rapidapi_key)
-            if "File is larger than max-filesize" in msg or "larger than max" in msg.lower():
-                raise VideoError(f"Video is larger than {max_bytes // 1024 // 1024} MB.")
-            raise VideoError(_friendly(msg))
-    for p in workdir.glob(stem.name + ".*"):
+                try:
+                    return await _tiktok_rapidapi(url, stem.with_suffix(".mp4"), max_bytes, rapidapi_key)
+                except VideoError:
+                    raise
+                except Exception as fe:              # keep the original reason, not the fallback's
+                    log.warning("TikTok RapidAPI fallback failed: %s", fe)
+                    _sweep(workdir, stem.name)
+                    raise VideoError(_friendly(msg)) from fe
+            _sweep(workdir, stem.name)
+            if _is_too_big(msg):
+                raise VideoError(f"Video is larger than {max_bytes // 1024 // 1024} MB.") from e
+            raise VideoError(_friendly(msg)) from e
+        except Exception as e:
+            _sweep(workdir, stem.name)
+            raise VideoError("Couldn't download that video.") from e
+    # yt-dlp *skips* (does not raise) when max_filesize is exceeded, so the only trace is
+    # that nothing was written. Without this the user got a misleading "No video found".
+    for p in sorted(workdir.glob(stem.name + ".*")):
         if p.suffix.lower() in (".mp4", ".mkv", ".webm", ".mov"):
             if p.stat().st_size > max_bytes:
-                p.unlink(missing_ok=True)
-                raise VideoError(f"Video is larger than {max_bytes // 1024 // 1024} MB.")
+                too_big = True
+                continue
+            _sweep(workdir, stem.name, keep=p)       # drop leftover per-format fragments
             return p
-    raise VideoError("No video found at that link.")
+    _sweep(workdir, stem.name)
+    if too_big:
+        raise VideoError(f"Video is larger than {max_bytes // 1024 // 1024} MB.")
+    raise VideoError(f"No video found at that link (or it is over the {max_bytes // 1024 // 1024} MB limit).")
+
+
+def _is_too_big(msg: str) -> bool:
+    low = msg.lower()
+    return "larger than max" in low or "max-filesize" in low or "file is larger" in low
+
+
+def _sweep(workdir: Path, stem_name: str, keep: Optional[Path] = None) -> None:
+    """Remove this job's leftovers: .part files, per-format fragments, failed merges."""
+    for p in workdir.glob(stem_name + "*"):
+        if keep is not None and p == keep:
+            continue
+        try:
+            if p.is_file():
+                p.unlink()
+        except OSError:
+            pass
 
 
 async def _tiktok_rapidapi(url: str, dest: Path, max_bytes: int, key: str) -> Path:
@@ -128,29 +174,46 @@ async def _tiktok_rapidapi(url: str, dest: Path, max_bytes: int, key: str) -> Pa
         play = data.get("play")
         if not play:
             raise VideoError("TikTok API returned no video.")
-        async with s.get(play) as r:
-            r.raise_for_status()
-            n = 0
-            with open(dest, "wb") as f:
-                async for chunk in r.content.iter_chunked(1 << 16):
-                    n += len(chunk)
-                    if n > max_bytes:
-                        f.close()
-                        dest.unlink(missing_ok=True)
-                        raise VideoError(f"Video is larger than {max_bytes // 1024 // 1024} MB.")
-                    f.write(chunk)
+        try:
+            async with s.get(play) as r:
+                r.raise_for_status()
+                n = 0
+                # write off the event loop: a 500 MB body written inline stalls playback
+                # for every guild while it streams in.
+                f = await asyncio.to_thread(open, dest, "wb")
+                try:
+                    async for chunk in r.content.iter_chunked(1 << 20):   # 1 MiB: one thread hop per MB
+                        n += len(chunk)
+                        if n > max_bytes:
+                            raise VideoError(f"Video is larger than {max_bytes // 1024 // 1024} MB.")
+                        await asyncio.to_thread(f.write, chunk)
+                finally:
+                    await asyncio.to_thread(f.close)
+        except BaseException:
+            dest.unlink(missing_ok=True)      # never leave a partial file behind
+            raise
     return dest
 
 
 # --------------------------------------------------------------------- probe
-async def probe(path: Path) -> Probe:
-    proc = await asyncio.create_subprocess_exec(
-        "ffprobe", "-v", "error", "-print_format", "json", "-show_format", "-show_streams", str(path),
-        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-    out, err = await proc.communicate()
+async def probe(path: Path, *, timeout: int = 60) -> Probe:
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ffprobe", "-v", "error", "-print_format", "json", "-show_format", "-show_streams", str(path),
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+    except FileNotFoundError as e:
+        raise VideoError("ffprobe is not installed on the host, so videos can't be compressed.") from e
+    try:
+        out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except TimeoutError as e:
+        await _terminate(proc)
+        raise VideoError("ffprobe timed out reading that file.") from e
     if proc.returncode != 0:
         raise VideoError(f"ffprobe failed: {err.decode(errors='ignore')[:200]}")
-    info = json.loads(out or b"{}")
+    try:
+        info = json.loads(out or b"{}")
+    except ValueError as e:
+        raise VideoError("ffprobe returned unreadable output.") from e
     streams = info.get("streams", [])
     v = next((s for s in streams if s.get("codec_type") == "video"), None)
     if not v:
@@ -162,7 +225,47 @@ async def probe(path: Path) -> Probe:
                  has_audio=any(s.get("codec_type") == "audio" for s in streams))
 
 
+async def _terminate(proc: asyncio.subprocess.Process) -> None:
+    """Kill a child and actually reap it. `proc.kill()` alone only sends the signal: the
+    process stays alive (and keeps its CPU/temp files) while we release the semaphore and
+    start the next encode."""
+    if proc.returncode is not None:
+        return
+    try:
+        proc.kill()
+    except ProcessLookupError:
+        return
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=10)
+    except TimeoutError:
+        log.warning("child %s did not die after SIGKILL", proc.pid)
+
+
 # -------------------------------------------------------------------- encode
+def plan_step(step: EncodeStep, limit_bytes: int, duration: float, has_audio: bool) -> Optional[tuple[int, int]]:
+    """Bitrates (video, audio) for `step`, or None if this rung provably cannot fit.
+
+    The old code clamped a negative video bitrate up to a floor and encoded anyway, so a
+    long clip ran all three rungs — six ffmpeg passes holding the encode semaphore — to
+    produce files many times over the limit before giving up.
+    """
+    if duration <= 0:
+        return None
+    abr = 64_000 if has_audio else 0
+    target_bytes = int(limit_bytes * step.size_factor)
+    vbr = int(target_bytes * 8 / duration) - abr
+    if vbr < MIN_VIDEO_BITRATE:
+        return None
+    return vbr, abr
+
+
+def max_fittable_duration(limit_bytes: int, has_audio: bool = True) -> float:
+    """Longest clip any ladder rung could compress under `limit_bytes`, in seconds."""
+    abr = 64_000 if has_audio else 0
+    best = max(st.size_factor for st in LADDER)
+    return (limit_bytes * best * 8) / (MIN_VIDEO_BITRATE + abr)
+
+
 async def fit_under(src: Path, limit_bytes: int, workdir: Path, *, timeout: int = 600,
                     progress=None) -> Path:
     """Return a path to a file ≤ limit_bytes (src itself if already small enough).
@@ -170,61 +273,95 @@ async def fit_under(src: Path, limit_bytes: int, workdir: Path, *, timeout: int 
     if src.stat().st_size <= limit_bytes:
         return src
     info = await probe(src)
-    for step in LADDER:
-        target_bytes = int(limit_bytes * step.size_factor)
-        abr = 48_000 if step.acodec == "libopus" else 64_000
-        if not info.has_audio:
-            abr = 0
-        vbr = int(target_bytes * 8 / info.duration) - abr
-        vbr = max(vbr, 120_000)
+    plans = [(step, plan) for step in LADDER if (plan := plan_step(step, limit_bytes, info.duration, info.has_audio))]
+    if not plans:
+        longest = max_fittable_duration(limit_bytes, info.has_audio)
+        raise VideoError(
+            f"That video is {_mmss(info.duration)} long — too long to fit in "
+            f"{limit_bytes // 1048576} MB at watchable quality (max about {_mmss(longest)}).")
+    for step, (vbr, abr) in plans:
         out = workdir / f"enc_{uuid.uuid4().hex[:8]}.mp4"
         if progress:
             try:
                 await progress(f"🗜️ Compressing ({step.label}, ~{vbr // 1000} kbps)…")
             except Exception:
                 pass
-        ok = await _two_pass(src, out, step, vbr, abr, info, timeout)
-        if ok and out.exists():
-            size = out.stat().st_size
-            log.info("encode %s → %.2f MB (limit %.2f MB)", step.label, size / 1048576, limit_bytes / 1048576)
-            if size <= limit_bytes:
-                return out
-            out.unlink(missing_ok=True)
-        else:
-            out.unlink(missing_ok=True)
+        try:
+            ok = await _two_pass(src, out, step, vbr, abr, info, timeout)
+            if ok and out.exists():
+                size = out.stat().st_size
+                log.info("encode %s → %.2f MB (limit %.2f MB)", step.label, size / 1048576, limit_bytes / 1048576)
+                if size <= limit_bytes:
+                    return out
+        finally:
+            if not (out.exists() and out.stat().st_size <= limit_bytes):
+                out.unlink(missing_ok=True)
     raise VideoError("Couldn't compress the video enough to upload it (try a shorter clip).")
 
 
-async def _two_pass(src: Path, out: Path, step: EncodeStep, vbr: int, abr: int, info: Probe, timeout: int) -> bool:
-    passlog = out.with_suffix("") .as_posix() + "_pass"
+def _mmss(seconds: float) -> str:
+    m, sec = divmod(int(seconds), 60)
+    h, m = divmod(m, 60)
+    return f"{h}:{m:02d}:{sec:02d}" if h else f"{m}:{sec:02d}"
+
+
+def build_pass_args(src: Path, out: Path, step: EncodeStep, vbr: int, abr: int,
+                    height: int, passlog: str) -> tuple[list[str], list[str]]:
+    """argv for ffmpeg pass 1 and pass 2. Split out so the flags are unit-testable."""
     vf: list[str] = []
-    if step.max_height and info.height > step.max_height:
+    if step.max_height and height > step.max_height:
         vf = ["-vf", f"scale=-2:{step.max_height}"]
     common = ["-y", "-nostdin", "-hide_banner", "-loglevel", "error", "-i", str(src),
               "-c:v", step.vcodec, "-b:v", str(vbr), "-maxrate", str(int(vbr * 1.3)), "-bufsize", str(vbr * 2),
               "-preset", step.preset, "-pix_fmt", "yuv420p", *vf, "-passlogfile", passlog]
+    x265 = []
     if step.vcodec == "libx265":
+        # libx265 does not read ffmpeg's -passlogfile. With -pass 1/-pass 2 alone ffmpeg
+        # writes an empty passlog and x265 reports neither stats-write nor stats-read, so
+        # the "two-pass" silently degrades into two independent single-pass encodes and the
+        # first pass is wasted CPU. Passing stats= and pass= through -x265-params is what
+        # actually turns it on (verified on ffmpeg 6.1.1/x265 3.5); it also gives each job
+        # its own stats file rather than x265's default ./x265_2pass.log.
         common += ["-tag:v", "hvc1"]
-    pass1 = ["ffmpeg", *common, "-pass", "1", "-an", "-f", "null", os.devnull]
+        x265 = [f"stats={passlog}-x265.log"]
+    pass1 = ["ffmpeg", *common,
+             *(["-x265-params", ":".join([*x265, "pass=1"])] if x265 else []),
+             "-pass", "1", "-an", "-f", "null", os.devnull]
     audio = ["-c:a", step.acodec, "-b:a", str(abr)] if abr else ["-an"]
-    if step.acodec == "libopus" and abr:
-        audio += ["-ac", "2"]
-    pass2 = ["ffmpeg", *common, "-pass", "2", *audio, "-movflags", "+faststart", str(out)]
+    pass2 = ["ffmpeg", *common,
+             *(["-x265-params", ":".join([*x265, "pass=2"])] if x265 else []),
+             "-pass", "2", *audio, "-movflags", "+faststart", str(out)]
+    return pass1, pass2
+
+
+async def _two_pass(src: Path, out: Path, step: EncodeStep, vbr: int, abr: int, info: Probe, timeout: int) -> bool:
+    passlog = out.with_suffix("").as_posix() + "_pass"
+    pass1, pass2 = build_pass_args(src, out, step, vbr, abr, info.height, passlog)
     async with _sem("encode"):
+        proc: Optional[asyncio.subprocess.Process] = None
         try:
             for argv in (pass1, pass2):
-                proc = await asyncio.create_subprocess_exec(*argv, stdout=asyncio.subprocess.DEVNULL,
-                                                            stderr=asyncio.subprocess.PIPE)
+                try:
+                    proc = await asyncio.create_subprocess_exec(*argv, stdout=asyncio.subprocess.DEVNULL,
+                                                                stderr=asyncio.subprocess.PIPE)
+                except FileNotFoundError as e:
+                    raise VideoError("ffmpeg is not installed on the host, so videos can't be compressed.") from e
                 try:
                     _, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-                except asyncio.TimeoutError:
-                    proc.kill()
+                except TimeoutError:
+                    # kill() only signals; without the reap the encoder keeps burning CPU
+                    # after we release the semaphore and start the next job.
+                    await _terminate(proc)
                     log.warning("ffmpeg timed out (%s)", step.label)
                     return False
                 if proc.returncode != 0:
                     log.warning("ffmpeg failed (%s): %s", step.label, err.decode(errors="ignore")[-300:])
                     return False
             return True
+        except asyncio.CancelledError:
+            if proc is not None:
+                await _terminate(proc)     # a cancelled convert used to orphan the encoder
+            raise
         finally:
             for p in out.parent.glob(Path(passlog).name + "*"):
                 p.unlink(missing_ok=True)

@@ -91,7 +91,6 @@ class YTDL:
             "quiet": True,
             "no_warnings": True,
             "noprogress": True,
-            "nocheckcertificate": True,
             "ignoreerrors": "only_download",
             "default_search": "ytsearch",
             "source_address": "0.0.0.0",
@@ -138,6 +137,8 @@ class YTDL:
         """Resolve (or refresh) a *streamable* URL for a track, trying YT clients in order."""
         if not track.webpage_url and track.search_query:
             await self._resolve_search(track)
+        if not track.webpage_url:
+            raise LookupError("No source to play for that track.")
         is_yt = "youtube" in (track.extractor or "").lower() or "youtu" in track.webpage_url
         clients = list(YT_CLIENT_ORDER) if is_yt else ["default"]
         now = time.monotonic()
@@ -154,15 +155,18 @@ class YTDL:
             if not info:
                 continue
             url = info.get("url")
-            if not url and info.get("requested_formats"):
-                url = info["requested_formats"][0].get("url")
+            fmt = _audio_format(info)
+            if not url and fmt:
+                url = fmt.get("url")
             if not url:
                 last_err = "No playable stream found."
                 continue
             hdrs = info.get("http_headers") or {}
-            if not hdrs and info.get("requested_formats"):
-                hdrs = info["requested_formats"][0].get("http_headers") or {}
-            hdrs = {k: v for k, v in hdrs.items() if k.lower() in ("user-agent", "referer", "origin", "cookie", "accept-language")}
+            if not hdrs and fmt:
+                hdrs = fmt.get("http_headers") or {}
+            hdrs = {k: _clean_header(v) for k, v in hdrs.items()
+                    if k.lower() in ("user-agent", "referer", "origin", "cookie", "accept-language")}
+            hdrs = {k: v for k, v in hdrs.items() if v}
             if is_yt and not await self._url_streamable(url, hdrs):
                 log.info("client %s gave a URL ffmpeg can't fetch (403) — trying next", client)
                 self._client_bad_until[client] = time.monotonic() + YT_CLIENT_PENALTY_SECONDS
@@ -240,6 +244,24 @@ class YTDL:
         return discord.PCMVolumeTransformer(src, volume=volume)
 
 
+def _clean_header(value: str) -> str:
+    """Strip CR/LF so a header value cannot inject extra header lines into ffmpeg's blob."""
+    return str(value).replace("\r", "").replace("\n", "").strip()
+
+
+def _audio_format(info: dict[str, Any]) -> Optional[dict[str, Any]]:
+    """The audio half of a merged format selection.
+
+    `requested_formats[0]` is the *video* stream when yt-dlp merges, so taking it blindly
+    handed ffmpeg a video-only URL for the audio player.
+    """
+    fmts = info.get("requested_formats") or []
+    for f in fmts:
+        if f.get("acodec") and f["acodec"] != "none":
+            return f
+    return fmts[0] if fmts else None
+
+
 def _shq(s: str) -> str:
     """discord.py splits before_options with shlex — quote a single argument safely."""
     return "'" + s.replace("'", "'\\''") + "'"
@@ -265,16 +287,23 @@ def _friendly(err: str) -> str:
     low = err.lower()
     if "private video" in low:
         return "That video is private."
+    # Check age-gating before the generic sign-in and unavailable branches: YouTube's actual
+    # wording is "Sign in to confirm your age", which has no "restrict" in it and used to
+    # land on the plain login message.
+    if "confirm your age" in low or "age-restricted" in low or ("age" in low and "restrict" in low):
+        return "That video is age-restricted (cookies needed)."
+    if "requested format" in low or "no video formats" in low:
+        return "No playable audio format for that video."
     if "video unavailable" in low or "not available" in low:
         return "That video is unavailable."
-    if "age" in low and "restrict" in low:
-        return "That video is age-restricted (cookies needed)."
     if "sign in" in low or "login" in low:
         return "That source requires a login (cookies needed)."
     if "unsupported url" in low:
         return "Unsupported URL."
     if "no video results" in low or "did not get any data" in low:
         return "No results."
+    if "is live" in low or "premieres in" in low:
+        return "That stream hasn't started yet."
     # strip yt-dlp's "ERROR: [youtube] xyz: " prefix
     m = re.search(r"ERROR:\s*(?:\[[^\]]+\]\s*)?(?:[\w-]+:\s*)?(.*)", err)
     return (m.group(1) if m else err).strip()[:200] or "Could not load that."
