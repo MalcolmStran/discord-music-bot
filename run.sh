@@ -5,7 +5,7 @@ cd "$(dirname "$0")"
 docker build -t discord-music-bot:2 .
 docker rm -f discord-music-bot 2>/dev/null || true
 docker run -d --name discord-music-bot --restart unless-stopped --network host \
-  --env-file .env -e DOCKER_CONTAINER=true -e YTDLP_AUTO_UPDATE="${YTDLP_AUTO_UPDATE:-true}" \
+  --env-file .env \
   -v "$PWD/logs:/app/logs" -v discord-music-bot_bot-downloads:/app/downloads \
   --memory 768m --stop-timeout 20 \
   discord-music-bot:2

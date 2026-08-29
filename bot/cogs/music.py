@@ -231,7 +231,7 @@ class Music(commands.Cog):
         player = self.player(ctx.guild)  # type: ignore[arg-type]
         if not await self._require_same_channel(ctx, player):
             return
-        if not player.is_playing:
+        if not player.is_busy:
             return await ctx.send("Nothing is playing.")
         player.skip()
         await ctx.send("⏭️ Skipped.")

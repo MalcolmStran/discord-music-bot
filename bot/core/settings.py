@@ -54,11 +54,18 @@ class GuildSettings:
     def _quarantine(self, err: Exception) -> None:
         """Move an unusable settings file aside and start fresh."""
         log.warning("settings file unreadable (%s); starting fresh", err)
-        # a fixed ".corrupt.json" name meant the second failure destroyed the copy kept
-        # from the first, so keep them distinct
+        # A fixed ".corrupt.json" name meant the second failure destroyed the copy kept from
+        # the first. A timestamp alone is not enough either: it only has second resolution,
+        # so repeated failures within the same second still overwrote each other (rename()
+        # replaces silently). Add a counter so every rescue copy survives.
         stamp = time.strftime("%Y%m%d-%H%M%S")
+        dest = self.path.with_suffix(f".corrupt-{stamp}.json")
+        n = 1
+        while dest.exists() and n < 1000:
+            dest = self.path.with_suffix(f".corrupt-{stamp}-{n}.json")
+            n += 1
         try:
-            self.path.rename(self.path.with_suffix(f".corrupt-{stamp}.json"))
+            self.path.rename(dest)
         except OSError as e:
             log.warning("could not preserve the corrupt settings file: %s", e)
 

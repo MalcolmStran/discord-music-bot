@@ -59,13 +59,18 @@ class _Settings(dict):
 
 
 class _Player:
+    """Uses GuildPlayer's REAL set_volume. Re-implementing the clamp here meant the clamp
+    test asserted on the stand-in and a broken GuildPlayer.set_volume went unnoticed."""
+
+    from bot.core.player import GuildPlayer as _GP
+
+    set_volume = _GP.set_volume
+
     def __init__(self):
         from bot.core.player import LoopMode
         self.volume = 0.5
         self.loop_mode = LoopMode.OFF
-
-    def set_volume(self, v):
-        self.volume = max(0.0, min(2.0, v))
+        self._source = None
 
 
 def restore(stored):
@@ -98,5 +103,11 @@ def test_corrupt_settings_do_not_break_player_creation():
 
 
 def test_restored_volume_is_clamped():
+    """Exercises GuildPlayer.set_volume itself."""
     p = restore({(1, "volume"): 99.0})
-    assert p.volume <= 2.0
+    assert p.volume == 2.0
+
+
+def test_restored_negative_volume_is_clamped():
+    p = restore({(1, "volume"): -5.0})
+    assert p.volume == 0.0

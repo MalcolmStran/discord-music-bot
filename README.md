@@ -50,11 +50,15 @@ an unknown `LOG_LEVEL` falls back to `INFO`, and an empty `COMMAND_PREFIX` is re
 
 ## Develop
 ```bash
-pip install -r requirements-dev.txt
-ruff check bot tests      # lint
-python -m pytest          # 150+ offline tests, no Discord and no network
+./check.sh --install      # deps, then lint + the whole offline suite
+./check.sh                # lint + tests (160+, no Discord and no network)
+./check.sh --docker       # also build the image and run the suite inside it
 ```
-CI runs both on 3.11 and 3.13, and runs the suite inside the Docker image as well.
+Or run the pieces directly: `ruff check bot tests` and `python -m pytest`.
+
+There is no GitHub Actions workflow — hosted runners bill against the repository owner's
+account and Actions is not available here — so `check.sh` is the thing to run before
+pushing. The suite is pure-offline and takes under a second.
 
 ## Layout
 ```
@@ -67,6 +71,7 @@ bot/
   core/queue.py    TrackQueue
   core/ytdl.py     resolve (flat playlists), lazy stream URLs, audio source
   core/video.py    download (yt-dlp + optional RapidAPI TikTok fallback), probe, fit_under (2-pass ladder)
+  core/spotify.py  Spotify links → metadata (embed page, or Web API when creds are set)
   core/settings.py per-guild JSON settings
 tests/           offline unit tests — queue/settings/links, player loop modes, encoder
                  planning, config parsing, ytdl helpers, Spotify parsing

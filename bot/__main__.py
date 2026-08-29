@@ -240,10 +240,12 @@ async def main() -> None:
                 await bot.close()  # lets `start()` finish its own gateway teardown
         finally:
             # Reap the loser, or asyncio warns "Task was destroyed but it is pending".
-            # bot.close() makes start() return by itself, so give it a moment to unwind
-            # the gateway cleanly before resorting to cancellation.
+            # Only `runner` gets a grace period: bot.close() makes start() return on its
+            # own. `waiter` is an Event.wait() that never completes by itself, so waiting
+            # on it just added a flat 10 s to every abnormal exit (a bad token took 11 s
+            # to report). Cancel that one outright.
             for task in pending:
-                if not task.done():
+                if task is runner and not task.done():
                     await asyncio.wait({task}, timeout=10)
                 if not task.done():
                     task.cancel()

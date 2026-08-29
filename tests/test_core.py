@@ -68,11 +68,17 @@ def test_settings_survives_a_bad_file(tmp_path: Path, body: str):
 
 
 def test_settings_keeps_every_corrupt_copy(tmp_path: Path):
+    """Every rescue copy must survive. A fixed name clobbered the previous one; a
+    second-resolution timestamp alone still collided for failures inside one second, which
+    a `>= 1` assertion happily accepted while 3 of 4 backups were being destroyed."""
     p = tmp_path / "s.json"
-    for _ in range(2):
-        p.write_text("{{{")
+    rounds = 4
+    for i in range(rounds):
+        p.write_text(f"{{{{{{ {i}")
         GuildSettings(p)
-    assert len(list(tmp_path.glob("s.corrupt-*.json"))) >= 1
+    kept = sorted(tmp_path.glob("s.corrupt-*.json"))
+    assert len(kept) == rounds, f"expected {rounds} rescue copies, kept {len(kept)}"
+    assert len({q.read_text() for q in kept}) == rounds, "rescue copies overwrote each other"
 
 
 def test_settings_forget_guild(tmp_path: Path):
