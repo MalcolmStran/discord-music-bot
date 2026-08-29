@@ -7,6 +7,17 @@ on:
   workflow_dispatch:      # lets CI be run on demand from the Actions tab
 
 jobs:
+  # Temporary diagnostic: uses no third-party actions at all. If this job gets a runner
+  # while the others do not, the blocker is the "Actions permissions" allow-list rather
+  # than runner availability. Removed once CI is understood.
+  runner-probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Prove a runner was allocated
+        run: |
+          echo "runner reached: $RUNNER_NAME on $RUNNER_OS"
+          python3 -c "print('python is here')"
+
   test:
     runs-on: ubuntu-latest
     strategy:
