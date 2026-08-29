@@ -15,7 +15,7 @@ COPY requirements.txt requirements-dev.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY bot/ ./bot/
-# the README and CI both say to run the suite inside the image, so it has to be here
+# the README tells you to run the suite inside the image, so it has to be here
 COPY tests/ ./tests/
 COPY pyproject.toml ./
 COPY entrypoint.sh /entrypoint.sh

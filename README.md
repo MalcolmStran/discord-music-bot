@@ -50,11 +50,15 @@ an unknown `LOG_LEVEL` falls back to `INFO`, and an empty `COMMAND_PREFIX` is re
 
 ## Develop
 ```bash
-pip install -r requirements-dev.txt
-ruff check bot tests      # lint
-python -m pytest          # 150+ offline tests, no Discord and no network
+./check.sh --install      # deps, then lint + the whole offline suite
+./check.sh                # lint + tests (160+, no Discord and no network)
+./check.sh --docker       # also build the image and run the suite inside it
 ```
-CI runs both on 3.11 and 3.13, and runs the suite inside the Docker image as well.
+Or run the pieces directly: `ruff check bot tests` and `python -m pytest`.
+
+There is no GitHub Actions workflow — hosted runners bill against the repository owner's
+account and Actions is not available here — so `check.sh` is the thing to run before
+pushing. The suite is pure-offline and takes under a second.
 
 ## Layout
 ```
