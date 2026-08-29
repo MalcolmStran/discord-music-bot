@@ -14,6 +14,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import shutil
 import uuid
 from dataclasses import dataclass
@@ -117,13 +118,16 @@ async def download(url: str, workdir: Path, max_bytes: int, *, cookies_file: Opt
             if "tiktok" in url.lower() and rapidapi_key:
                 log.info("yt-dlp failed for TikTok (%s); trying RapidAPI fallback", msg[:80])
                 try:
-                    return await _tiktok_rapidapi(url, stem.with_suffix(".mp4"), max_bytes, rapidapi_key)
+                    fallback = await _tiktok_rapidapi(url, stem.with_suffix(".mp4"), max_bytes, rapidapi_key)
                 except VideoError:
+                    _sweep(workdir, stem.name)       # yt-dlp's partial files are still around
                     raise
                 except Exception as fe:              # keep the original reason, not the fallback's
                     log.warning("TikTok RapidAPI fallback failed: %s", fe)
                     _sweep(workdir, stem.name)
                     raise VideoError(_friendly(msg)) from fe
+                _sweep(workdir, stem.name, keep=fallback)
+                return fallback
             _sweep(workdir, stem.name)
             if _is_too_big(msg):
                 raise VideoError(f"Video is larger than {max_bytes // 1024 // 1024} MB.") from e
@@ -133,17 +137,36 @@ async def download(url: str, workdir: Path, max_bytes: int, *, cookies_file: Opt
             raise VideoError("Couldn't download that video.") from e
     # yt-dlp *skips* (does not raise) when max_filesize is exceeded, so the only trace is
     # that nothing was written. Without this the user got a misleading "No video found".
-    for p in sorted(workdir.glob(stem.name + ".*")):
-        if p.suffix.lower() in (".mp4", ".mkv", ".webm", ".mov"):
-            if p.stat().st_size > max_bytes:
-                too_big = True
-                continue
-            _sweep(workdir, stem.name, keep=p)       # drop leftover per-format fragments
-            return p
+    for p in _output_candidates(workdir, stem.name):
+        if p.stat().st_size > max_bytes:
+            too_big = True
+            continue
+        _sweep(workdir, stem.name, keep=p)           # drop leftover per-format fragments
+        return p
     _sweep(workdir, stem.name)
     if too_big:
         raise VideoError(f"Video is larger than {max_bytes // 1024 // 1024} MB.")
     raise VideoError(f"No video found at that link (or it is over the {max_bytes // 1024 // 1024} MB limit).")
+
+
+# yt-dlp names per-format downloads "<stem>.f<ID>.<ext>" and the merged result "<stem>.<ext>".
+_FRAGMENT_RE = re.compile(r"\.f\d+$")
+_VIDEO_EXTS = (".mp4", ".mkv", ".webm", ".mov")
+
+
+def _output_candidates(workdir: Path, stem_name: str) -> list[Path]:
+    """Playable outputs for this job, merged result first.
+
+    Sorting the raw glob put "<stem>.f137.mp4" ahead of "<stem>.mp4" ("f" < "m"), so a
+    surviving video-only fragment was returned to the uploader — and the _sweep(keep=...)
+    below then deleted the real merged file. Rank real outputs above fragments.
+    """
+    merged, fragments = [], []
+    for p in sorted(workdir.glob(stem_name + ".*")):
+        if not p.is_file() or p.suffix.lower() not in _VIDEO_EXTS:
+            continue
+        (fragments if _FRAGMENT_RE.search(p.stem) else merged).append(p)
+    return merged + fragments
 
 
 def _is_too_big(msg: str) -> bool:
@@ -287,15 +310,20 @@ async def fit_under(src: Path, limit_bytes: int, workdir: Path, *, timeout: int 
                 await progress(f"🗜️ Compressing ({step.label}, ~{vbr // 1000} kbps)…")
             except Exception:
                 pass
+        keep = False
         try:
             ok = await _two_pass(src, out, step, vbr, abr, info, timeout)
             if ok and out.exists():
                 size = out.stat().st_size
                 log.info("encode %s → %.2f MB (limit %.2f MB)", step.label, size / 1048576, limit_bytes / 1048576)
                 if size <= limit_bytes:
+                    keep = True
                     return out
         finally:
-            if not (out.exists() and out.stat().st_size <= limit_bytes):
+            # Only a file we are actually returning survives. Testing the size here instead
+            # meant a timed-out or failed encode that happened to land under the limit was
+            # left on disk to be reaped an hour later by the cleanup loop.
+            if not keep:
                 out.unlink(missing_ok=True)
     raise VideoError("Couldn't compress the video enough to upload it (try a shorter clip).")
 

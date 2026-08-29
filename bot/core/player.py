@@ -262,7 +262,11 @@ class GuildPlayer:
         code only assigned `current` on success, so a failed track duplicated its
         predecessor and evicted its successor.
         """
-        if self.current:
+        if self.current and not self._stop_requested:
+            # A /stop must end playback even under loop-all. Nothing else clears loop_mode
+            # any more (it is a persisted per-guild setting), so without this guard the
+            # branch below put the just-stopped track straight back into the queue and the
+            # player replayed it forever.
             if self.loop_mode is LoopMode.ONE and not self._skip_requested:
                 return self.current
             if self.loop_mode is LoopMode.ALL:

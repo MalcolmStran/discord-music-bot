@@ -157,3 +157,43 @@ def test_friendly_messages(raw, expected):
 @pytest.mark.parametrize("secs,text", [(65, "1:05"), (3600, "1:00:00"), (0, "0:00"), (419, "6:59")])
 def test_mmss(secs, text):
     assert _mmss(secs) == text
+
+
+# ------------------------------------------------- picking the right download output
+def test_merged_output_wins_over_a_per_format_fragment(tmp_path):
+    """yt-dlp writes "<stem>.f137.mp4" beside the merged "<stem>.mp4". Sorting the raw glob
+    put the fragment first ("f" < "m"), so the video-only file was uploaded and _sweep()
+    then deleted the real merge."""
+    from bot.core.video import _output_candidates
+
+    (tmp_path / "dl_x.f137.mp4").write_bytes(b"VIDEO-ONLY")
+    (tmp_path / "dl_x.f140.m4a").write_bytes(b"AUDIO-ONLY")
+    (tmp_path / "dl_x.mp4").write_bytes(b"MERGED")
+    picked = _output_candidates(tmp_path, "dl_x")
+    assert picked[0].name == "dl_x.mp4"
+    assert picked[0].read_bytes() == b"MERGED"
+
+
+def test_fragment_is_still_used_when_nothing_was_merged(tmp_path):
+    """A single-format download never produces a merge; the fragment is all there is."""
+    from bot.core.video import _output_candidates
+
+    (tmp_path / "dl_y.f22.mp4").write_bytes(b"ONLY")
+    assert [p.name for p in _output_candidates(tmp_path, "dl_y")] == ["dl_y.f22.mp4"]
+
+
+def test_non_video_and_partial_files_are_never_candidates(tmp_path):
+    from bot.core.video import _output_candidates
+
+    (tmp_path / "dl_z.mp4.part").write_bytes(b"partial")
+    (tmp_path / "dl_z.f140.m4a").write_bytes(b"audio")
+    (tmp_path / "dl_z.info.json").write_bytes(b"{}")
+    assert _output_candidates(tmp_path, "dl_z") == []
+
+
+def test_other_jobs_are_not_candidates(tmp_path):
+    from bot.core.video import _output_candidates
+
+    (tmp_path / "dl_mine.mp4").write_bytes(b"mine")
+    (tmp_path / "dl_other.mp4").write_bytes(b"someone else's job")
+    assert [p.name for p in _output_candidates(tmp_path, "dl_mine")] == ["dl_mine.mp4"]

@@ -109,3 +109,13 @@ def test_derived_paths_live_under_download_dir(monkeypatch, tmp_path):
     monkeypatch.setenv("DOWNLOAD_DIR", str(tmp_path))
     cfg = Config.from_env()
     assert cfg.data_dir.parent == tmp_path and cfg.media_tmp_dir.parent == tmp_path
+
+
+def test_blank_bool_falls_back_to_the_default(monkeypatch):
+    """A blank value means "unset", matching _int/_float. Treating it as False made
+    `MEDIA_ENABLED_DEFAULT=` silently disable the feature."""
+    monkeypatch.setenv("B", "")
+    assert _bool("B", True) is True
+    assert _bool("B", False) is False
+    monkeypatch.setenv("B", "   ")
+    assert _bool("B", True) is True

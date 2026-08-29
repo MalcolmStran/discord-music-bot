@@ -59,8 +59,13 @@ def _clamp(name, value, minimum, maximum, default):
 
 
 def _bool(name: str, default: bool) -> bool:
+    """A blank value means "unset" and falls back to `default`, matching _int/_float.
+
+    Treating it as False made `MEDIA_ENABLED_DEFAULT=` silently disable the feature rather
+    than use the documented default — and .env.example ships several keys with empty values.
+    """
     v = os.getenv(name)
-    if v is None:
+    if v is None or not v.strip():
         return default
     return v.strip().lower() in ("1", "true", "yes", "on")
 
