@@ -4,6 +4,7 @@ on:
   push:
     branches: ["**"]
   pull_request:
+  workflow_dispatch:      # lets CI be run on demand from the Actions tab
 
 jobs:
   test:
