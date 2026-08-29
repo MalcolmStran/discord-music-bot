@@ -57,6 +57,7 @@ class GuildPlayer:
         self._np_task: Optional[asyncio.Task] = None   # live "now playing" updater
         self._skip_requested = False
         self._stop_requested = False   # /stop raised while a stream was still resolving
+        self._loading: Optional[Track] = None   # track whose stream is being resolved
         self._failures = 0             # consecutive tracks that would not play
         self._lock = asyncio.Lock()
 
@@ -96,7 +97,8 @@ class GuildPlayer:
 
     async def disconnect(self) -> None:
         self.queue.clear()
-        self.loop_mode = LoopMode.OFF
+        self._failures = 0
+        self._loading = None
         self._skip_requested = True     # so the teardown is not mistaken for a dead stream
         self._stop_current()
         self._cancel_np()
@@ -152,9 +154,9 @@ class GuildPlayer:
 
     def stop(self) -> None:
         self.queue.clear()
-        self.loop_mode = LoopMode.OFF
         self._skip_requested = True
         self._stop_requested = True
+        self._failures = 0          # a fresh queue must not inherit an old failure streak
         self._stop_current()
 
     def pause(self) -> bool:
@@ -184,6 +186,15 @@ class GuildPlayer:
     def is_playing(self) -> bool:
         vc = self.voice
         return bool(vc and (vc.is_playing() or vc.is_paused()))
+
+    @property
+    def is_busy(self) -> bool:
+        """Playing, paused, or resolving a stream.
+
+        `is_playing` is False for the seconds it takes yt-dlp to resolve a URL, so a guard
+        built on it alone told users "Nothing is playing" and dropped their /skip.
+        """
+        return self.is_playing or self._loading is not None
 
     @property
     def is_paused(self) -> bool:
@@ -238,6 +249,7 @@ class GuildPlayer:
             await self._announce("❌ Player crashed; try `/play` again.")
             self.current = None
         finally:
+            self._loading = None
             self._cancel_np()
             self._release_source()
 
@@ -281,16 +293,19 @@ class GuildPlayer:
         self._finished.clear()
         self._skip_requested = False
         self._stop_requested = False
+        self._loading = track
         try:
             await self.ytdl.fetch_stream(track)
             source = self.ytdl.make_source(track, self.volume)
         except Exception as e:
             log.warning("[%s] cannot play %s: %s", self.guild.name, track.title, e)
+            self._loading = None
             self.current = None          # never leave the previous track as "current"
             await self._on_track_failed(
                 f"⚠️ Skipping **{escape_markdown(track.title)}** — {escape_markdown(str(e)[:150])}")
             return
 
+        self._loading = None
         if self._stop_requested or self._skip_requested:
             # the user gave up while we were resolving; honour it instead of playing
             try:
@@ -327,11 +342,15 @@ class GuildPlayer:
         try:
             await self._finished.wait()
         finally:
+            # Sample this BEFORE any Discord call: _finalize_now_playing() edits a message,
+            # which routinely costs a few hundred ms and can stall on a rate limit. Measuring
+            # after it made a stream that died at 2.9 s look like a 3.5 s track, so the
+            # "couldn't stream" branch never fired and it silently reset _failures instead.
+            played = time.monotonic() - self.started_at
             self._cancel_np()
             self._release_source()
         await self._finalize_now_playing()
         # ffmpeg dying immediately (403 on the CDN url, geo-block, etc.) looks like a 1-second track
-        played = time.monotonic() - self.started_at
         if played < 3 and not self._skip_requested and not self._stop_requested and (track.duration or 0) > 10:
             log.warning("[%s] %s ended after <3s — stream probably failed", self.guild.name, track.title)
             self.current = None          # keep the dead track out of the loop-all rotation
@@ -352,7 +371,6 @@ class GuildPlayer:
         if self._failures >= self.MAX_CONSECUTIVE_FAILURES:
             log.warning("[%s] %d tracks failed in a row; stopping", self.guild.name, self._failures)
             self.queue.clear()
-            self.loop_mode = LoopMode.OFF
             self._failures = 0
             await self._announce("🛑 Too many tracks failed in a row — stopping. "
                                  "YouTube may be blocking the bot; try again later or set `YTDL_COOKIES_FILE`.")

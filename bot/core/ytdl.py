@@ -34,8 +34,8 @@ FFMPEG_OPTS = "-vn -loglevel error"
 # YouTube keeps changing which "player client" hands out URLs that a plain HTTP client (ffmpeg)
 # may fetch. Observed 2026-08-19: the default client's googlevideo URLs 403 for anything that
 # isn't a ≤1 MiB Range request (PO-token enforcement), while the `android` client's progressive
-# URLs stream fine. So we try clients in order and verify the URL with a tiny Range probe before
-# handing it to ffmpeg; a client that fails is skipped for a while.
+# URLs stream fine. So we try clients in order and verify the URL with a plain GET (the same
+# shape of request ffmpeg makes) before handing it over; a client that fails is skipped for a while.
 YT_CLIENT_ORDER = ("default", "android")
 YT_CLIENT_PENALTY_SECONDS = 600
 

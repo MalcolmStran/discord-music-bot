@@ -8,11 +8,14 @@ venv/
 .venv/
 .env
 downloads/
+logs/
 temp/
 *.log
+.pytest_cache/
+.ruff_cache/
 .DS_Store
 Thumbs.db
 
 # Test files
-test_compression.py
+/test_compression.py
 x265_2pass.log*

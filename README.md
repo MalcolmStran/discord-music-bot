@@ -71,6 +71,7 @@ bot/
   core/queue.py    TrackQueue
   core/ytdl.py     resolve (flat playlists), lazy stream URLs, audio source
   core/video.py    download (yt-dlp + optional RapidAPI TikTok fallback), probe, fit_under (2-pass ladder)
+  core/spotify.py  Spotify links → metadata (embed page, or Web API when creds are set)
   core/settings.py per-guild JSON settings
 tests/           offline unit tests — queue/settings/links, player loop modes, encoder
                  planning, config parsing, ytdl helpers, Spotify parsing

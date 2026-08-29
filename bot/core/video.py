@@ -3,7 +3,8 @@
 * download():   yt-dlp (Twitter/X, TikTok, and anything else yt-dlp supports), with an
                 optional RapidAPI fallback for TikTok.
 * fit_under():  ffprobe → pick bitrate for the target size → two-pass encode; ladder of
-                attempts (x265 full-res → x265 720p → x264 480p) until it fits.
+                attempts (x264 source-res → x264 480p → x265 480p) until it fits, skipping
+                any rung whose bitrate maths says it cannot fit.
 All ffmpeg work goes through asyncio subprocesses with a global semaphore so a burst of
 links can never fork unbounded encoders (the 2026-04-14 PSP lesson).
 """

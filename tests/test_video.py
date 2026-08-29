@@ -100,13 +100,18 @@ def test_both_passes_share_identical_video_settings():
     p1, p2 = build_pass_args("in.mp4", "out.mp4", LADDER[1], 250_000, 64_000, 1080, "/tmp/j_pass")
 
     def video_opts(argv):
+        """Collect EVERY occurrence: ffmpeg honours the last one, and list.index() only
+        finds the first, so a later overriding flag used to slip past this comparison."""
         out = {}
         for flag in ("-c:v", "-b:v", "-maxrate", "-bufsize", "-preset", "-pix_fmt", "-vf"):
-            if flag in argv:
-                out[flag] = argv[argv.index(flag) + 1]
+            values = [argv[i + 1] for i, a in enumerate(argv) if a == flag]
+            if values:
+                out[flag] = values
         return out
 
     assert video_opts(p1) == video_opts(p2)
+    # and a flag appended to only one pass must be detected
+    assert video_opts(p1) != video_opts([*p2, "-bufsize", "1"])
 
 
 def test_downscale_only_applies_when_the_source_is_taller():

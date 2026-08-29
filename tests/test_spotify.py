@@ -78,20 +78,90 @@ EMBED_ENTITY = {
 }
 
 
-def test_embed_payload_shape_is_what_the_parser_expects():
-    """Guards the exact key path `_via_embed` walks; a Spotify layout change breaks here
-    rather than at runtime with 'Couldn't parse Spotify metadata'."""
-    ent = json.loads(json.dumps(EMBED_ENTITY))["props"]["pageProps"]["state"]["data"]["entity"]
-    cover = _cover(ent)
-    assert cover == "large.jpg"
-    tracks = [
-        _track(it["title"], it["subtitle"], it["duration"], cover,
-               f"https://open.spotify.com/track/{it['uri'].split(':')[-1]}", None)
-        for it in ent["trackList"]
-    ]
+class _FakeResponse:
+    def __init__(self, html, status=200):
+        self._html, self.status = html, status
+
+    async def text(self):
+        return self._html
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+
+class _FakeSession:
+    def __init__(self, html, status=200):
+        self._html, self._status = html, status
+
+    def get(self, url, **kw):
+        return _FakeResponse(self._html, self._status)
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+
+def _embed_html(payload):
+    return ('<html><body><script id="__NEXT_DATA__" type="application/json">'
+            + json.dumps(payload) + "</script></body></html>")
+
+
+async def test_via_embed_parses_a_playlist(monkeypatch):
+    """Drives the real _via_embed. The previous version of this test re-implemented the
+    key walk on a literal dict, so breaking the parser left it green."""
+    monkeypatch.setattr("bot.core.spotify.aiohttp.ClientSession",
+                        lambda *a, **kw: _FakeSession(_embed_html(EMBED_ENTITY)))
+    tracks = await Spotify()._via_embed("playlist", "37i9dQZF1DXcBWIGoYBM5M", requester_id=9)
     assert [t.search_query for t in tracks] == ["Artist A - One", "Artist B - Two"]
     assert [t.duration for t in tracks] == [60, 90]
     assert all(t.thumbnail == "large.jpg" for t in tracks)
+    assert all(t.extractor == "spotify" and t.requester_id == 9 for t in tracks)
+    assert tracks[0].source_url.endswith("/track/1111111111111111111111")
+
+
+async def test_via_embed_parses_a_single_track(monkeypatch):
+    payload = {"props": {"pageProps": {"state": {"data": {"entity": {
+        "name": "Solo", "artists": [{"name": "A"}], "duration": 5000,
+        "visualIdentity": {"image": [{"url": "c.jpg"}]}}}}}}}
+    monkeypatch.setattr("bot.core.spotify.aiohttp.ClientSession",
+                        lambda *a, **kw: _FakeSession(_embed_html(payload)))
+    tracks = await Spotify()._via_embed("track", "4PTG3Z6ehGkBFwjybzWkR8", requester_id=None)
+    assert len(tracks) == 1
+    assert tracks[0].search_query == "A - Solo" and tracks[0].duration == 5
+
+
+async def test_via_embed_reports_a_layout_change(monkeypatch):
+    """A Spotify redesign must surface as a clear LookupError, not a raw KeyError."""
+    monkeypatch.setattr("bot.core.spotify.aiohttp.ClientSession",
+                        lambda *a, **kw: _FakeSession(_embed_html({"props": {"nope": 1}})))
+    with pytest.raises(LookupError, match="Couldn't parse"):
+        await Spotify()._via_embed("track", "4PTG3Z6ehGkBFwjybzWkR8", None)
+
+
+async def test_via_embed_reports_a_missing_script_block(monkeypatch):
+    monkeypatch.setattr("bot.core.spotify.aiohttp.ClientSession",
+                        lambda *a, **kw: _FakeSession("<html>nothing here</html>"))
+    with pytest.raises(LookupError, match="layout changed"):
+        await Spotify()._via_embed("track", "4PTG3Z6ehGkBFwjybzWkR8", None)
+
+
+async def test_via_embed_reports_an_http_error(monkeypatch):
+    monkeypatch.setattr("bot.core.spotify.aiohttp.ClientSession",
+                        lambda *a, **kw: _FakeSession("", status=404))
+    with pytest.raises(LookupError, match="404"):
+        await Spotify()._via_embed("track", "4PTG3Z6ehGkBFwjybzWkR8", None)
+
+
+async def test_via_embed_respects_max_tracks(monkeypatch):
+    monkeypatch.setattr("bot.core.spotify.aiohttp.ClientSession",
+                        lambda *a, **kw: _FakeSession(_embed_html(EMBED_ENTITY)))
+    tracks = await Spotify(max_tracks=1)._via_embed("playlist", "37i9dQZF1DXcBWIGoYBM5M", None)
+    assert len(tracks) == 1
 
 
 async def test_artist_links_are_rejected_before_any_network_call():
