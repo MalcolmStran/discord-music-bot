@@ -110,6 +110,7 @@ class Config:
     max_download_mb: int = 500
     max_concurrent_encodes: int = 2        # ffmpeg jobs at once (lesson: never unbounded)
     encode_timeout_seconds: int = 600
+    max_gif_seconds: int = 30              # silent clips up to this long become GIFs (0 = off)
     rapidapi_key: Optional[str] = None     # optional TikTok fallback
     spotify_client_id: Optional[str] = None   # optional: full playlists via Web API (else embed page, ~50-100 tracks)
     spotify_client_secret: Optional[str] = None
@@ -151,6 +152,7 @@ class Config:
             max_download_mb=_int("MAX_DOWNLOAD_MB", 500, minimum=1),
             max_concurrent_encodes=_int("MAX_CONCURRENT_ENCODES", 2, minimum=1, maximum=16),
             encode_timeout_seconds=_int("ENCODE_TIMEOUT_SECONDS", 600, minimum=30),
+            max_gif_seconds=_int("MAX_GIF_SECONDS", 30, minimum=0, maximum=600),
             rapidapi_key=(os.getenv("RAPIDAPI_KEY") or "").strip() or None,
             spotify_client_id=(os.getenv("SPOTIFY_CLIENT_ID") or "").strip() or None,
             spotify_client_secret=(os.getenv("SPOTIFY_CLIENT_SECRET") or "").strip() or None,

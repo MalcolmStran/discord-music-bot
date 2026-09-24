@@ -67,6 +67,30 @@ LADDER = [
 # needs less than this is treated as impossible rather than encoded and thrown away.
 MIN_VIDEO_BITRATE = 120_000
 
+
+@dataclass
+class GifStep:
+    fps: int
+    max_side: Optional[int]     # bound on the LONGEST edge, px; None = keep source size
+    colors: int                 # palette entries, 2..256
+
+    @property
+    def label(self) -> str:
+        res = f"≤{self.max_side}px" if self.max_side else "source res"
+        return f"{res} {self.fps}fps {self.colors}c"
+
+
+# GIF is an enormously wasteful container — no interframe compression beyond simple frame
+# differencing, and a hard 256-colour palette — so the rungs drop fast. Best quality first;
+# the first one that fits under the limit wins.
+GIF_LADDER = [
+    GifStep(20, 480, 256),
+    GifStep(15, 400, 192),
+    GifStep(12, 320, 128),
+    GifStep(10, 256, 64),
+    GifStep(8, 200, 32),
+]
+
 _encode_sem: Optional[asyncio.Semaphore] = None
 _download_sem: Optional[asyncio.Semaphore] = None
 
@@ -291,12 +315,14 @@ def max_fittable_duration(limit_bytes: int, has_audio: bool = True) -> float:
 
 
 async def fit_under(src: Path, limit_bytes: int, workdir: Path, *, timeout: int = 600,
-                    progress=None) -> Path:
+                    progress=None, info: Optional[Probe] = None) -> Path:
     """Return a path to a file ≤ limit_bytes (src itself if already small enough).
-    `progress(text)` is an optional async callback for status updates."""
+    `progress(text)` is an optional async callback for status updates.
+    `info` lets a caller that already probed the file avoid a second ffprobe run."""
     if src.stat().st_size <= limit_bytes:
         return src
-    info = await probe(src)
+    if info is None:
+        info = await probe(src)
     plans = [(step, plan) for step in LADDER if (plan := plan_step(step, limit_bytes, info.duration, info.has_audio))]
     if not plans:
         longest = max_fittable_duration(limit_bytes, info.has_audio)
@@ -394,6 +420,116 @@ async def _two_pass(src: Path, out: Path, step: EncodeStep, vbr: int, abr: int, 
         finally:
             for p in out.parent.glob(Path(passlog).name + "*"):
                 p.unlink(missing_ok=True)
+
+
+# ----------------------------------------------------------------------- gif
+def should_gif(info: Probe, max_seconds: int) -> bool:
+    """True for a silent clip short enough to be worth turning into a GIF.
+
+    Silent video is what GIF is actually for, and Discord autoplays it inline without the
+    click-to-play a muted MP4 needs. Long clips are excluded because a GIF of one is both
+    gigantic and slow to build; `max_seconds <= 0` turns the whole feature off.
+    """
+    if info.has_audio or max_seconds <= 0:
+        return False
+    return 0 < info.duration <= max_seconds
+
+
+def gif_scale(width: int, height: int, max_side: Optional[int]) -> Optional[tuple[int, int]]:
+    """ffmpeg scale args bounding the longest edge, or None when no scaling is needed.
+
+    Bounding the longest edge rather than the width matters here: TikTok clips are portrait,
+    so capping width would leave a 480x853 monster.
+    """
+    if not max_side or not width or not height or max(width, height) <= max_side:
+        return None
+    return (max_side, -1) if width >= height else (-1, max_side)
+
+
+def build_gif_args(src: Path, out: Path, palette: Path, step: GifStep,
+                   width: int = 0, height: int = 0) -> tuple[list[str], list[str]]:
+    """argv for the palette pass and the render pass. Split out so the flags are testable.
+
+    Two invocations rather than one filter_complex with `split`: generating the palette
+    inline forces ffmpeg to buffer every decoded frame until palettegen finishes, which is
+    hundreds of MB for a 30 s clip — too much for a 768 MB container running two encodes.
+    Decoding twice is cheaper than holding it all in memory.
+    """
+    chain = [f"fps={step.fps}"]
+    scale = gif_scale(width, height, step.max_side)
+    if scale:
+        chain.append(f"scale={scale[0]}:{scale[1]}:flags=lanczos")
+    vf = ",".join(chain)
+    common = ["ffmpeg", "-y", "-nostdin", "-hide_banner", "-loglevel", "error", "-i", str(src)]
+    # stats_mode=diff biases the palette toward what actually moves; diff_mode=rectangle
+    # lets paletteuse rewrite only the changed region of each frame, which is where most of
+    # the size saving in a GIF comes from.
+    palette_pass = [*common, "-vf", f"{vf},palettegen=max_colors={step.colors}:stats_mode=diff",
+                    str(palette)]
+    render_pass = [*common, "-i", str(palette),
+                   "-lavfi", f"{vf} [x]; [x][1:v] paletteuse=dither=bayer:bayer_scale=5:diff_mode=rectangle",
+                   "-an", "-loop", "0", str(out)]
+    return palette_pass, render_pass
+
+
+async def _gif_encode(src: Path, out: Path, step: GifStep, info: Probe, timeout: int) -> bool:
+    palette = out.with_suffix(".palette.png")
+    passes = build_gif_args(src, out, palette, step, info.width, info.height)
+    async with _sem("encode"):
+        proc: Optional[asyncio.subprocess.Process] = None
+        try:
+            for argv in passes:
+                try:
+                    proc = await asyncio.create_subprocess_exec(*argv, stdout=asyncio.subprocess.DEVNULL,
+                                                                stderr=asyncio.subprocess.PIPE)
+                except FileNotFoundError as e:
+                    raise VideoError("ffmpeg is not installed on the host, so videos can't be converted.") from e
+                try:
+                    _, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+                except TimeoutError:
+                    await _terminate(proc)
+                    log.warning("gif encode timed out (%s)", step.label)
+                    return False
+                if proc.returncode != 0:
+                    log.warning("gif encode failed (%s): %s", step.label, err.decode(errors="ignore")[-300:])
+                    return False
+            return True
+        except asyncio.CancelledError:
+            if proc is not None:
+                await _terminate(proc)
+            raise
+        finally:
+            palette.unlink(missing_ok=True)
+
+
+async def to_gif(src: Path, limit_bytes: int, workdir: Path, *, info: Probe,
+                 timeout: int = 600, progress=None) -> Optional[Path]:
+    """Best-effort GIF of a silent clip, at most `limit_bytes`.
+
+    Returns None when no rung fits, which is not an error: the caller falls back to the
+    normal MP4 path so a clip that is a poor GIF candidate still gets delivered.
+    """
+    for step in GIF_LADDER:
+        out = workdir / f"gif_{uuid.uuid4().hex[:8]}.gif"
+        if progress:
+            try:
+                await progress(f"🎞️ Making a GIF ({step.label})…")
+            except Exception:
+                pass
+        keep = False
+        try:
+            ok = await _gif_encode(src, out, step, info, timeout)
+            if ok and out.exists():
+                size = out.stat().st_size
+                log.info("gif %s → %.2f MB (limit %.2f MB)", step.label, size / 1048576, limit_bytes / 1048576)
+                if size <= limit_bytes:
+                    keep = True
+                    return out
+        finally:
+            if not keep:
+                out.unlink(missing_ok=True)
+    log.info("no gif rung fit under %.2f MB; falling back to mp4", limit_bytes / 1048576)
+    return None
 
 
 # ------------------------------------------------------------------ cleanup
