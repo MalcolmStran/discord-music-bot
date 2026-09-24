@@ -22,6 +22,7 @@ Everything works both as `!cmd` and `/cmd`.
 | Media | |
 |---|---|
 | *(paste a Twitter/X or TikTok link)* | auto-converted; original embed suppressed when possible |
+| *(silent clip)* | sent as a looping GIF instead of an MP4, sized to fit the server's upload cap (`MAX_GIF_SECONDS=0` to disable) |
 | `/convert <url>` | manual |
 | `/mediainfo` | status, limits, this server's upload cap |
 | `/media-toggle` *(Manage Server)* | per-server on/off, persisted |
@@ -81,6 +82,7 @@ tests/           offline unit tests — queue/settings/links, player loop modes,
 * **Playback loop per guild** (`GuildPlayer._player_loop`): wait for track → fetch stream → play → await finish. Skip/stop just stop the voice client. No recursion, no `run_coroutine_threadsafe` chains.
 * **Voice**: minimal `channel.connect(reconnect=True)`; discord.py handles resumes. Retry loops around it caused the 4006/4017 errors in the past — don't add them back.
 * **Playlists** resolve flat (one yt-dlp call, ~1 s for 100 items); stream URLs are fetched right before each track plays.
+* **Silent clips become GIFs** (`core/video.py`): a clip with no audio track and a duration within `MAX_GIF_SECONDS` is rendered as a looping GIF — Discord autoplays those inline, where a muted MP4 gets a click-to-play card. Two ffmpeg passes (`palettegen` then `paletteuse`, never one `split` filter: generating the palette inline buffers every decoded frame and blows the container's memory cap). Its own ladder drops fps, longest edge and palette size until it fits; the cap applies to the **longest** edge so portrait TikToks do not come out 480x853. If no rung fits, it silently falls back to the normal MP4 path rather than failing.
 * **Compression ladder** (`core/video.py`): x264 veryfast source-res → x264 480p → x265 ultrafast 480p, all with AAC audio. Two-pass, target = 97 % of `guild.filesize_limit`. Measured on rock5: a 3.4-min 720p clip 17.5 MB → 7.7 MB in ~75 s. Encodes are bounded by `MAX_CONCURRENT_ENCODES` (default 2) — never unbounded. Each rung is size-checked *before* it runs (`plan_step`): a clip that provably cannot fit is rejected in a second with the longest duration that would, instead of burning six ffmpeg passes to find out.
 * **Link allowlisting** (`cogs/media.py`): `classify()` parses the host with `urlsplit` and matches it against an exact domain/subdomain list. It must never be reimplemented with string splitting — a `#` or `?` can smuggle an allowlisted suffix past that and turn the auto-converter into an SSRF primitive.
 * **Playback failures**: `GuildPlayer.current` is `None` whenever a track did not actually play. That is what keeps a broken track out of the loop-all rotation; assigning `current` only on success made a failed track re-queue its *predecessor* and evict its successor. Five consecutive failures stop the player rather than spamming the channel.

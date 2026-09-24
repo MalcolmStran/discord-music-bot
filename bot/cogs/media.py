@@ -70,7 +70,7 @@ class Media(commands.Cog):
         self.workdir.mkdir(parents=True, exist_ok=True)
         self.max_bytes = self.cfg.max_download_mb * 1024 * 1024
         self._inflight: set[int] = set()            # message ids being processed
-        self.stats = {"ok": 0, "failed": 0, "compressed": 0}
+        self.stats = {"ok": 0, "failed": 0, "compressed": 0, "gif": 0}
         video.configure(self.cfg.max_concurrent_encodes)
         self.cleanup_loop.start()
 
@@ -161,12 +161,23 @@ class Media(commands.Cog):
         try:
             src = await video.download(url, self.workdir, self.max_bytes,
                                        cookies_file=self.cfg.ytdl_cookies_file, rapidapi_key=self.cfg.rapidapi_key)
-            if src.stat().st_size > limit:
-                self.stats["compressed"] += 1
-                out = await video.fit_under(src, int(limit * 0.97), self.workdir,
-                                            timeout=self.cfg.encode_timeout_seconds, progress=progress)
-            else:
-                out = src
+            info = await video.probe(src)
+            target = int(limit * 0.97)
+            out = None
+            # A silent clip is what GIF is for, and Discord autoplays a GIF inline instead of
+            # showing the click-to-play card a muted MP4 gets.
+            if video.should_gif(info, self.cfg.max_gif_seconds):
+                out = await video.to_gif(src, target, self.workdir, info=info,
+                                         timeout=self.cfg.encode_timeout_seconds, progress=progress)
+                if out is not None:
+                    self.stats["gif"] += 1
+            if out is None:                      # not silent, too long, or no rung fit
+                if src.stat().st_size > limit:
+                    self.stats["compressed"] += 1
+                    out = await video.fit_under(src, target, self.workdir, info=info,
+                                                timeout=self.cfg.encode_timeout_seconds, progress=progress)
+                else:
+                    out = src
             ext = out.suffix.lower().lstrip(".") or "mp4"
             await message.reply(file=discord.File(out, filename=f"{kind}.{ext}"), mention_author=False)
             self.stats["ok"] += 1
@@ -257,7 +268,11 @@ class Media(commands.Cog):
         used = await asyncio.to_thread(video.dir_size, self.workdir)
         e.add_field(name="Temp usage", value=f"{used / 1048576:.1f} MB", inline=True)
         s = self.stats
-        e.set_footer(text=f"session: {s['ok']} ok · {s['failed']} failed · {s['compressed']} needed compression")
+        e.add_field(name="Silent clips → GIF",
+                    value=f"≤ {self.cfg.max_gif_seconds}s" if self.cfg.max_gif_seconds else "🚫 disabled",
+                    inline=True)
+        e.set_footer(text=f"session: {s['ok']} ok · {s['failed']} failed · "
+                          f"{s['compressed']} compressed · {s['gif']} as GIF")
         await ctx.send(embed=e)
 
     @commands.hybrid_command(name="media-cleanup", description="Delete temporary media files (admin)")

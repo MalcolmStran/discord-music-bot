@@ -1,16 +1,24 @@
 """Encoder planning and ffmpeg argument construction (no ffmpeg needed)."""
+import itertools
+
 import pytest
 
 from bot.core.video import (
+    GIF_LADDER,
     LADDER,
     MIN_VIDEO_BITRATE,
     EncodeStep,
+    GifStep,
+    Probe,
     _friendly,
     _is_too_big,
     _mmss,
+    build_gif_args,
     build_pass_args,
+    gif_scale,
     max_fittable_duration,
     plan_step,
+    should_gif,
 )
 
 MB = 1024 * 1024
@@ -197,3 +205,96 @@ def test_other_jobs_are_not_candidates(tmp_path):
     (tmp_path / "dl_mine.mp4").write_bytes(b"mine")
     (tmp_path / "dl_other.mp4").write_bytes(b"someone else's job")
     assert [p.name for p in _output_candidates(tmp_path, "dl_mine")] == ["dl_mine.mp4"]
+
+
+# ------------------------------------------------------------- silent clip -> GIF
+
+def _probe(duration=8.0, width=1280, height=720, has_audio=False):
+    return Probe(duration=duration, width=width, height=height, has_audio=has_audio)
+
+
+@pytest.mark.parametrize("has_audio,duration,cap,expected", [
+    (False, 8.0, 30, True),       # the whole point: a short silent clip
+    (True, 8.0, 30, False),       # has sound, so it stays a video
+    (False, 45.0, 30, False),     # too long to be a sane GIF
+    (False, 30.0, 30, True),      # exactly at the cap is allowed
+    (False, 8.0, 0, False),       # 0 disables the feature
+    (False, 8.0, -1, False),
+    (False, 0.0, 30, False),      # unknown duration
+])
+def test_should_gif(has_audio, duration, cap, expected):
+    assert should_gif(_probe(duration=duration, has_audio=has_audio), cap) is expected
+
+
+def test_gif_scale_bounds_the_longest_edge_not_the_width():
+    """A portrait TikTok capped on width would still be 480x853; the cap must apply to
+    whichever edge is longer."""
+    assert gif_scale(1280, 720, 480) == (480, -1)      # landscape -> width driven
+    assert gif_scale(1080, 1920, 480) == (-1, 480)     # portrait  -> height driven
+    assert gif_scale(600, 600, 480) == (480, -1)       # square    -> either, width wins
+
+
+@pytest.mark.parametrize("w,h,side", [
+    (320, 240, 480),      # already smaller than the cap
+    (480, 270, 480),      # exactly at the cap
+    (1280, 720, None),    # no cap configured
+    (0, 0, 480),          # unknown dimensions
+])
+def test_gif_scale_skips_pointless_rescaling(w, h, side):
+    assert gif_scale(w, h, side) is None
+
+
+def test_gif_args_carry_fps_palette_and_loop():
+    step = GifStep(15, 400, 128)
+    pal, render = build_gif_args("in.mp4", "out.gif", "p.png", step, 1280, 720)
+    assert f"fps={step.fps}" in pal[pal.index("-vf") + 1]
+    assert f"max_colors={step.colors}" in pal[pal.index("-vf") + 1]
+    assert pal[-1] == "p.png"
+    lavfi = render[render.index("-lavfi") + 1]
+    assert f"fps={step.fps}" in lavfi and "paletteuse" in lavfi
+    assert render[render.index("-loop") + 1] == "0"    # GIFs must loop forever
+    assert "-an" in render and render[-1] == "out.gif"
+
+
+def test_gif_args_use_the_palette_as_the_second_input():
+    """paletteuse reads [1:v]; if the palette is not input 1 the render silently uses the
+    wrong stream."""
+    step = GIF_LADDER[0]
+    _, render = build_gif_args("in.mp4", "out.gif", "p.png", step, 1280, 720)
+    assert render.count("-i") == 2
+    assert render[render.index("-i") + 1] == "in.mp4"
+    assert render[-render[::-1].index("-i")] == "p.png"
+    assert "[1:v]" in render[render.index("-lavfi") + 1]
+
+
+def test_gif_args_omit_scaling_for_an_already_small_clip():
+    step = GifStep(15, 480, 128)
+    pal, render = build_gif_args("in.mp4", "out.gif", "p.png", step, 320, 240)
+    # compare the filter CHAIN only: paletteuse carries an unrelated "bayer_scale=5"
+    assert pal[pal.index("-vf") + 1] == f"fps={step.fps},palettegen=max_colors={step.colors}:stats_mode=diff"
+    chain = render[render.index("-lavfi") + 1].split(" [x];")[0]
+    assert chain == f"fps={step.fps}"
+
+
+def test_gif_args_scale_portrait_by_height():
+    step = GifStep(15, 400, 128)
+    pal, _ = build_gif_args("in.mp4", "out.gif", "p.png", step, 1080, 1920)
+    assert "scale=-1:400" in pal[pal.index("-vf") + 1]
+
+
+def test_both_gif_passes_share_the_same_filter_chain():
+    """The palette must be built from exactly the frames it will be applied to."""
+    step = GIF_LADDER[2]
+    pal, render = build_gif_args("in.mp4", "out.gif", "p.png", step, 1920, 1080)
+    chain = pal[pal.index("-vf") + 1].split(",palettegen")[0]
+    assert render[render.index("-lavfi") + 1].startswith(chain + " [x]")
+
+
+def test_gif_ladder_degrades_monotonically():
+    """Each rung must be cheaper than the last, or the search cannot converge."""
+    for a, b in itertools.pairwise(GIF_LADDER):
+        assert b.fps <= a.fps
+        assert (b.max_side or 10**9) <= (a.max_side or 10**9)
+        assert b.colors <= a.colors
+    assert all(2 <= s.colors <= 256 for s in GIF_LADDER)
+    assert all(s.fps > 0 for s in GIF_LADDER)

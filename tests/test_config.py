@@ -119,3 +119,14 @@ def test_blank_bool_falls_back_to_the_default(monkeypatch):
     assert _bool("B", False) is False
     monkeypatch.setenv("B", "   ")
     assert _bool("B", True) is True
+
+
+def test_max_gif_seconds_defaults_and_clamps(monkeypatch):
+    monkeypatch.setenv("DISCORD_TOKEN", "t")
+    assert Config.from_env().max_gif_seconds == 30
+    monkeypatch.setenv("MAX_GIF_SECONDS", "0")          # 0 turns the feature off
+    assert Config.from_env().max_gif_seconds == 0
+    monkeypatch.setenv("MAX_GIF_SECONDS", "-5")
+    assert Config.from_env().max_gif_seconds == 0       # never negative
+    monkeypatch.setenv("MAX_GIF_SECONDS", "99999")
+    assert Config.from_env().max_gif_seconds == 600     # a 27-hour GIF is not a thing
