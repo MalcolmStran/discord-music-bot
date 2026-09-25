@@ -13,6 +13,19 @@ from typing import Any
 log = logging.getLogger(__name__)
 
 
+def _int_set(raw: Any) -> set[int]:
+    """Ints from a stored list, tolerating a hand-edited file."""
+    if not isinstance(raw, list):
+        return set()
+    out = set()
+    for x in raw:
+        try:
+            out.add(int(x))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
 class GuildSettings:
     """Tiny key/value store: {guild_id: {key: value}}. Backwards compatible with the
     v1 file format {guild_id: bool} which meant "media conversion enabled".
@@ -105,6 +118,36 @@ class GuildSettings:
         await asyncio.to_thread(self.set, guild_id, key, value)
 
     # convenience
+    def media_optout(self) -> set[int]:
+        """Users who asked not to have their own posts auto-converted.
+
+        Global rather than per guild: it is a statement about your own messages, so opting
+        out once should cover every server the bot is in instead of needing repeating.
+        Stored under the reserved guild id 0 alongside the bot's other bookkeeping.
+        """
+        return _int_set(self.get(0, "media_optout"))
+
+    def is_media_optout(self, user_id: int) -> bool:
+        return int(user_id) in self.media_optout()
+
+    def set_media_optout(self, user_id: int, opted_out: bool) -> None:
+        """Add or remove one user, read-modify-write under the lock.
+
+        Doing this as get() then set() from the caller would drop one of two concurrent
+        opt-outs, since each would write back a list built before the other's change.
+        """
+        with self._lock:
+            ids = _int_set(self._data.get(0, {}).get("media_optout"))
+            if opted_out:
+                ids.add(int(user_id))
+            else:
+                ids.discard(int(user_id))
+            self._data.setdefault(0, {})["media_optout"] = sorted(ids)
+            self._save()
+
+    async def set_media_optout_async(self, user_id: int, opted_out: bool) -> None:
+        await asyncio.to_thread(self.set_media_optout, user_id, opted_out)
+
     def media_enabled(self, guild_id: int) -> bool:
         return bool(self.get(guild_id, "media_enabled", self.media_default))
 

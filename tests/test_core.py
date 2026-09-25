@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from bot.cogs.media import classify, normalise
+from bot.cogs.media import EMBED_FIXERS, classify, is_embed_fixer, normalise
 from bot.core.queue import TrackQueue
 from bot.core.settings import GuildSettings
 from bot.core.spotify import is_spotify, parse
@@ -168,3 +168,111 @@ def test_settings_reserves_guild_zero_for_bookkeeping(tmp_path: Path):
     s.set(1, "media_enabled", False)
     assert GuildSettings(p).get(0, "command_signature") == "abc"
     assert GuildSettings(p).media_enabled(1) is False
+
+
+# ------------------------------------------------- embed-fixer links are left alone
+@pytest.mark.parametrize("url", [
+    "https://fxtwitter.com/a/status/1",
+    "https://vxtwitter.com/a/status/1",
+    "https://fixupx.com/a/status/1",
+    "https://fixvx.com/a/status/1",
+    "https://twittpr.com/a/status/1",
+    "https://d.fxtwitter.com/a/status/1",       # the direct-media subdomain
+    "https://www.vxtwitter.com/a/status/1",
+    "https://vxtiktok.com/@u/video/1",
+    "https://tnktok.com/@u/video/1",
+])
+def test_embed_fixers_are_recognised(url):
+    """These front-ends already render a playable embed, so auto-converting them would post
+    the same clip twice under the message."""
+    assert is_embed_fixer(url) is True
+    assert classify(url) is not None, "still classified, so an explicit /convert works"
+
+
+@pytest.mark.parametrize("url", [
+    "https://x.com/a/status/1",
+    "https://twitter.com/a/status/1",
+    "https://www.tiktok.com/@u/video/1",
+    "https://vm.tiktok.com/ZM1/",      # official shortener, NOT a fixer
+    "https://vt.tiktok.com/ZS1/",      # official shortener, NOT a fixer
+])
+def test_real_posts_are_not_treated_as_fixers(url):
+    assert is_embed_fixer(url) is False
+    assert classify(url) is not None
+
+
+@pytest.mark.parametrize("url", [
+    "https://youtube.com/watch?v=1",
+    "https://evil.com#.fxtwitter.com/",     # the host-smuggling shape
+    "https://fxtwitter.com.evil.com/a",     # suffix, not the domain
+    "ftp://fxtwitter.com/a",
+    "not a url",
+])
+def test_fixer_check_is_not_foolable(url):
+    assert is_embed_fixer(url) is False
+
+
+def test_every_fixer_is_also_a_supported_domain():
+    """A fixer that classify() does not recognise would make /convert reject it outright."""
+    for domain in EMBED_FIXERS:
+        assert classify(f"https://{domain}/a/status/1") is not None
+
+
+@pytest.mark.parametrize("raw,expected", [
+    ("https://fixvx.com/a/status/1", "https://x.com/a/status/1"),
+    ("https://twittpr.com/a/status/1", "https://x.com/a/status/1"),
+    ("https://vxtiktok.com/@u/video/1", "https://www.tiktok.com/@u/video/1"),
+    ("https://tnktok.com/@u/video/1", "https://www.tiktok.com/@u/video/1"),
+])
+def test_normalise_rewrites_the_newer_fixers(raw, expected):
+    """An explicit /convert on a fixer link must still reach the real site."""
+    assert normalise(raw, classify(raw)) == expected
+
+
+# ----------------------------------------------- per-user auto-convert opt-out
+def test_media_optout_round_trip(tmp_path: Path):
+    p = tmp_path / "s.json"
+    s = GuildSettings(p)
+    assert s.is_media_optout(42) is False
+    s.set_media_optout(42, True)
+    s.set_media_optout(99, True)
+    assert GuildSettings(p).media_optout() == {42, 99}
+    s.set_media_optout(42, False)
+    assert GuildSettings(p).media_optout() == {99}
+
+
+def test_media_optout_is_idempotent(tmp_path: Path):
+    p = tmp_path / "s.json"
+    s = GuildSettings(p)
+    for _ in range(3):
+        s.set_media_optout(7, True)
+    assert s.media_optout() == {7}
+    for _ in range(3):
+        s.set_media_optout(7, False)
+    assert s.media_optout() == set()
+
+
+def test_media_optout_does_not_disturb_guild_settings(tmp_path: Path):
+    """The opt-out lives under the reserved guild id 0, so it must not collide with a
+    real guild's media_enabled flag."""
+    p = tmp_path / "s.json"
+    s = GuildSettings(p)
+    s.set_media_enabled(1, False)
+    s.set_media_optout(42, True)
+    reloaded = GuildSettings(p)
+    assert reloaded.media_enabled(1) is False
+    assert reloaded.media_optout() == {42}
+    assert reloaded.media_enabled(42) is True, "a user id must not be read as a guild id"
+
+
+def test_media_optout_survives_a_hand_mangled_list(tmp_path: Path):
+    p = tmp_path / "s.json"
+    p.write_text('{"0": {"media_optout": [1, "2", null, "abc", 3.9, [], {}]}}')
+    assert GuildSettings(p).media_optout() == {1, 2, 3}
+
+
+def test_media_optout_defaults_to_empty_when_absent(tmp_path: Path):
+    p = tmp_path / "s.json"
+    p.write_text('{"0": {"command_signature": "abc"}}')
+    assert GuildSettings(p).media_optout() == set()
+    assert GuildSettings(p).is_media_optout(1) is False

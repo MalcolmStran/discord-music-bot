@@ -188,7 +188,9 @@ def build_help(bot: MusicBot) -> None:
             f"`{p}loop [off|one|all]` · `{p}shuffle` · `{p}remove <n>` · `{p}move <a> <b>` · `{p}clear`\n"
             f"`{p}join` · `{p}leave` · `{p}status`"))
         e.add_field(name="Media (Twitter/X & TikTok → MP4)", inline=False, value=(
-            f"Just paste a link — it gets converted automatically.\n"
+            f"Just paste a link — it gets converted automatically. Silent clips come back as a GIF.\n"
+            f"Links that already embed themselves (fxtwitter, vxtwitter, fixupx …) are left alone.\n"
+            f"`{p}autoconvert [on|off]` — opt your own posts in or out, anywhere I am\n"
             f"`{p}convert <url>` · `{p}mediainfo` · `{p}media-toggle` (admin) · `{p}media-cleanup` (admin)"))
         e.set_footer(text="Bot leaves voice when idle or when everyone's gone.")
         await ctx.send(embed=e)

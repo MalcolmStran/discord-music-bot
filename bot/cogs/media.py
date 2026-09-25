@@ -21,15 +21,26 @@ URL_RE = re.compile(r"https?://[^\s<>()\[\]]+", re.I)
 # Trailing characters Discord markdown / prose commonly glues onto a link.
 _TRAILING = ").,!?;:'\"|*_~`"
 SUPPORTED = {
-    "tiktok": ("tiktok.com",),
-    "twitter": ("twitter.com", "x.com", "fxtwitter.com", "vxtwitter.com", "fixupx.com"),
+    "tiktok": ("tiktok.com", "vxtiktok.com", "tnktok.com"),
+    "twitter": ("twitter.com", "x.com", "fxtwitter.com", "vxtwitter.com",
+                "fixupx.com", "fixvx.com", "twittpr.com"),
 }
 
+# Third-party front-ends whose whole purpose is to render a playable inline embed. Someone
+# who posts one has already solved the embed problem, so auto-converting it just duplicates
+# the video underneath their message. They stay in SUPPORTED so an explicit /convert still
+# works — this only suppresses the automatic listener.
+EMBED_FIXERS = (
+    "fxtwitter.com", "fixupx.com", "twittpr.com",   # FixTweet and its aliases
+    "vxtwitter.com", "fixvx.com",                   # BetterTwitFix and its aliases
+    "vxtiktok.com", "tnktok.com",                   # the TikTok equivalents
+)
 
-def classify(url: str) -> Optional[str]:
-    """Return "tiktok"/"twitter" for a link we handle, else None.
 
-    The host is taken from a real URL parse. Hand-rolling this used to be a hole: the old
+def _host(url: str) -> str:
+    """Hostname of an http(s) URL, lowercased, or "" if it is not one we should touch.
+
+    Everything host-based goes through here. Hand-rolling it used to be a hole: the old
     splitter only cut at "/" and ":", so a fragment or query could smuggle the allowlisted
     suffix past it and make the bot fetch anything —
     ``https://127.0.0.1#.x.com/`` classified as twitter and got downloaded.
@@ -37,25 +48,47 @@ def classify(url: str) -> Optional[str]:
     try:
         parts = urlsplit(url.strip().rstrip(_TRAILING))
     except ValueError:
-        return None
+        return ""
     if parts.scheme.lower() not in ("http", "https"):
-        return None
+        return ""
     try:
-        host = (parts.hostname or "").lower().rstrip(".")
+        return (parts.hostname or "").lower().rstrip(".")
     except ValueError:      # malformed IPv6 literal / bad port
-        return None
+        return ""
+
+
+def _host_matches(host: str, domains) -> bool:
+    return bool(host) and any(host == d or host.endswith("." + d) for d in domains)
+
+
+def classify(url: str) -> Optional[str]:
+    """Return "tiktok"/"twitter" for a link we handle, else None."""
+    host = _host(url)
     if not host:
         return None
     for kind, domains in SUPPORTED.items():
-        if any(host == d or host.endswith("." + d) for d in domains):
+        if _host_matches(host, domains):
             return kind
     return None
+
+
+def is_embed_fixer(url: str) -> bool:
+    """True for a link that already embeds its own video, so we should leave it alone.
+
+    Note this is deliberately NOT true for tiktok's own vm./vt. shorteners — those are
+    official redirects to a normal post, not embed front-ends.
+    """
+    return _host_matches(_host(url), EMBED_FIXERS)
 
 
 def normalise(url: str, kind: str) -> str:
     url = url.strip().rstrip(_TRAILING)
     if kind == "twitter":
-        url = re.sub(r"https?://(www\.)?(fxtwitter|vxtwitter|fixupx)\.com", "https://x.com", url, flags=re.I)
+        url = re.sub(r"https?://(www\.)?(fxtwitter|vxtwitter|fixupx|fixvx|twittpr)\.com",
+                     "https://x.com", url, flags=re.I)
+    elif kind == "tiktok":
+        url = re.sub(r"https?://(www\.)?(vxtiktok|tnktok)\.com",
+                     "https://www.tiktok.com", url, flags=re.I)
     return url
 
 
@@ -107,7 +140,12 @@ class Media(commands.Cog):
             return  # the command path handles it (/convert), don't convert twice
         if not self.settings.media_enabled(message.guild.id):
             return
-        links = [(u, k) for u in URL_RE.findall(message.content) if (k := classify(u))]
+        if self.settings.is_media_optout(message.author.id):
+            return  # this person asked us to leave their posts alone (/autoconvert off)
+        # A fixer link already embeds its own video; converting it would post the same clip
+        # twice. An explicit /convert still honours them.
+        links = [(u, k) for u in URL_RE.findall(message.content)
+                 if (k := classify(u)) and not is_embed_fixer(u)]
         if not links:
             return
         # at most 2 videos per message, and never process the same message twice
@@ -244,6 +282,32 @@ class Media(commands.Cog):
             anchor = ctx.message
         await self.convert_and_send(anchor, normalise(url, kind), kind, reply_errors=True)
 
+    @commands.hybrid_command(name="autoconvert", aliases=["noconvert"],
+                             description="Choose whether I auto-convert links you post")
+    @app_commands.describe(state="on to let me convert your links, off to leave them alone")
+    @app_commands.choices(state=[
+        app_commands.Choice(name="on", value="on"),
+        app_commands.Choice(name="off", value="off"),
+    ])
+    @commands.guild_only()
+    async def autoconvert(self, ctx: commands.Context, state: Optional[str] = None):
+        """Anyone can opt themselves out; it applies everywhere the bot is, not just here."""
+        opted_out = self.settings.is_media_optout(ctx.author.id)
+        if state is None:
+            return await ctx.send(
+                ("🚫 I currently **don't** auto-convert links you post. `/autoconvert on` to turn it back on."
+                 if opted_out else
+                 "✅ I currently auto-convert Twitter/X and TikTok links you post. `/autoconvert off` to stop."),
+                ephemeral=True)
+        want_off = state.strip().lower() in ("off", "no", "false", "0", "stop", "disable")
+        await self.settings.set_media_optout_async(ctx.author.id, want_off)
+        await ctx.send(
+            ("🚫 Done — I'll leave the links you post alone, in every server I'm in. "
+             "`/convert <url>` still works if you want one on purpose."
+             if want_off else
+             "✅ Done — I'll auto-convert Twitter/X and TikTok links you post again."),
+            ephemeral=True)
+
     @commands.hybrid_command(name="media-toggle", description="Enable/disable automatic link conversion here (admin)")
     @commands.has_permissions(manage_guild=True)
     @app_commands.default_permissions(manage_guild=True)
@@ -268,6 +332,10 @@ class Media(commands.Cog):
         used = await asyncio.to_thread(video.dir_size, self.workdir)
         e.add_field(name="Temp usage", value=f"{used / 1048576:.1f} MB", inline=True)
         s = self.stats
+        e.add_field(name="Your links",
+                    value="🚫 not converted" if self.settings.is_media_optout(ctx.author.id) else "✅ converted",
+                    inline=True)
+        e.add_field(name="Embed-fixer links", value="left alone", inline=True)
         e.add_field(name="Silent clips → GIF",
                     value=f"≤ {self.cfg.max_gif_seconds}s" if self.cfg.max_gif_seconds else "🚫 disabled",
                     inline=True)
