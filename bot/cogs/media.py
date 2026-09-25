@@ -6,7 +6,7 @@ import logging
 import re
 from pathlib import Path
 from typing import Optional
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 
 import discord
 from discord import app_commands
@@ -18,18 +18,46 @@ from ..core.settings import GuildSettings
 log = logging.getLogger(__name__)
 
 URL_RE = re.compile(r"https?://[^\s<>()\[\]]+", re.I)
+_ON_WORDS = ("on", "yes", "true", "1", "enable", "enabled", "start")
+_OFF_WORDS = ("off", "no", "false", "0", "disable", "disabled", "stop")
 # Trailing characters Discord markdown / prose commonly glues onto a link.
 _TRAILING = ").,!?;:'\"|*_~`"
-SUPPORTED = {
+# Third-party front-ends whose whole purpose is to render a playable inline embed, mapped to
+# the site each one fronts. Someone who posts one has already solved the embed problem, so
+# auto-converting it just duplicates the video underneath their message. They stay in
+# SUPPORTED so an explicit /convert still works — this only suppresses the automatic
+# listener. One dict is the single home for the list: it used to be spelled out again in
+# SUPPORTED and a third time in normalise()'s regex, and the regex copy fell out of step.
+EMBED_FIXERS = {
+    "fxtwitter.com": "twitter",      # FixTweet
+    "fixupx.com": "twitter",
+    "twittpr.com": "twitter",
+    "vxtwitter.com": "twitter",      # BetterTwitFix
+    "fixvx.com": "twitter",
+    "vxtiktok.com": "tiktok",        # the TikTok equivalents
+    "tnktok.com": "tiktok",
+}
+
+# Where a fixer link has to be rewritten to before yt-dlp sees it.
+CANONICAL_HOST = {"twitter": "x.com", "tiktok": "www.tiktok.com"}
+
+# The genuine sites. tiktok's vm./vt. shorteners are covered by the suffix match and are
+# deliberately NOT fixers: they redirect to an ordinary post and still need converting.
+_REAL_DOMAINS = {
     "tiktok": ("tiktok.com",),
-    "twitter": ("twitter.com", "x.com", "fxtwitter.com", "vxtwitter.com", "fixupx.com"),
+    "twitter": ("twitter.com", "x.com"),
+}
+
+SUPPORTED = {
+    kind: (*domains, *(f for f, k in EMBED_FIXERS.items() if k == kind))
+    for kind, domains in _REAL_DOMAINS.items()
 }
 
 
-def classify(url: str) -> Optional[str]:
-    """Return "tiktok"/"twitter" for a link we handle, else None.
+def _host(url: str) -> str:
+    """Hostname of an http(s) URL, lowercased, or "" if it is not one we should touch.
 
-    The host is taken from a real URL parse. Hand-rolling this used to be a hole: the old
+    Everything host-based goes through here. Hand-rolling it used to be a hole: the old
     splitter only cut at "/" and ":", so a fragment or query could smuggle the allowlisted
     suffix past it and make the bot fetch anything —
     ``https://127.0.0.1#.x.com/`` classified as twitter and got downloaded.
@@ -37,26 +65,64 @@ def classify(url: str) -> Optional[str]:
     try:
         parts = urlsplit(url.strip().rstrip(_TRAILING))
     except ValueError:
-        return None
+        return ""
     if parts.scheme.lower() not in ("http", "https"):
-        return None
+        return ""
     try:
-        host = (parts.hostname or "").lower().rstrip(".")
+        return (parts.hostname or "").lower().rstrip(".")
     except ValueError:      # malformed IPv6 literal / bad port
-        return None
+        return ""
+
+
+def _matched_domain(host: str, domains) -> Optional[str]:
+    """The entry of `domains` that `host` is, or is a subdomain of."""
     if not host:
         return None
+    for d in domains:
+        if host == d or host.endswith("." + d):
+            return d
+    return None
+
+
+def classify_host(host: str) -> Optional[str]:
     for kind, domains in SUPPORTED.items():
-        if any(host == d or host.endswith("." + d) for d in domains):
+        if _matched_domain(host, domains):
             return kind
     return None
 
 
+def classify(url: str) -> Optional[str]:
+    """Return "tiktok"/"twitter" for a link we handle, else None."""
+    return classify_host(_host(url))
+
+
+def fixer_domain(url: str) -> Optional[str]:
+    """The fixer domain this URL belongs to, or None. Subdomains count (d.fxtwitter.com)."""
+    return _matched_domain(_host(url), EMBED_FIXERS)
+
+
+def is_embed_fixer(url: str) -> bool:
+    """True for a link that already embeds its own video, so we should leave it alone."""
+    return fixer_domain(url) is not None
+
+
 def normalise(url: str, kind: str) -> str:
+    """Point a fixer link back at the real site, keeping the path and query.
+
+    Rewriting the host through the parser rather than a "www.-or-nothing" prefix regex is
+    what makes subdomains work: that regex left ``d.fxtwitter.com`` — which
+    classify() and is_embed_fixer() both accept — completely untouched, so an explicit
+    /convert handed the third-party host to yt-dlp instead of x.com.
+    """
     url = url.strip().rstrip(_TRAILING)
-    if kind == "twitter":
-        url = re.sub(r"https?://(www\.)?(fxtwitter|vxtwitter|fixupx)\.com", "https://x.com", url, flags=re.I)
-    return url
+    fixer = fixer_domain(url)
+    if not fixer:
+        return url
+    target = CANONICAL_HOST.get(EMBED_FIXERS[fixer])
+    if not target:
+        return url
+    parts = urlsplit(url)
+    return urlunsplit(("https", target, parts.path, parts.query, ""))
 
 
 class Media(commands.Cog):
@@ -70,7 +136,7 @@ class Media(commands.Cog):
         self.workdir.mkdir(parents=True, exist_ok=True)
         self.max_bytes = self.cfg.max_download_mb * 1024 * 1024
         self._inflight: set[int] = set()            # message ids being processed
-        self.stats = {"ok": 0, "failed": 0, "compressed": 0, "gif": 0}
+        self.stats = {"ok": 0, "failed": 0, "compressed": 0, "gif": 0, "skipped": 0}
         video.configure(self.cfg.max_concurrent_encodes)
         self.cleanup_loop.start()
 
@@ -107,16 +173,33 @@ class Media(commands.Cog):
             return  # the command path handles it (/convert), don't convert twice
         if not self.settings.media_enabled(message.guild.id):
             return
-        links = [(u, k) for u in URL_RE.findall(message.content) if (k := classify(u))]
+        # One parse per URL: classify() and is_embed_fixer() each re-parsed it otherwise.
+        links, fixers = [], 0
+        for u in URL_RE.findall(message.content):
+            host = _host(u)
+            kind = classify_host(host)
+            if not kind:
+                continue
+            if _matched_domain(host, EMBED_FIXERS):
+                # already embeds its own video; converting would post the clip twice
+                fixers += 1
+                continue
+            links.append((u, kind))
+        self.stats["skipped"] += fixers
         if not links:
             return
+        # Checked here rather than above: this is the only point where the answer matters,
+        # and the lookup builds a set, which is wasted on every message with no link at all.
+        if self.settings.is_media_optout(message.author.id):
+            return  # this person asked us to leave their posts alone (/autoconvert off)
         # at most 2 videos per message, and never process the same message twice
         if message.id in self._inflight:
             return
         self._inflight.add(message.id)
         try:
             for url, kind in links[:2]:
-                await self.convert_and_send(message, normalise(url, kind), kind, reply_errors=False)
+                await self.convert_and_send(message, normalise(url, kind), kind, reply_errors=False,
+                                            suppress_embeds=not fixers)
         finally:
             self._inflight.discard(message.id)
 
@@ -136,7 +219,8 @@ class Media(commands.Cog):
         return any(p and message.content.startswith(p) for p in prefixes)
 
     # ---------------------------------------------------------------- core
-    async def convert_and_send(self, message: discord.Message, url: str, kind: str, *, reply_errors: bool) -> bool:
+    async def convert_and_send(self, message: discord.Message, url: str, kind: str, *,
+                               reply_errors: bool, suppress_embeds: bool = True) -> bool:
         guild = message.guild
         assert guild is not None
         limit = guild.filesize_limit                     # honours server boost level
@@ -181,11 +265,15 @@ class Media(commands.Cog):
             ext = out.suffix.lower().lstrip(".") or "mp4"
             await message.reply(file=discord.File(out, filename=f"{kind}.{ext}"), mention_author=False)
             self.stats["ok"] += 1
-            # tidy: drop the original embed if we can
-            try:
-                await message.edit(suppress=True)
-            except discord.HTTPException:
-                pass
+            # Tidy: drop the original embed if we can. Discord's suppress flag applies to the
+            # WHOLE message, so when the same message also carries an embed-fixer link we
+            # must leave it alone — suppressing here would destroy the very embed the
+            # listener skipped that link to preserve.
+            if suppress_embeds:
+                try:
+                    await message.edit(suppress=True)
+                except discord.HTTPException:
+                    pass
             return True
         except video.VideoError as e:
             self.stats["failed"] += 1
@@ -244,6 +332,39 @@ class Media(commands.Cog):
             anchor = ctx.message
         await self.convert_and_send(anchor, normalise(url, kind), kind, reply_errors=True)
 
+    @commands.hybrid_command(name="autoconvert",
+                             description="Choose whether I auto-convert links you post")
+    @app_commands.describe(state="on to let me convert your links, off to leave them alone")
+    @app_commands.choices(state=[
+        app_commands.Choice(name="on", value="on"),
+        app_commands.Choice(name="off", value="off"),
+    ])
+    async def autoconvert(self, ctx: commands.Context, state: Optional[str] = None):
+        """Anyone can opt themselves out; it applies everywhere the bot is, not just here."""
+        opted_out = self.settings.is_media_optout(ctx.author.id)
+        if state is None:
+            return await ctx.send(
+                ("🚫 I currently **don't** auto-convert links you post. `/autoconvert on` to turn it back on."
+                 if opted_out else
+                 "✅ I currently auto-convert Twitter/X and TikTok links you post. `/autoconvert off` to stop."),
+                ephemeral=True)
+        value = state.strip().lower()
+        if value in _OFF_WORDS:
+            want_off = True
+        elif value in _ON_WORDS:
+            want_off = False
+        else:
+            # Anything unrecognised used to fall through to "on", so `!autoconvert of`
+            # silently deleted an existing opt-out and reported success.
+            return await ctx.send("Use `on` or `off`.", ephemeral=True)
+        await self.settings.set_media_optout_async(ctx.author.id, want_off)
+        await ctx.send(
+            ("🚫 Done — I'll leave the links you post alone, in every server I'm in. "
+             "`/convert <url>` still works if you want one on purpose."
+             if want_off else
+             "✅ Done — I'll auto-convert Twitter/X and TikTok links you post again."),
+            ephemeral=True)
+
     @commands.hybrid_command(name="media-toggle", description="Enable/disable automatic link conversion here (admin)")
     @commands.has_permissions(manage_guild=True)
     @app_commands.default_permissions(manage_guild=True)
@@ -268,6 +389,10 @@ class Media(commands.Cog):
         used = await asyncio.to_thread(video.dir_size, self.workdir)
         e.add_field(name="Temp usage", value=f"{used / 1048576:.1f} MB", inline=True)
         s = self.stats
+        e.add_field(name="Your links",
+                    value="🚫 not converted" if self.settings.is_media_optout(ctx.author.id) else "✅ converted",
+                    inline=True)
+        e.add_field(name="Fixer links left alone", value=str(s["skipped"]), inline=True)
         e.add_field(name="Silent clips → GIF",
                     value=f"≤ {self.cfg.max_gif_seconds}s" if self.cfg.max_gif_seconds else "🚫 disabled",
                     inline=True)
