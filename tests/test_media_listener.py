@@ -44,9 +44,12 @@ def cog(tmp_path: Path):
     c.settings = GuildSettings(tmp_path / "s.json", media_default=True)
     c._inflight = set()
     c.converted = []
+    c.suppressed = []
+    c.stats = {"ok": 0, "failed": 0, "compressed": 0, "gif": 0, "skipped": 0}
 
-    async def _convert(message, url, kind, *, reply_errors):
+    async def _convert(message, url, kind, *, reply_errors, suppress_embeds=True):
         c.converted.append((url, kind))
+        c.suppressed.append(suppress_embeds)
         return True
 
     async def _not_a_command(message):
@@ -137,3 +140,27 @@ async def test_at_most_two_links_per_message(cog):
 
 async def test_unsupported_links_are_ignored(cog):
     assert await urls(cog, "https://youtube.com/watch?v=1 https://example.com/a") == []
+
+
+async def test_a_fixer_link_in_the_message_stops_us_suppressing_its_embed(cog):
+    """Discord's suppress flag covers the WHOLE message. Suppressing after converting the
+    x.com link would destroy the fxtwitter embed the listener skipped that link to keep —
+    exactly the outcome this feature exists to prevent."""
+    await urls(cog, "https://fxtwitter.com/a/1 and https://x.com/b/status/2")
+    assert cog.suppressed == [False]
+
+
+async def test_embeds_are_still_suppressed_when_no_fixer_is_present(cog):
+    await urls(cog, "https://x.com/b/status/2")
+    assert cog.suppressed == [True]
+
+
+async def test_skipped_fixer_links_are_counted(cog):
+    await urls(cog, "https://fxtwitter.com/a/1 https://vxtwitter.com/b/2 https://x.com/c/status/3")
+    assert cog.stats["skipped"] == 2
+
+
+async def test_an_opted_out_user_does_not_bump_the_skip_counter_twice(cog):
+    cog.settings.set_media_optout(555, True)
+    await urls(cog, "https://x.com/a/status/1", uid=555)
+    assert cog.stats["skipped"] == 0

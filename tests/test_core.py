@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from bot.cogs.media import EMBED_FIXERS, classify, is_embed_fixer, normalise
+from bot.cogs.media import CANONICAL_HOST, EMBED_FIXERS, classify, is_embed_fixer, normalise
 from bot.core.queue import TrackQueue
 from bot.core.settings import GuildSettings
 from bot.core.spotify import is_spotify, parse
@@ -266,9 +266,19 @@ def test_media_optout_does_not_disturb_guild_settings(tmp_path: Path):
 
 
 def test_media_optout_survives_a_hand_mangled_list(tmp_path: Path):
+    """Junk is DROPPED, never coerced. int(3.9) is 3 — a real snowflake belonging to someone
+    else, whose links would then silently stop converting."""
     p = tmp_path / "s.json"
-    p.write_text('{"0": {"media_optout": [1, "2", null, "abc", 3.9, [], {}]}}')
-    assert GuildSettings(p).media_optout() == {1, 2, 3}
+    p.write_text('{"0": {"media_optout": [1, "2", null, "abc", 3.9, true, [], {}]}}')
+    assert GuildSettings(p).media_optout() == {1, 2}
+
+
+def test_media_optout_ignores_a_wrong_shaped_value(tmp_path: Path):
+    for body in ('{"0": {"media_optout": 42}}', '{"0": {"media_optout": "42"}}',
+                 '{"0": {"media_optout": {"a": 1}}}'):
+        p = tmp_path / "s.json"
+        p.write_text(body)
+        assert GuildSettings(p).media_optout() == set()
 
 
 def test_media_optout_defaults_to_empty_when_absent(tmp_path: Path):
@@ -276,3 +286,31 @@ def test_media_optout_defaults_to_empty_when_absent(tmp_path: Path):
     p.write_text('{"0": {"command_signature": "abc"}}')
     assert GuildSettings(p).media_optout() == set()
     assert GuildSettings(p).is_media_optout(1) is False
+
+
+@pytest.mark.parametrize("domain", sorted(EMBED_FIXERS))
+@pytest.mark.parametrize("prefix", ["", "www.", "d."])
+def test_normalise_moves_every_fixer_host_to_the_real_site(domain, prefix):
+    """Covers every entry and its subdomains, so adding a fixer cannot leave normalise()
+    behind. A "www.-or-nothing" prefix regex passed this for the bare hosts while handing
+    `d.fxtwitter.com` — which classify() and is_embed_fixer() both accept — straight to
+    yt-dlp on the third-party host."""
+    url = f"https://{prefix}{domain}/someone/status/12345?s=20"
+    kind = classify(url)
+    assert kind is not None
+    assert is_embed_fixer(url) is True
+    out = normalise(url, kind)
+    host = out.split("/")[2]
+    assert host == CANONICAL_HOST[EMBED_FIXERS[domain]]
+    assert domain not in host
+    assert out.endswith("/someone/status/12345?s=20"), "path and query must survive"
+
+
+@pytest.mark.parametrize("url", [
+    "https://x.com/a/status/1?s=20",
+    "https://twitter.com/a/status/1",
+    "https://www.tiktok.com/@u/video/1",
+    "https://vm.tiktok.com/ZM1/",
+])
+def test_normalise_leaves_real_posts_alone(url):
+    assert normalise(url, classify(url)) == url

@@ -14,15 +14,27 @@ log = logging.getLogger(__name__)
 
 
 def _int_set(raw: Any) -> set[int]:
-    """Ints from a stored list, tolerating a hand-edited file."""
+    """Ids from a stored list, tolerating a hand-edited file.
+
+    Anything that is not already a whole number is DROPPED rather than coerced: int(3.9) is
+    3, a perfectly valid snowflake belonging to somebody else, so a malformed entry would
+    silently stop an unrelated person's links converting. bool is excluded for the same
+    reason — True would become id 1.
+    """
     if not isinstance(raw, list):
+        if raw is not None:
+            log.warning("stored id list is %s, not a list; ignoring it", type(raw).__name__)
         return set()
-    out = set()
+    out: set[int] = set()
     for x in raw:
-        try:
-            out.add(int(x))
-        except (TypeError, ValueError):
+        if isinstance(x, bool):
             continue
+        if isinstance(x, int):
+            out.add(x)
+        elif isinstance(x, str) and x.strip().lstrip("-").isdigit():
+            out.add(int(x.strip()))
+        else:
+            log.warning("ignoring non-integer id %r in stored list", x)
     return out
 
 
