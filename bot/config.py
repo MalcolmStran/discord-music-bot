@@ -104,6 +104,7 @@ class Config:
     max_song_duration: int = 7200          # seconds
     default_volume: float = 0.5            # 0..1
     idle_disconnect_seconds: int = 300     # leave voice after this long with nothing to play
+    voice_reconnect_grace: int = 45        # wait this long for a dropped voice link to recover
 
     # media conversion
     media_enabled_default: bool = True
@@ -148,6 +149,7 @@ class Config:
             max_song_duration=_int("MAX_SONG_DURATION", 7200, minimum=1),
             default_volume=_float("DEFAULT_VOLUME", 0.5, minimum=0.0, maximum=1.0),
             idle_disconnect_seconds=_int("VOICE_AUTO_DISCONNECT_TIMEOUT", 300, minimum=10),
+            voice_reconnect_grace=_int("VOICE_RECONNECT_GRACE", 45, minimum=0, maximum=300),
             media_enabled_default=_bool("MEDIA_ENABLED_DEFAULT", True),
             max_download_mb=_int("MAX_DOWNLOAD_MB", 500, minimum=1),
             max_concurrent_encodes=_int("MAX_CONCURRENT_ENCODES", 2, minimum=1, maximum=16),

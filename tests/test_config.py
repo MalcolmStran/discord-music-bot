@@ -7,7 +7,7 @@ from bot.config import Config, _bool, _float, _int, _log_level, _prefix
 @pytest.fixture(autouse=True)
 def clean_env(monkeypatch):
     for name in ("DISCORD_TOKEN", "COMMAND_PREFIX", "OWNER_IDS", "MAX_QUEUE_SIZE",
-                 "MAX_SONG_DURATION", "DEFAULT_VOLUME", "VOICE_AUTO_DISCONNECT_TIMEOUT",
+                 "MAX_SONG_DURATION", "DEFAULT_VOLUME", "VOICE_AUTO_DISCONNECT_TIMEOUT", "VOICE_RECONNECT_GRACE",
                  "MAX_CONCURRENT_ENCODES", "MAX_DOWNLOAD_MB", "ENCODE_TIMEOUT_SECONDS",
                  "LOG_LEVEL", "LOG_DIR", "DOWNLOAD_DIR", "MEDIA_ENABLED_DEFAULT",
                  "RAPIDAPI_KEY", "SPOTIFY_CLIENT_ID", "SPOTIFY_CLIENT_SECRET",
@@ -130,3 +130,12 @@ def test_max_gif_seconds_defaults_and_clamps(monkeypatch):
     assert Config.from_env().max_gif_seconds == 0       # never negative
     monkeypatch.setenv("MAX_GIF_SECONDS", "99999")
     assert Config.from_env().max_gif_seconds == 600     # a 27-hour GIF is not a thing
+
+
+def test_voice_reconnect_grace_default_and_bounds(monkeypatch):
+    monkeypatch.setenv("DISCORD_TOKEN", "x")
+    assert Config.from_env().voice_reconnect_grace == 45
+    monkeypatch.setenv("VOICE_RECONNECT_GRACE", "-5")
+    assert Config.from_env().voice_reconnect_grace == 0
+    monkeypatch.setenv("VOICE_RECONNECT_GRACE", "9999")
+    assert Config.from_env().voice_reconnect_grace == 300

@@ -136,6 +136,7 @@ Every setting is an environment variable, read from `.env` (see `.env.example`).
 | `MAX_SONG_DURATION` | `7200` | ≥ 1 | seconds |
 | `DEFAULT_VOLUME` | `0.5` | 0.0–1.0 | |
 | `VOICE_AUTO_DISCONNECT_TIMEOUT` | `300` | ≥ 10 | seconds idle in voice before leaving |
+| `VOICE_RECONNECT_GRACE` | `45` | 0–300 | seconds to wait for a dropped voice connection to recover before resetting the player (0 = reset immediately) |
 | **Media** | | | |
 | `MEDIA_ENABLED_DEFAULT` | `true` | | starting state for servers that haven't used `/media-toggle` |
 | `MAX_DOWNLOAD_MB` | `500` | ≥ 1 | refuse to download anything larger |
@@ -178,6 +179,11 @@ than burning six ffmpeg passes to find out; the message includes the longest dur
 would have fit. `"Couldn't compress the video enough to upload it"` is the same outcome
 found the slow way, after the ladder ran. Boosted servers have higher upload caps and the
 bot reads the current one per server.
+
+**The bot goes quiet for a few seconds mid-song, then carries on.**
+That's a voice connection drop being recovered (common on satellite or mobile uplinks); the
+log shows `bot left voice (external); waiting up to 45s for a reconnect` followed by
+`voice connection recovered`. If drops end the song instead, raise `VOICE_RECONNECT_GRACE`.
 
 **The container restarts in a loop.**
 The `HEALTHCHECK` watches a heartbeat file the bot touches only while its gateway
@@ -244,6 +250,14 @@ client. No recursion and no `run_coroutine_threadsafe` chains.
 **Voice connection is deliberately minimal** — a plain `channel.connect(reconnect=True)`,
 letting discord.py handle resumes. Retry loops around it are what caused the 4006/4017
 errors in the past; don't add them back.
+
+**A dropped voice connection is ridden out, not treated as a kick.** On a flaky uplink
+Discord closes the voice websocket now and then; discord.py waits up to 30 s for a new voice
+server, reconnects, and the audio player just pauses. Resetting the player on the first "bot
+left voice" event cancelled that reconnect and ended the song, so `wait_for_reconnect()` now
+waits up to `VOICE_RECONNECT_GRACE` (default 45 s, deliberately longer than discord.py's
+window) and only resets if the connection didn't come back. If discord.py has already dropped
+its voice client — a real kick or a deleted channel — it resets at once.
 
 **Playlists resolve flat** (one yt-dlp call, about a second for 100 items). Individual
 stream URLs are fetched immediately before each track plays, so a long playlist queues

@@ -306,3 +306,54 @@ async def test_repeated_failures_stop_the_player_and_clear_the_queue(monkeypatch
     assert p._failures == 0, "the streak resets once it has tripped"
     assert any("Too many tracks failed" in m for m in said)
     assert len(said) <= p.MAX_CONSECUTIVE_FAILURES + 1, "one message per attempt is spam"
+
+
+# ------------------------------------------------- dropped voice connection (2026-09-27)
+class _FlakyVoice:
+    """Stands in for discord.VoiceClient: disconnected until `back_after` polls have passed."""
+
+    def __init__(self, back_after):
+        self.back_after = back_after
+        self.polls = 0
+
+    def is_connected(self):
+        self.polls += 1
+        return self.back_after is not None and self.polls > self.back_after
+
+
+def _with_voice(p, vc, monkeypatch):
+    monkeypatch.setattr(GuildPlayer, "voice", property(lambda self: vc))
+    return p
+
+
+async def test_wait_for_reconnect_returns_true_once_voice_is_back(monkeypatch):
+    """A Starlink blip: discord.py reconnects a few seconds later; the player must survive."""
+    p = _with_voice(make_player(), _FlakyVoice(back_after=3), monkeypatch)
+    assert await p.wait_for_reconnect(grace=5, poll=0.001) is True
+
+
+async def test_wait_for_reconnect_gives_up_after_the_grace(monkeypatch):
+    p = _with_voice(make_player(), _FlakyVoice(back_after=None), monkeypatch)
+    loop = asyncio.get_running_loop()
+    t0 = loop.time()
+    assert await p.wait_for_reconnect(grace=0.05, poll=0.01) is False
+    assert loop.time() - t0 < 1
+
+
+async def test_wait_for_reconnect_returns_at_once_when_discord_dropped_the_client(monkeypatch):
+    """A real kick: discord.py has already torn its voice client down, so don't sit out the grace."""
+    p = _with_voice(make_player(), None, monkeypatch)
+    loop = asyncio.get_running_loop()
+    t0 = loop.time()
+    assert await p.wait_for_reconnect(grace=60, poll=0.01) is False
+    assert loop.time() - t0 < 0.5
+
+
+async def test_zero_grace_keeps_the_old_immediate_behaviour(monkeypatch):
+    p = _with_voice(make_player(), _FlakyVoice(back_after=None), monkeypatch)
+    assert await p.wait_for_reconnect(grace=0, poll=0.01) is False
+
+
+async def test_default_grace_outlasts_discord_py_reconnect_window():
+    """discord.py waits up to 30 s for a new voice server after a forced close."""
+    assert make_player().reconnect_grace > 30

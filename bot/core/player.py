@@ -32,9 +32,14 @@ class LoopMode(str, Enum):
 class GuildPlayer:
     # consecutive unplayable tracks before the player gives up instead of spamming
     MAX_CONSECUTIVE_FAILURES = 5
+    # How long to let discord.py recover a dropped voice connection before treating it as a
+    # real disconnect. discord.py waits up to its connect timeout (30 s) for a new voice
+    # server after a forced close, so this has to outlast that. Overridden from config.
+    reconnect_grace: float = 45.0
 
     def __init__(self, bot: discord.Client, guild: discord.Guild, ytdl: YTDL, *,
-                 max_queue: int, default_volume: float, idle_seconds: int):
+                 max_queue: int, default_volume: float, idle_seconds: int,
+                 reconnect_grace: float = 45.0):
         self.bot = bot
         self.guild = guild
         self.ytdl = ytdl
@@ -42,6 +47,7 @@ class GuildPlayer:
         self.volume = default_volume
         self.loop_mode = LoopMode.OFF
         self.idle_seconds = idle_seconds
+        self.reconnect_grace = reconnect_grace
 
         self.current: Optional[Track] = None
         self.started_at: float = 0.0
@@ -94,6 +100,28 @@ class GuildPlayer:
             # (lesson from 2026-03-11: extra retry loops caused 4006/4017 errors)
             await channel.connect(timeout=30, reconnect=True, self_deaf=True)
             log.info("[%s] connected to %s", self.guild.name, channel.name)
+
+    async def wait_for_reconnect(self, grace: Optional[float] = None, poll: float = 0.5) -> bool:
+        """Give a dropped voice connection a chance to come back. True if it did.
+
+        On a flaky uplink (Starlink, 2026-09-27) Discord closes the voice websocket every so
+        often. discord.py then waits for a new voice server and reconnects by itself, and the
+        audio player just pauses until it is back. Resetting the player at the first
+        "bot left voice" event is what used to turn a few seconds of silence into a lost song.
+
+        Returns as soon as the connection is back, or as soon as discord.py has given up and
+        dropped its voice client (a real kick or a deleted channel), so real disconnects are
+        still handled promptly.
+        """
+        grace = self.reconnect_grace if grace is None else grace
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max(0.0, grace)
+        while True:
+            if self.connected:
+                return True
+            if self.voice is None or loop.time() >= deadline:
+                return False
+            await asyncio.sleep(poll)
 
     async def disconnect(self) -> None:
         self.queue.clear()
@@ -232,11 +260,10 @@ class GuildPlayer:
                     await self.disconnect()
                     return
                 if not self.connected:
-                    log.warning("[%s] not connected; dropping %s", self.guild.name, track.title)
+                    log.warning("[%s] not connected; holding %s until voice is back", self.guild.name, track.title)
                     self.queue.push_front(track)
                     self.current = None    # so loop-all does not re-queue the previous track
-                    await asyncio.sleep(2)
-                    if not self.connected:
+                    if not await self.wait_for_reconnect():
                         await self._announce("❌ Lost the voice connection. Use `/play` again to reconnect.")
                         self.current = None
                         return

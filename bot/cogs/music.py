@@ -41,13 +41,15 @@ class Music(commands.Cog):
         self.settings = bot.settings            # type: ignore[attr-defined]
         self.players: dict[int, GuildPlayer] = {}
         self._alone_checks: set[int] = set()   # guilds with a pending "is anyone left?" check
+        self._reconnect_checks: set[int] = set()   # guilds waiting to see if a voice drop recovers
 
     # ------------------------------------------------------------ helpers
     def player(self, guild: discord.Guild) -> GuildPlayer:
         p = self.players.get(guild.id)
         if p is None:
             p = GuildPlayer(self.bot, guild, self.ytdl, max_queue=self.cfg.max_queue_size,
-                            default_volume=self.cfg.default_volume, idle_seconds=self.cfg.idle_disconnect_seconds)
+                            default_volume=self.cfg.default_volume, idle_seconds=self.cfg.idle_disconnect_seconds,
+                            reconnect_grace=self.cfg.voice_reconnect_grace)
             self._restore(guild.id, p)
             self.players[guild.id] = p
         return p
@@ -132,10 +134,10 @@ class Music(commands.Cog):
         player = self.players.get(member.guild.id)
         if player is None:
             return
-        # bot itself disconnected (kicked / channel deleted)
+        # bot itself left voice: a network drop that discord.py is about to recover, or a real
+        # kick / deleted channel. Only reset once we know which.
         if self.bot.user and member.id == self.bot.user.id and before.channel and not after.channel:
-            log.info("[%s] bot left voice (external); resetting player", member.guild.name)
-            await player.disconnect()
+            await self._handle_bot_left_voice(member.guild, player)
             return
         # somebody actually left the bot's channel (a mute/deafen keeps before == after)
         if member.bot or before.channel == after.channel:
@@ -153,6 +155,21 @@ class Music(commands.Cog):
                 await player.disconnect()
         finally:
             self._alone_checks.discard(member.guild.id)
+
+    async def _handle_bot_left_voice(self, guild: discord.Guild, player: GuildPlayer) -> None:
+        if guild.id in self._reconnect_checks:
+            return          # already waiting on this drop
+        self._reconnect_checks.add(guild.id)
+        try:
+            log.info("[%s] bot left voice (external); waiting up to %.0fs for a reconnect",
+                     guild.name, player.reconnect_grace)
+            if await player.wait_for_reconnect():
+                log.info("[%s] voice connection recovered; keeping the player", guild.name)
+                return
+            log.info("[%s] voice did not come back; resetting player", guild.name)
+            await player.disconnect()
+        finally:
+            self._reconnect_checks.discard(guild.id)
 
     @commands.Cog.listener()
     async def on_guild_remove(self, guild: discord.Guild):
