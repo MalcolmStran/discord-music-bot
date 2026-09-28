@@ -196,7 +196,7 @@ then `docker logs discord-music-bot`.
 
 ```bash
 ./check.sh --install      # install dev deps, then lint + the whole suite
-./check.sh                # lint + tests (306, no Discord and no network)
+./check.sh                # lint + tests (320, no Discord and no network)
 ./check.sh --docker       # also build the image and run the suite inside it
 ```
 
@@ -220,8 +220,9 @@ bot/
   core/video.py    download, probe, fit_under (2-pass ladder), to_gif
   core/spotify.py  Spotify links -> metadata (embed page, or Web API when creds are set)
   core/settings.py per-guild JSON settings + the global opt-out list
-tests/             offline unit tests: queue/settings/links, player loop modes, encoder
-                   planning, config parsing, ytdl helpers, Spotify parsing, media cog
+tests/             offline unit tests: queue/settings/links, player loop modes, voice-drop
+                   recovery, encoder planning, config parsing, ytdl helpers, Spotify parsing,
+                   media cog
 check.sh           lint + tests (+ optional Docker build)
 Dockerfile         python:3.13-slim + ffmpeg + node, runs as an unprivileged user
 entrypoint.sh      optional yt-dlp self-update, then starts the bot
