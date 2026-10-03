@@ -19,7 +19,7 @@ import discord
 from discord.utils import escape_markdown
 
 from .queue import TrackQueue
-from .ytdl import YTDL, Track
+from .ytdl import YTDL, TooLong, Track
 
 log = logging.getLogger(__name__)
 
@@ -408,6 +408,16 @@ class GuildPlayer:
         try:
             await self.ytdl.fetch_stream(track)
             source = self.ytdl.make_source(track, self.volume)
+        except TooLong as e:
+            # The real length is often only known here (flat playlist entries and Spotify→YouTube
+            # matches carry none). Over MAX_SONG_DURATION is a choice of track, not a broken
+            # source, so it must not feed the failure streak: five long mixes in a row would
+            # otherwise wipe the queue with a false "YouTube may be blocking the bot".
+            log.info("[%s] skipping %s: %s", self.guild.name, track.title, e)
+            self._loading = None
+            self.current = None
+            await self._announce(f"⏱️ Skipping **{escape_markdown(track.title)}** — {escape_markdown(str(e))}")
+            return
         except Exception as e:
             log.warning("[%s] cannot play %s: %s", self.guild.name, track.title, e)
             self._loading = None

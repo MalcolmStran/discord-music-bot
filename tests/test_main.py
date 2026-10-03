@@ -223,3 +223,11 @@ async def test_a_typo_gets_the_usage_line_not_an_internal_error(mbot, caplog, er
         await mbot.on_command_error(ctx, error)
     assert ctx.sent == ["Usage: `!remove <index>`"]
     assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+
+
+# --- wiring -------------------------------------------------------------------------------
+def test_song_duration_cap_reaches_the_resolver(tmp_path):
+    """MAX_SONG_DURATION was only checked against resolve-time metadata, which flat playlist
+    entries and Spotify matches don't have. The resolver needs the cap to enforce it at play time."""
+    cfg = Config(token="x", download_dir=tmp_path / "dl", log_dir=tmp_path / "logs", max_song_duration=600)
+    assert MusicBot(cfg).ytdl.max_duration == 600

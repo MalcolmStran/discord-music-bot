@@ -67,7 +67,8 @@ class MusicBot(commands.Bot):
         self.cfg = cfg
         # the playlist cap used to be hard-wired to 100 while the queue held 50, so half a
         # long playlist was resolved and then thrown away
-        self.ytdl = YTDL(cookies_file=cfg.ytdl_cookies_file, max_playlist=cfg.max_queue_size)
+        self.ytdl = YTDL(cookies_file=cfg.ytdl_cookies_file, max_playlist=cfg.max_queue_size,
+                         max_duration=cfg.max_song_duration)
         self.spotify = Spotify(cfg.spotify_client_id, cfg.spotify_client_secret, max_tracks=cfg.max_queue_size)
         self.settings = GuildSettings(cfg.data_dir / "guild_settings.json", media_default=cfg.media_enabled_default)
         self.log = logging.getLogger("bot")

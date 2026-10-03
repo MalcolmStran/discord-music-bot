@@ -17,8 +17,8 @@ services:
       - bot-downloads:/app/downloads   # temp media + guild settings (persisted)
       # yt-dlp cookies: a host path in YTDL_COOKIES_FILE doesn't exist in the container and is
       # silently skipped. Create the file, uncomment this, and set YTDL_COOKIES_FILE=/app/cookies.txt.
-      # Leave it writable (no :ro): yt-dlp saves the cookie jar back after every download.
-      # - ./cookies.txt:/app/cookies.txt
+      # The bot only reads it (cookies are never written back), so :ro is fine.
+      # - ./cookies.txt:/app/cookies.txt:ro
     # `deploy.resources` is swarm-only and is ignored by `docker compose up`, so the cap
     # was never actually applied. mem_limit is the compose-v2 key.
     mem_limit: 768m         # two concurrent x265 encodes need headroom

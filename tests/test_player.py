@@ -299,6 +299,35 @@ async def test_play_track_counts_the_failure(monkeypatch):
     assert p._failures == 1
 
 
+class _TooLongYTDL:
+    """fetch_stream finds out the real length only now and it is over MAX_SONG_DURATION."""
+
+    async def fetch_stream(self, track):
+        from bot.core.ytdl import TooLong
+        raise TooLong("Too long (3:00:00; max 2:00:00).")
+
+    def make_source(self, track, volume):      # never reached
+        raise AssertionError("make_source must not run after fetch_stream raised")
+
+
+async def test_too_long_tracks_do_not_count_toward_the_failure_streak(monkeypatch):
+    """A set of long DJ mixes is the requester's choice, not a broken source. Counting them as
+    failures let five in a row wipe the rest of the queue and blame YouTube."""
+    p = make_player()
+    p.ytdl = _TooLongYTDL()
+    _, said = _wire(p, monkeypatch)
+    p.queue.extend([track(f"next{i}") for i in range(3)])
+
+    for _ in range(p.MAX_CONSECUTIVE_FAILURES + 1):
+        await p._play_track(track("mix"))
+
+    assert len(p.queue) == 3, "too-long tracks must not trip the failure cutoff"
+    assert p._failures == 0
+    assert p.current is None, "a skipped track must not stay current (loop-all would re-queue it)"
+    assert not any("Too many tracks failed" in m for m in said)
+    assert all("Too long" in m for m in said) and len(said) == p.MAX_CONSECUTIVE_FAILURES + 1
+
+
 async def test_repeated_failures_stop_the_player_and_clear_the_queue(monkeypatch):
     """Five unplayable tracks in a row must stop rather than spam one message per attempt."""
     p = make_player()
