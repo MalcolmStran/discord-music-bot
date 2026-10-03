@@ -41,6 +41,9 @@ def make_player(max_queue: int = 50, idle_seconds: int = 300) -> GuildPlayer:
     p._loading = None
     p._failures = 0
     p._lock = asyncio.Lock()
+    p._connecting = 0
+    p._leaving = 0
+    p._pending = 0
     # mirrors __init__; without it every attribute read here falls back to the class
     # attribute, which is how the shipped grace test passed without touching the wiring
     p.reconnect_grace = 45.0

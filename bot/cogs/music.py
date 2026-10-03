@@ -22,6 +22,14 @@ def _voice_channel_of(member: discord.Member):
     return member.voice.channel if member.voice else None
 
 
+def _has_human_listeners(ch) -> bool:
+    if any(not m.bot for m in ch.members):
+        return True
+    # The bot runs without the members intent, and `members` silently drops anyone the cache
+    # cannot resolve. An unresolvable voice state is still somebody listening.
+    return any(ch.guild.get_member(uid) is None for uid in ch.voice_states)
+
+
 def split_too_long(tracks: list, max_seconds: int) -> tuple[list, list]:
     """Partition into (playable, too_long). Tracks of unknown length (livestreams) pass."""
     playable, too_long = [], []
@@ -32,6 +40,13 @@ def split_too_long(tracks: list, max_seconds: int) -> tuple[list, list]:
 
 class Music(commands.Cog):
     """Play music from YouTube (and anything else yt-dlp can stream)."""
+
+    # how long to wait after the last listener leaves before leaving too
+    ALONE_CHECK_DELAY: float = 10.0
+    # Shutdown budget for leaving every voice channel. Each VoiceClient.disconnect() waits up
+    # to 30 s for a gateway echo that never comes when the uplink is down, and docker's
+    # stop_grace_period is 20 s, after which the container is SIGKILLed mid-teardown.
+    UNLOAD_TIMEOUT: float = 8.0
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
@@ -88,8 +103,19 @@ class Music(commands.Cog):
         if not (perms.connect and perms.speak):
             await ctx.send(f"❌ I can't connect/speak in **{ch.name}** (missing permissions).")
             return False
-        if player.connected and player.channel != ch and self._busy_elsewhere(player):
+        # Gated on the client existing, not on it being connected: during a voice drop that
+        # discord.py is recovering, `connected` is False while the listeners are still in the
+        # old channel, and skipping the check let anyone elsewhere move the bot and its queue.
+        if player.channel and player.channel != ch and self._busy_elsewhere(player):
             await ctx.send(f"🎧 I'm already busy in **{player.channel.name}** — join me there or `/stop` first.")  # type: ignore[union-attr]
+            return False
+        # Discord never answers a join into a full channel without Move Members, so connect()
+        # sat out its 30 s timeout and then blamed "flaky voice servers"; a retry never works.
+        # voice_states, not members: without the members intent `members` can undercount.
+        if (player.channel != ch and ch.user_limit and len(ch.voice_states) >= ch.user_limit
+                and not perms.move_members):
+            await ctx.send(f"❌ **{ch.name}** is full ({ch.user_limit} max) — "
+                           "raise its user limit or give me the Move Members permission.")
             return False
         try:
             await player.connect(ch)
@@ -102,7 +128,31 @@ class Music(commands.Cog):
             await ctx.send(f"❌ Couldn't connect to **{ch.name}**.")
             return False
         player.text_channel = ctx.channel
+        if isinstance(ch, discord.StageChannel):
+            await self._request_stage_speaker(ctx)
+        # The idle timer lives in the player loop, which only enqueue() used to start, so a
+        # bare /join or a /play that failed after joining sat in voice forever. An idle leave
+        # cannot cut a /play short: play() holds player.reserve() until it has enqueued.
+        player.ensure_loop()
         return True
+
+    async def _request_stage_speaker(self, ctx: commands.Context) -> None:
+        """Everyone joins a Stage as a suppressed audience member, and a suppressed bot
+        "plays" to silence while /status says playing. Never fails the join over this."""
+        me = ctx.guild.me  # type: ignore[union-attr]
+        if not (me.voice and me.voice.suppress):
+            return
+        try:
+            await me.edit(suppress=False)        # needs Mute Members (Stage moderator)
+        except discord.Forbidden:
+            try:
+                await me.request_to_speak()
+            except (discord.HTTPException, discord.ClientException) as e:
+                log.debug("request to speak failed in %s: %s", ctx.guild, e)
+            await ctx.send("🎙️ I'm in the Stage audience — a Stage moderator has to invite me "
+                           "to speak before anyone can hear me.")
+        except discord.HTTPException as e:
+            log.warning("could not unsuppress in the stage in %s: %s", ctx.guild, e)
 
     @staticmethod
     def _busy_elsewhere(player: GuildPlayer) -> bool:
@@ -137,6 +187,11 @@ class Music(commands.Cog):
         # bot itself left voice: a network drop that discord.py is about to recover, or a real
         # kick / deleted channel. Only reset once we know which.
         if self.bot.user and member.id == self.bot.user.id and before.channel and not after.channel:
+            # Our own /leave, idle or alone leave echoes back exactly like a kick; checked
+            # before any await, while VoiceClient.disconnect() is still waiting on this echo.
+            if player.leaving:
+                log.debug("[%s] left voice (own disconnect)", member.guild.name)
+                return
             await self._handle_bot_left_voice(member.guild, player)
             return
         # somebody actually left the bot's channel (a mute/deafen keeps before == after)
@@ -148,10 +203,17 @@ class Music(commands.Cog):
             return          # a check is already pending for this guild
         self._alone_checks.add(member.guild.id)
         try:
-            await asyncio.sleep(10)
+            await asyncio.sleep(self.ALONE_CHECK_DELAY)
+            # A /play or /join is connecting or moving the bot (maybe out of this empty
+            # channel); disconnect() would queue behind it and then tear the new connection down.
+            if player.connecting:
+                return
             ch = player.channel
             if ch and not any(not m.bot for m in ch.members):
                 await player.announce("👋 Everyone left, so I'll leave too.")
+                ch = player.channel
+                if player.connecting or (ch and any(not m.bot for m in ch.members)):
+                    return      # somebody came back or summoned the bot while that was sending
                 await player.disconnect()
         finally:
             self._alone_checks.discard(member.guild.id)
@@ -185,8 +247,16 @@ class Music(commands.Cog):
                 log.debug("cleanup disconnect failed for guild %s", guild_id, exc_info=True)
 
     async def cog_unload(self) -> None:
-        for gid in list(self.players):
-            await self._drop_player(gid)
+        # Concurrently and under one overall bound: one at a time, each guild could take the
+        # full 30 s echo wait. Leftovers are cancelled but not awaited, since a cancel landing in
+        # discord.py's voice-websocket close re-enters that 30 s wait in its `finally`.
+        tasks = [asyncio.create_task(self._drop_player(gid)) for gid in list(self.players)]
+        if not tasks:
+            return
+        _, pending = await asyncio.wait(tasks, timeout=self.UNLOAD_TIMEOUT)
+        for t in pending:
+            log.warning("voice disconnect still pending at shutdown; abandoning it")
+            t.cancel()
 
     # ----------------------------------------------------------- commands
     @commands.hybrid_command(name="play", aliases=["p"], description="Play a song/URL or add it to the queue")
@@ -194,36 +264,45 @@ class Music(commands.Cog):
     @app_commands.describe(query="Song name, YouTube/SoundCloud URL, playlist URL, or Spotify track/album/playlist link")
     async def play(self, ctx: commands.Context, *, query: str):
         player = self.player(ctx.guild)  # type: ignore[arg-type]
+        # Users wrap links in <...> to stop Discord unfurling them; left on, the URL test in
+        # resolve() failed and the link was searched on YouTube as literal text.
+        query = query.strip()
+        if query.startswith("<") and query.endswith(">"):
+            query = query[1:-1].strip()
         # Defer first: joining voice can take up to 30 s and a slash command has 3 s to
         # acknowledge, so connecting before this left the interaction dead.
         await ctx.defer()
-        if player.queue.is_full:
-            return await ctx.send(f"📦 Queue is full ({player.queue.max_size}).")
-        if not await self._join_author_channel(ctx, player):
-            return
-        try:
-            async with self._thinking(ctx):
-                if is_spotify(query):
-                    tracks = await self.spotify.resolve(query, requester_id=ctx.author.id)
-                else:
-                    tracks = await self.ytdl.resolve(query, requester_id=ctx.author.id)
-        except LookupError as e:
-            return await ctx.send(f"❌ {e}")
-        except Exception:
-            log.exception("resolve failed for %r", query)
-            return await ctx.send("❌ Couldn't load that; it's been logged.")
-        if not tracks:
-            return await ctx.send("❌ Nothing playable at that link.")
-        limit = self.cfg.max_song_duration
-        playable, too_long = split_too_long(tracks, limit)
-        if not playable:
-            return await ctx.send(f"⏱️ Too long (max {limit // 60} min).")
-        added = player.enqueue(playable)
+        with player.reserve():          # no idle leave between joining and enqueueing
+            if player.queue.is_full:
+                return await ctx.send(f"📦 Queue is full ({player.queue.max_size}).")
+            if not await self._join_author_channel(ctx, player):
+                return
+            try:
+                async with self._thinking(ctx):
+                    if is_spotify(query):
+                        tracks = await self.spotify.resolve(query, requester_id=ctx.author.id)
+                    else:
+                        tracks = await self.ytdl.resolve(query, requester_id=ctx.author.id)
+            except LookupError as e:
+                return await ctx.send(f"❌ {e}")
+            except Exception:
+                log.exception("resolve failed for %r", query)
+                return await ctx.send("❌ Couldn't load that; it's been logged.")
+            if not tracks:
+                return await ctx.send("❌ Nothing playable at that link.")
+            limit = self.cfg.max_song_duration
+            playable, too_long = split_too_long(tracks, limit)
+            if not playable:
+                return await ctx.send(f"⏱️ Too long (max {limit // 60} min).")
+            added = player.enqueue(playable)
         if added == 0:
             return await ctx.send(f"📦 Queue is full ({player.queue.max_size}).")
         if added == 1 and len(playable) == 1:
             t = playable[0]
-            pos = len(player.queue) if player.current else 0
+            # `current` is None while the loop resolves a stream (the first track, or the one
+            # after a failure), so testing it alone said "Playing next" for a song queued 20th.
+            active = player.current or player.is_busy or len(player.queue) > 1
+            pos = len(player.queue) if active else 0
             e = discord.Embed(title="➕ Added to queue" if pos else "▶️ Playing next",
                               description=f"**[{escape_markdown(t.title)}]({t.link})**", color=0x5865F2)
             if t.extractor == "spotify":
@@ -396,6 +475,13 @@ class Music(commands.Cog):
         player = self.player(ctx.guild)  # type: ignore[arg-type]
         if not player.connected:
             return await ctx.send("I'm not in a voice channel.")
+        # /leave also wipes the queue, so it must not be open to anyone outside the channel
+        # while people are listening (/stop already refused them). An empty channel, or a
+        # member who could disconnect the bot from Discord's UI anyway, may still send it off.
+        ch = player.channel
+        if (ch and _has_human_listeners(ch) and _voice_channel_of(ctx.author) != ch  # type: ignore[arg-type]
+                and not ctx.author.guild_permissions.move_members):  # type: ignore[union-attr]
+            return await ctx.send(f"You need to be in **{ch.name}** to make me leave.")
         await player.disconnect()
         await ctx.send("👋 Bye.")
 

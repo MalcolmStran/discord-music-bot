@@ -9,6 +9,7 @@ finished event. Idle → disconnect after `idle_seconds`.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import time
 from enum import Enum
@@ -66,6 +67,12 @@ class GuildPlayer:
         self._loading: Optional[Track] = None   # track whose stream is being resolved
         self._failures = 0             # consecutive tracks that would not play
         self._lock = asyncio.Lock()
+        # connect() calls in flight, counted BEFORE they take _lock so queued ones count too.
+        # A plain `_lock.locked()` is not enough: on release the lock reads unlocked while
+        # the next waiter has not run yet, so a leaver could slip in and tear down its connect.
+        self._connecting = 0
+        self._leaving = 0              # our own VoiceClient.disconnect() calls in flight
+        self._pending = 0              # commands between "about to join" and enqueue (reserve())
 
     # ---------------------------------------------------------------- voice
     @property
@@ -83,23 +90,62 @@ class GuildPlayer:
         vc = self.voice
         return vc.channel if vc else None  # type: ignore[return-value]
 
+    @property
+    def connecting(self) -> bool:
+        """A connect/move is running or queued; its outcome decides where the bot ends up."""
+        return self._connecting > 0
+
+    @property
+    def leaving(self) -> bool:
+        """We are disconnecting the voice client ourselves.
+
+        Discord echoes our own leave as a "bot left voice" event, indistinguishable from a
+        kick by discord.py's state, so the cog read every /leave as a failed recovery.
+        """
+        return self._leaving > 0
+
     async def connect(self, channel: discord.VoiceChannel | discord.StageChannel) -> None:
         """Connect or move to `channel`. Raises on failure."""
-        async with self._lock:
-            vc = self.voice
-            if vc and vc.is_connected():
-                if vc.channel != channel:
-                    await vc.move_to(channel)
-                return
-            if vc:  # stale client object
-                try:
-                    await vc.disconnect(force=True)
-                except Exception:
-                    pass
-            # discord.py handles reconnects/session resumes itself; keep this minimal
-            # (lesson from 2026-03-11: extra retry loops caused 4006/4017 errors)
-            await channel.connect(timeout=30, reconnect=True, self_deaf=True)
-            log.info("[%s] connected to %s", self.guild.name, channel.name)
+        self._connecting += 1
+        try:
+            async with self._lock:
+                vc = self.voice
+                if vc and vc.is_connected():
+                    if vc.channel != channel:
+                        await vc.move_to(channel)
+                    return
+                if vc:  # stale client object
+                    try:
+                        await self._leave_voice(vc)
+                    except Exception:
+                        pass
+                # discord.py handles reconnects/session resumes itself; keep this minimal
+                # (lesson from 2026-03-11: extra retry loops caused 4006/4017 errors)
+                await channel.connect(timeout=30, reconnect=True, self_deaf=True)
+                log.info("[%s] connected to %s", self.guild.name, channel.name)
+        finally:
+            self._connecting -= 1
+
+    async def _leave_voice(self, vc: discord.VoiceClient) -> None:
+        self._leaving += 1
+        try:
+            await vc.disconnect(force=True)
+        finally:
+            self._leaving -= 1
+
+    @contextlib.contextmanager
+    def reserve(self):
+        """Hold off the idle disconnect while a command is joining/resolving to enqueue.
+
+        /play connects first and enqueues seconds later, after yt-dlp has resolved the
+        query. An idle timer expiring in that window left the channel and the confirmed
+        song then died on "Lost the voice connection".
+        """
+        self._pending += 1
+        try:
+            yield
+        finally:
+            self._pending -= 1
 
     async def wait_for_reconnect(self, grace: Optional[float] = None, poll: float = 0.5) -> bool:
         """Give a dropped voice connection a chance to come back. True if it did.
@@ -119,31 +165,45 @@ class GuildPlayer:
         while True:
             if self.connected:
                 return True
+            if self._connecting:
+                # A /play or /join is (re)connecting: it, not the clock, decides. Giving up
+                # here let the caller tear down the half-built client mid-handshake (discord.py
+                # registers it before the handshake), and the loop announced a false
+                # "Lost the voice connection". Bounded by connect()'s own timeouts.
+                await asyncio.sleep(poll)
+                continue
             if self.voice is None or loop.time() >= deadline:
                 return False
             await asyncio.sleep(poll)
 
     async def disconnect(self) -> None:
-        self.queue.clear()
-        self._failures = 0
-        self._loading = None
-        self._skip_requested = True     # so the teardown is not mistaken for a dead stream
-        self._stop_current()
-        self._cancel_np()
-        self._release_source()
-        vc = self.voice
-        if vc:
-            try:
-                await vc.disconnect(force=True)
-            except Exception as e:
-                log.debug("disconnect error: %s", e)
-        task, self._task = self._task, None
-        # `disconnect()` is also called from inside `_player_loop` (idle timeout). Cancelling
-        # the task we are running in leaves it in a half-cancelled state for no benefit.
-        if task and task is not asyncio.current_task() and not task.done():
-            task.cancel()
-        self.current = None
-        log.info("[%s] disconnected", self.guild.name)
+        # Serialised with connect(): unserialised, a leaver force-disconnected the client a
+        # /play was still handshaking, and two concurrent VoiceClient.disconnect() calls on one
+        # stale client each ran cleanup(), which pops whatever client is registered for the guild.
+        async with self._lock:
+            self.queue.clear()
+            self._failures = 0
+            self._loading = None
+            self._skip_requested = True     # so the teardown is not mistaken for a dead stream
+            self._stop_requested = True     # and so loop-all cannot re-queue the torn-down track
+            self._stop_current()
+            self._cancel_np()
+            self._release_source()
+            # Detach the loop BEFORE awaiting the voice disconnect, which can wait up to 30 s
+            # for the gateway echo: reading `_task` after it could cancel a loop started meanwhile.
+            task, self._task = self._task, None
+            # `disconnect()` is also called from inside `_player_loop` (idle timeout). Cancelling
+            # the task we are running in leaves it in a half-cancelled state for no benefit.
+            if task and task is not asyncio.current_task() and not task.done():
+                task.cancel()
+            self.current = None
+            vc = self.voice
+            if vc:
+                try:
+                    await self._leave_voice(vc)
+                except Exception as e:
+                    log.debug("disconnect error: %s", e)
+            log.info("[%s] disconnected", self.guild.name)
 
     def _cancel_np(self) -> None:
         """Stop the live now-playing updater. It used to be cancelled only on the normal
@@ -250,10 +310,12 @@ class GuildPlayer:
             while True:
                 track = await self._next_track()
                 if track is None:          # idle timeout
-                    if not self.queue.is_empty:
+                    # A /play joining or resolving (_pending) or a connect in flight is about to
+                    # use the connection; leaving now would strand it. Wait another period.
+                    if not self.queue.is_empty or self._pending or self._connecting:
                         continue           # something arrived as the timer expired
                     await self._announce("💤 Nothing played for a while — leaving the voice channel.")
-                    if not self.queue.is_empty:
+                    if not self.queue.is_empty or self._pending or self._connecting:
                         # queued while that message was in flight; disconnect() would clear
                         # it and leave no loop running to play it
                         continue
