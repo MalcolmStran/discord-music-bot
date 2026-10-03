@@ -140,7 +140,16 @@ class Config:
             raise SystemExit("DISCORD_TOKEN is not set (put it in .env)")
         owners = frozenset(int(x) for x in os.getenv("OWNER_IDS", "").replace(";", ",").split(",") if x.strip().isdigit())
         cookies = os.getenv("YTDL_COOKIES_FILE", "").strip()
+        if cookies and not Path(cookies).exists():
+            # both yt-dlp callers skip a missing file without a word, so cookies looked
+            # configured while never being sent
+            log.warning("YTDL_COOKIES_FILE=%s does not exist; cookies will not be used. Under Docker "
+                        "the path is resolved inside the container: mount the file into it and "
+                        "point YTDL_COOKIES_FILE at the mounted path.", cookies)
         logs = os.getenv("LOG_DIR", "").strip()
+        # blank means "unset", like LOG_DIR: Path("") is ".", which moved the settings file
+        # out of the persisted volume
+        downloads = os.getenv("DOWNLOAD_DIR", "").strip()
         return cls(
             token=token,
             prefix=_prefix(),
@@ -158,7 +167,7 @@ class Config:
             rapidapi_key=(os.getenv("RAPIDAPI_KEY") or "").strip() or None,
             spotify_client_id=(os.getenv("SPOTIFY_CLIENT_ID") or "").strip() or None,
             spotify_client_secret=(os.getenv("SPOTIFY_CLIENT_SECRET") or "").strip() or None,
-            download_dir=Path(os.getenv("DOWNLOAD_DIR", "./downloads")),
+            download_dir=Path(downloads) if downloads else Path("./downloads"),
             log_dir=Path(logs) if logs else Path("./logs"),
             ytdl_cookies_file=Path(cookies) if cookies else None,
             log_level=_log_level(),

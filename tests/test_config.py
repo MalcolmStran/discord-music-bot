@@ -1,4 +1,7 @@
 """Environment parsing: degenerate values used to be accepted verbatim and brick the bot."""
+import logging
+from pathlib import Path
+
 import pytest
 
 from bot.config import Config, _bool, _float, _int, _log_level, _prefix
@@ -109,6 +112,41 @@ def test_derived_paths_live_under_download_dir(monkeypatch, tmp_path):
     monkeypatch.setenv("DOWNLOAD_DIR", str(tmp_path))
     cfg = Config.from_env()
     assert cfg.data_dir.parent == tmp_path and cfg.media_tmp_dir.parent == tmp_path
+
+
+@pytest.mark.parametrize("raw", ["", "   "])
+def test_blank_download_dir_falls_back_to_the_default(monkeypatch, raw):
+    """Path("") is ".", which put guild settings in ./bot_settings, outside the persisted
+    volume, so they were lost on every container rebuild."""
+    monkeypatch.setenv("DISCORD_TOKEN", "t")
+    monkeypatch.setenv("DOWNLOAD_DIR", raw)
+    cfg = Config.from_env()
+    assert cfg.download_dir == Path("./downloads")
+    assert cfg.data_dir == Path("./downloads/bot_settings")
+
+
+def test_missing_cookies_file_is_warned_about(monkeypatch, tmp_path, caplog):
+    """yt-dlp's callers skip a missing cookies file silently; under Docker a host path never
+    exists inside the container, so cookies looked configured but were never sent."""
+    monkeypatch.setenv("DISCORD_TOKEN", "t")
+    missing = tmp_path / "nope" / "cookies.txt"
+    monkeypatch.setenv("YTDL_COOKIES_FILE", str(missing))
+    with caplog.at_level(logging.WARNING, logger="bot.config"):
+        cfg = Config.from_env()
+    assert cfg.ytdl_cookies_file == missing
+    [rec] = [r for r in caplog.records if "YTDL_COOKIES_FILE" in r.getMessage()]
+    assert rec.levelno == logging.WARNING
+    assert str(missing) in rec.getMessage() and "inside the container" in rec.getMessage()
+
+
+def test_existing_cookies_file_is_not_warned_about(monkeypatch, tmp_path, caplog):
+    monkeypatch.setenv("DISCORD_TOKEN", "t")
+    jar = tmp_path / "cookies.txt"
+    jar.write_text("# Netscape HTTP Cookie File\n")
+    monkeypatch.setenv("YTDL_COOKIES_FILE", str(jar))
+    with caplog.at_level(logging.WARNING, logger="bot.config"):
+        Config.from_env()
+    assert not [r for r in caplog.records if "YTDL_COOKIES_FILE" in r.getMessage()]
 
 
 def test_blank_bool_falls_back_to_the_default(monkeypatch):
