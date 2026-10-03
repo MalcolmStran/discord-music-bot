@@ -30,6 +30,10 @@ class _Message:
         self.content = content
         self.author = _Author(uid, is_bot)
         self.guild = _Guild() if guild else None
+        self.edits = []
+
+    async def edit(self, **kw):
+        self.edits.append(kw)
 
 
 class _Cfg:
@@ -45,12 +49,16 @@ def cog(tmp_path: Path):
     c._inflight = set()
     c.converted = []
     c.suppressed = []
+    c.spoilered = []
+    c.failing = set()           # URLs whose conversion should fail
+    c.last = None
     c.stats = {"ok": 0, "failed": 0, "compressed": 0, "gif": 0, "skipped": 0}
 
-    async def _convert(message, url, kind, *, reply_errors, suppress_embeds=True):
+    async def _convert(message, url, kind, *, reply_errors, suppress_embeds=True, spoiler=False):
         c.converted.append((url, kind))
         c.suppressed.append(suppress_embeds)
-        return True
+        c.spoilered.append(spoiler)
+        return url not in c.failing
 
     async def _not_a_command(message):
         return False
@@ -62,8 +70,14 @@ def cog(tmp_path: Path):
 
 async def urls(cog, content, uid=100, **kw):
     cog.converted.clear()
-    await cog.on_message(_Message(content, uid=uid, **kw))
+    cog.last = _Message(content, uid=uid, **kw)
+    await cog.on_message(cog.last)
     return [u for u, _ in cog.converted]
+
+
+def suppressed(cog) -> bool:
+    """Whether the listener hid the message's embeds."""
+    return {"suppress": True} in cog.last.edits
 
 
 async def test_a_real_post_is_converted(cog):
@@ -147,12 +161,96 @@ async def test_a_fixer_link_in_the_message_stops_us_suppressing_its_embed(cog):
     x.com link would destroy the fxtwitter embed the listener skipped that link to keep —
     exactly the outcome this feature exists to prevent."""
     await urls(cog, "https://fxtwitter.com/a/1 and https://x.com/b/status/2")
-    assert cog.suppressed == [False]
+    assert cog.converted == [("https://x.com/b/status/2", "twitter")]
+    assert not suppressed(cog)
 
 
 async def test_embeds_are_still_suppressed_when_no_fixer_is_present(cog):
     await urls(cog, "https://x.com/b/status/2")
-    assert cog.suppressed == [True]
+    assert suppressed(cog)
+    assert cog.last.edits == [{"suppress": True}], "once, not once per link"
+
+
+async def test_embeds_are_suppressed_once_after_every_link_converted(cog):
+    await urls(cog, "https://x.com/a/status/1 https://www.tiktok.com/@u/video/2")
+    assert len(cog.converted) == 2
+    assert cog.suppressed == [False, False], "the listener decides once, after the loop"
+    assert cog.last.edits == [{"suppress": True}]
+
+
+# Discord's suppress flag hides every embed on the message, so it may only be set once each
+# link in it has been replaced by an upload.
+async def test_another_sites_embed_beside_the_tweet_is_kept(cog):
+    await urls(cog, "tweet https://x.com/a/status/1 and the song https://youtube.com/watch?v=abc")
+    assert cog.converted == [("https://x.com/a/status/1", "twitter")]
+    assert not suppressed(cog)
+
+
+async def test_a_third_link_past_the_cap_keeps_the_embeds(cog):
+    await urls(cog, " ".join(f"https://x.com/u/status/{i}" for i in range(3)))
+    assert len(cog.converted) == 2
+    assert not suppressed(cog)
+
+
+async def test_a_failed_conversion_keeps_the_embeds(cog):
+    cog.failing = {"https://x.com/b/status/2"}
+    await urls(cog, "https://x.com/a/status/1 https://x.com/b/status/2")
+    assert len(cog.converted) == 2
+    assert not suppressed(cog)
+
+
+async def test_trailing_punctuation_does_not_stop_suppression(cog):
+    """Both sides go through the same normalisation, so "(…/1)." still counts as converted."""
+    await urls(cog, "see (https://x.com/a/status/1).")
+    assert suppressed(cog)
+
+
+# ------------------------------------------------------------------- ||spoilers||
+async def test_a_spoilered_link_is_uploaded_as_a_spoiler_and_keeps_its_blurred_embed(cog):
+    await urls(cog, "ending spoiler ||https://x.com/a/status/1||")
+    assert cog.converted == [("https://x.com/a/status/1", "twitter")]
+    assert cog.spoilered == [True]
+    assert not suppressed(cog)
+
+
+async def test_one_spoilered_link_keeps_every_embed(cog):
+    """Suppression is per message: hiding the plain link's embed would hide the blurred
+    one too."""
+    await urls(cog, "https://x.com/a/status/1 and ||the twist\nhttps://x.com/b/status/2 ||")
+    assert cog.spoilered == [False, True]
+    assert not suppressed(cog)
+
+
+async def test_a_link_after_a_closed_spoiler_is_not_spoilered(cog):
+    await urls(cog, "||no peeking|| https://x.com/a/status/1")
+    assert cog.spoilered == [False]
+    assert suppressed(cog)
+
+
+# ------------------------------------------------------------- the same post twice
+@pytest.mark.parametrize("second", [
+    "https://x.com/a/status/1",
+    "https://x.com/a/status/1).",
+    "https://twitter.com/a/status/1",
+    "https://mobile.twitter.com/a/status/1?s=20",
+    "https://www.x.com/a/status/1/",
+])
+async def test_the_same_post_twice_is_converted_once(cog, second):
+    await urls(cog, f"lol https://x.com/a/status/1 {second}")
+    assert cog.converted == [("https://x.com/a/status/1", "twitter")]
+    assert suppressed(cog), "every link in the message is the converted post"
+
+
+async def test_the_cap_counts_distinct_posts(cog):
+    """A repeat used to take one of the two slots, silently dropping a different link."""
+    await urls(cog, "https://x.com/a/status/1 https://twitter.com/a/status/1 https://x.com/b/status/2")
+    assert [u for u, _ in cog.converted] == ["https://x.com/a/status/1", "https://x.com/b/status/2"]
+
+
+async def test_a_repeat_inside_a_spoiler_blurs_the_upload(cog):
+    await urls(cog, "https://x.com/a/status/1 ||https://x.com/a/status/1||")
+    assert cog.spoilered == [True]
+    assert not suppressed(cog)
 
 
 async def test_skipped_fixer_links_are_counted(cog):

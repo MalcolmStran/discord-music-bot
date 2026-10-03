@@ -18,6 +18,9 @@ from ..core.settings import GuildSettings
 log = logging.getLogger(__name__)
 
 URL_RE = re.compile(r"https?://[^\s<>()\[\]]+", re.I)
+# A ||spoiler|| span, non-greedy and across lines. A stray "||" can make a link look
+# spoilered when it is not, which only ever errs towards hiding it.
+_SPOILER_RE = re.compile(r"\|\|.+?\|\|", re.S)
 _ON_WORDS = ("on", "yes", "true", "1", "enable", "enabled", "start")
 _OFF_WORDS = ("off", "no", "false", "0", "disable", "disabled", "stop")
 # Trailing characters Discord markdown / prose commonly glues onto a link.
@@ -134,6 +137,18 @@ def normalise(url: str, kind: str) -> str:
     return urlunsplit(("https", target, parts.path, parts.query, ""))
 
 
+def _post_key(url: str, kind: str) -> tuple[str, str, str]:
+    """Which post a supported link points at, to spot the same one twice in a message.
+
+    The raw string was not enough: x.com / twitter.com / mobile.twitter.com forms and
+    ?s=20 share-tracking queries of one tweet each got converted and uploaded again. The
+    query is dropped because the post id lives in the path on both sites.
+    """
+    parts = urlsplit(normalise(url, kind))
+    host = CANONICAL_HOST["twitter"] if kind == "twitter" else (parts.hostname or "").lower()
+    return kind, host, parts.path.rstrip("/")
+
+
 class Media(commands.Cog):
     """Twitter/X & TikTok → MP4, compressed to fit the server's upload limit."""
 
@@ -182,9 +197,18 @@ class Media(commands.Cog):
             return  # the command path handles it (/convert), don't convert twice
         if not self.settings.media_enabled(message.guild.id):
             return
+        spoilers = [m.span() for m in _SPOILER_RE.finditer(message.content)]
         # One parse per URL: classify() and is_embed_fixer() each re-parsed it otherwise.
-        links, fixers = [], 0
-        for u in URL_RE.findall(message.content):
+        links: dict[tuple[str, str, str], list] = {}   # post -> [url, kind, spoiler], first seen wins
+        found: list[Optional[tuple[str, str, str]]] = []  # each URL's post, None if we don't convert it
+        fixers, any_spoiler = 0, False
+        for m in URL_RE.finditer(message.content):
+            u = m.group()
+            # Test where the link STARTS: URL_RE runs on through the closing "||", so the
+            # match always ends past the spoiler span it sits in.
+            spoiler = any(s <= m.start() < e for s, e in spoilers)
+            any_spoiler = any_spoiler or spoiler
+            found.append(None)
             host = _host(u)
             kind = classify_host(host)
             if not kind:
@@ -193,7 +217,11 @@ class Media(commands.Cog):
                 # already embeds its own video; converting would post the clip twice
                 fixers += 1
                 continue
-            links.append((u, kind))
+            key = found[-1] = _post_key(u, kind)
+            if key in links:
+                links[key][2] = links[key][2] or spoiler    # spoilered anywhere → upload blurred
+            else:
+                links[key] = [u, kind, spoiler]
         self.stats["skipped"] += fixers
         if not links:
             return
@@ -206,9 +234,22 @@ class Media(commands.Cog):
             return
         self._inflight.add(message.id)
         try:
-            for url, kind in links[:2]:
-                await self.convert_and_send(message, normalise(url, kind), kind, reply_errors=False,
-                                            suppress_embeds=not fixers)
+            done = set()
+            for key, (url, kind, spoiler) in list(links.items())[:2]:
+                if await self.convert_and_send(message, normalise(url, kind), kind, reply_errors=False,
+                                               suppress_embeds=False, spoiler=spoiler):
+                    done.add(key)
+            # Discord's suppress flag removes EVERY embed on the message, so drop them only
+            # once each link in it has been replaced by an upload. Suppressing per conversion
+            # wiped the embeds of a YouTube link beside the tweet, of a third link past the
+            # cap, of a link whose conversion failed, and of an embed-fixer link (which the
+            # listener skipped precisely to keep its embed). A spoilered link's embed is the
+            # blurred copy the poster chose, so a spoiler anywhere keeps them all.
+            if not any_spoiler and all(k in done for k in found):
+                try:
+                    await message.edit(suppress=True)
+                except discord.HTTPException:
+                    pass
         finally:
             self._inflight.discard(message.id)
 
@@ -229,7 +270,7 @@ class Media(commands.Cog):
 
     # ---------------------------------------------------------------- core
     async def convert_and_send(self, message: discord.Message, url: str, kind: str, *,
-                               reply_errors: bool, suppress_embeds: bool = True) -> bool:
+                               reply_errors: bool, suppress_embeds: bool = True, spoiler: bool = False) -> bool:
         guild = message.guild
         assert guild is not None
         limit = guild.filesize_limit                     # honours server boost level
@@ -272,12 +313,13 @@ class Media(commands.Cog):
                 else:
                     out = src
             ext = out.suffix.lower().lstrip(".") or "mp4"
-            await message.reply(file=discord.File(out, filename=f"{kind}.{ext}"), mention_author=False)
+            # A link posted inside ||spoiler|| tags must not come back as a clip playing inline.
+            await message.reply(file=discord.File(out, filename=f"{kind}.{ext}", spoiler=spoiler),
+                                mention_author=False)
             self.stats["ok"] += 1
             # Tidy: drop the original embed if we can. Discord's suppress flag applies to the
-            # WHOLE message, so when the same message also carries an embed-fixer link we
-            # must leave it alone — suppressing here would destroy the very embed the
-            # listener skipped that link to preserve.
+            # WHOLE message, which is why the listener passes False and decides once, after
+            # all its links are done. An explicit /convert still suppresses straight away.
             if suppress_embeds:
                 try:
                     await message.edit(suppress=True)
