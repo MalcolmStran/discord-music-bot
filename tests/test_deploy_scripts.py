@@ -119,3 +119,52 @@ def test_entrypoint_self_update_keeps_the_requirement_extras(sandbox):
     specs = [a for a in pip if _ytdlp_extras(a) is not None]
     assert specs, pip
     assert _ytdlp_extras(specs[0]) == _requirement_extras()
+
+
+# ---------------------------------------------------------------- run.sh settings volume
+
+def _run_sh_in(tmp_path, dirname, dotenv=""):
+    checkout = tmp_path / dirname
+    checkout.mkdir()
+    shutil.copy2(RUN_SH, checkout / "run.sh")
+    (checkout / ".env").write_text(dotenv)
+    return checkout / "run.sh"
+
+
+def _downloads_volume(recorded):
+    (run,) = [c for c in recorded if c[:2] == ["docker", "run"]]
+    vols = [run[i + 1] for i, a in enumerate(run) if a == "-v"]
+    (vol,) = [v for v in vols if v.endswith(":/app/downloads")]
+    return vol.removesuffix(":/app/downloads")
+
+
+# Expected names are what `docker compose config` (v5.1.1) reports for a checkout in that
+# directory: lowercase, keep only [a-z0-9_-], trim leading - and _.
+@pytest.mark.parametrize(("dirname", "project"), [
+    ("discord-music-bot", "discord-music-bot"),
+    ("musicbot", "musicbot"),
+    ("My.Music Bot", "mymusicbot"),
+    ("__-Weird_Dir!", "weird_dir"),
+    ("ÄbcDé", "bcd"),
+])
+def test_run_sh_mounts_the_volume_compose_would_for_the_checkout_dir(sandbox, tmp_path, dirname, project):
+    """A hard-coded discord-music-bot_ prefix gave other clones an empty settings volume."""
+    proc, recorded = sandbox(_run_sh_in(tmp_path, dirname))
+    assert proc.returncode == 0, proc.stderr
+    assert _downloads_volume(recorded) == f"{project}_bot-downloads"
+
+
+def test_run_sh_honours_compose_project_name_from_the_environment(sandbox, tmp_path):
+    script = _run_sh_in(tmp_path, "discord-music-bot", dotenv="COMPOSE_PROJECT_NAME=fromdotenv\n")
+    proc, recorded = sandbox(script, COMPOSE_PROJECT_NAME="fromenv")
+    assert proc.returncode == 0, proc.stderr
+    assert _downloads_volume(recorded) == "fromenv_bot-downloads"
+
+
+def test_run_sh_honours_compose_project_name_from_dotenv(sandbox, tmp_path):
+    """Compose reads COMPOSE_PROJECT_NAME from the project's .env too (CRLF tolerated)."""
+    script = _run_sh_in(tmp_path, "discord-music-bot",
+                        dotenv="DISCORD_TOKEN=x\r\nCOMPOSE_PROJECT_NAME=fromdotenv\r\n")
+    proc, recorded = sandbox(script)
+    assert proc.returncode == 0, proc.stderr
+    assert _downloads_volume(recorded) == "fromdotenv_bot-downloads"
