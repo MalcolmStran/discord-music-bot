@@ -8,6 +8,7 @@ These are repository checks, so they skip where the scripts are not next to test
 Docker image ships bot/ and tests/ under /app, with the entrypoint at /entrypoint.sh).
 """
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -18,6 +19,7 @@ import pytest
 REPO = Path(__file__).resolve().parent.parent
 ENTRYPOINT = REPO / "entrypoint.sh"
 RUN_SH = REPO / "run.sh"
+REQUIREMENTS = REPO / "requirements.txt"
 BASH = shutil.which("bash")
 
 pytestmark = pytest.mark.skipif(
@@ -62,6 +64,19 @@ def sandbox(tmp_path):
     return run
 
 
+def _ytdlp_extras(spec: str):
+    m = re.match(r"\s*yt-dlp(?:\[([^\]]*)\])?", spec)
+    if not m:
+        return None
+    return {e.strip() for e in (m.group(1) or "").split(",") if e.strip()}
+
+
+def _requirement_extras():
+    for line in REQUIREMENTS.read_text().splitlines():
+        extras = _ytdlp_extras(line)
+        if extras is not None:
+            return extras
+    raise AssertionError("requirements.txt has no yt-dlp line")
 
 
 # ---------------------------------------------------------------- entrypoint.sh self-update
@@ -90,3 +105,17 @@ def test_entrypoint_says_so_when_the_self_update_is_off(sandbox, value):
     assert f"self-update disabled (YTDLP_AUTO_UPDATE={value})" in proc.stdout
     assert recorded[-1][0] == "setpriv", "the bot was not started"
 
+
+def test_requirements_ship_the_js_runtime_yt_dlp_uses_by_default():
+    """yt-dlp enables only Deno unless told otherwise (Debian's Node is below its 22+ floor
+    anyway), and solves YouTube's challenges with the yt-dlp-ejs scripts from `default`."""
+    assert {"default", "deno"} <= _requirement_extras()
+
+
+def test_entrypoint_self_update_keeps_the_requirement_extras(sandbox):
+    """A bare `pip install -U yt-dlp` upgrades yt-dlp past the yt-dlp-ejs it pins."""
+    _, recorded = sandbox(ENTRYPOINT)
+    (pip,) = _pip_calls(recorded)
+    specs = [a for a in pip if _ytdlp_extras(a) is not None]
+    assert specs, pip
+    assert _ytdlp_extras(specs[0]) == _requirement_extras()

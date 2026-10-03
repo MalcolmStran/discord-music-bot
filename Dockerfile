@@ -5,9 +5,11 @@ ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     DOCKER_CONTAINER=true
 
-# ffmpeg for audio/video, libopus for voice, nodejs as yt-dlp's JS runtime (YouTube signature solving)
+# ffmpeg for audio/video, libopus for voice. yt-dlp's JS runtime (YouTube signature solving)
+# is Deno from the yt-dlp[deno] extra in requirements.txt, not apt's nodejs: yt-dlp only
+# enables Deno by default and rejects Node below 22, which is newer than Debian ships.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ffmpeg libopus0 nodejs ca-certificates tini \
+        ffmpeg libopus0 ca-certificates tini \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
