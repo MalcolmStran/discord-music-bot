@@ -275,19 +275,20 @@ class Media(commands.Cog):
             self._inflight.discard(message.id)
 
     async def _is_command_invocation(self, message: discord.Message) -> bool:
-        """True if this message starts with any prefix the bot answers to.
+        """True if this message is a real command: a prefix the bot answers to AND a known
+        command, which the command path handles (/convert), so don't convert twice.
 
         `commands.when_mentioned_or(...)` means the bot mention is a prefix as well as the
         configured one, so checking only cfg.prefix let `@Bot convert <link>` be converted
-        twice — once here and once by the command.
+        twice. But a prefix alone was too broad: "!!! look <link>" or "@Bot what is this
+        <link>" runs no command (CommandNotFound is ignored), so the link was silently
+        dropped.
         """
         try:
-            prefixes = await self.bot.get_prefix(message)
+            ctx = await self.bot.get_context(message)
         except Exception:
-            prefixes = self.cfg.prefix
-        if isinstance(prefixes, str):
-            prefixes = [prefixes]
-        return any(p and message.content.startswith(p) for p in prefixes)
+            return message.content.startswith(self.cfg.prefix)
+        return ctx.valid
 
     # ---------------------------------------------------------------- core
     async def convert_and_send(self, message: discord.Message, url: str, kind: str, *,

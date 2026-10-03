@@ -1,11 +1,14 @@
 """/autoconvert: the per-user opt-out command's own contract.
 
 Driven through the real callback, because the app_commands choices only constrain the slash
-form — the prefix form accepts any string.
+form — the prefix form accepts any string. Also: which messages count as a command
+invocation, so the auto-converter leaves them to the command path.
 """
 from pathlib import Path
 
+import discord
 import pytest
+from discord.ext import commands
 
 from bot.cogs.media import Media
 from bot.core.settings import GuildSettings
@@ -75,6 +78,62 @@ async def test_no_argument_reports_the_current_state_without_changing_it(cog):
     reply2 = await run(cog, ctx2, None)
     assert cog.settings.is_media_optout(7) is True, "reporting must not flip the setting"
     assert reply2 != reply
+
+
+# ------------------------------------------- which messages the listener leaves to commands
+BOT_ID = 999
+
+
+class _User:
+    def __init__(self, uid):
+        self.id = uid
+
+
+class _Msg:
+    _state = None
+
+    def __init__(self, content):
+        self.content = content
+        self.author = _User(100)
+        self.guild = None
+
+
+@pytest.fixture
+async def real_bot():
+    """A real commands.Bot with the production prefix setup and the commands that take a
+    link, so get_context resolves exactly as it does in MusicBot."""
+    bot = commands.Bot(command_prefix=commands.when_mentioned_or("!"), intents=discord.Intents.default(),
+                       help_command=None)
+    bot._connection.user = _User(BOT_ID)
+
+    @bot.command(name="convert")
+    async def convert(ctx, url: str): ...
+
+    @bot.command(name="play")
+    async def play(ctx, *, query: str): ...
+
+    yield bot
+    await bot.close()
+
+
+class _Cfg:
+    prefix = "!"
+
+
+@pytest.mark.parametrize("content,is_command", [
+    ("!convert https://x.com/a/status/1", True),
+    (f"<@{BOT_ID}> convert https://x.com/a/status/1", True),
+    ("!play https://x.com/a/status/1", True),
+    # a prefix but no command: nothing else will handle these, so the listener must
+    ("!!! look at this https://x.com/someone/status/123", False),
+    (f"<@{BOT_ID}> what is this https://www.tiktok.com/@a/video/1", False),
+    ("! https://x.com/a/status/1", False),
+    ("look https://x.com/a/status/1", False),
+])
+async def test_only_a_real_command_is_left_to_the_command_path(real_bot, content, is_command):
+    c = Media.__new__(Media)
+    c.bot, c.cfg = real_bot, _Cfg()
+    assert await c._is_command_invocation(_Msg(content)) is is_command
 
 
 async def test_the_command_only_affects_the_caller(cog):
