@@ -26,7 +26,10 @@ RUN chmod +x /entrypoint.sh \
     && mkdir -p /app/downloads /app/logs && chown -R app:app /app
 
 # `python -m bot` exits on an unrecoverable error, so restart:unless-stopped covers a crash.
-# This catches the other failure mode: the process alive but the gateway connection dead.
+# This check only REPORTS the other failure mode, the process alive but the gateway dead, as
+# `(unhealthy)` in `docker ps`: plain Docker and compose never restart a container for being
+# unhealthy (only Swarm does). The restart for that case comes from the bot's own watchdog,
+# which exits the process when the heartbeat goes stale, plus restart:unless-stopped.
 HEALTHCHECK --interval=60s --timeout=10s --start-period=90s --retries=3 \
     CMD python -c "import os,pathlib,sys,time; \
 p=pathlib.Path(os.environ.get('LOG_DIR') or '/app/logs')/'healthy'; \
