@@ -3,12 +3,18 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 import math
+import os
 import signal
 import sys
+import threading
+import time
+from collections.abc import Callable
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
+from typing import Optional
 
 import discord
 from discord import app_commands
@@ -20,6 +26,12 @@ from .core.spotify import Spotify
 from .core.ytdl import YTDL
 
 EXTENSIONS = ("bot.cogs.music", "bot.cogs.media")
+
+# How long the gateway may stay dead before the watchdog ends the process. Generous on
+# purpose: discord.py rides out short outages by itself, and every restart re-runs the
+# entrypoint's yt-dlp update and a fresh IDENTIFY.
+WATCHDOG_LIMIT = 600
+WATCHDOG_POLL = 30
 
 
 def setup_logging(level: str, log_dir: Path = Path("logs")) -> None:
@@ -59,6 +71,9 @@ class MusicBot(commands.Bot):
         self.spotify = Spotify(cfg.spotify_client_id, cfg.spotify_client_secret, max_tracks=cfg.max_queue_size)
         self.settings = GuildSettings(cfg.data_dir / "guild_settings.json", media_default=cfg.media_enabled_default)
         self.log = logging.getLogger("bot")
+        # time.monotonic() of the last heartbeat that saw a live gateway. None until the
+        # first one, so the watchdog never fires during a slow login or first READY.
+        self.last_beat: Optional[float] = None
 
     async def setup_hook(self) -> None:
         # slash failures are dispatched through the tree, not through on_command_error
@@ -70,18 +85,17 @@ class MusicBot(commands.Bot):
         self.loop.create_task(self._heartbeat(), name="heartbeat")
 
     def command_signature(self) -> str:
-        """Fingerprint of the local app-command surface, to skip no-op global syncs."""
-        parts = []
-        for cmd in sorted(self.tree.get_commands(), key=lambda c: c.qualified_name):
-            params = getattr(cmd, "parameters", ()) or ()
-            parts.append("|".join([
-                cmd.qualified_name,
-                getattr(cmd, "description", "") or "",
-                str(getattr(cmd, "default_permissions", None)),
-                str(getattr(cmd, "guild_only", False)),
-                ",".join(f"{p.name}:{p.type}:{p.required}" for p in params),
-            ]))
-        return hashlib.sha256("\n".join(parts).encode()).hexdigest()
+        """Fingerprint of the local app-command surface, to skip no-op global syncs.
+
+        Hashes exactly the payload `tree.sync()` sends, plus the application id. A
+        hand-picked subset of fields used to miss changed choices and descriptions, so
+        those were never published; and without the application id, pointing the same
+        data volume at a different bot skipped its first sync and left it with no slash
+        commands at all.
+        """
+        cmds = [c.to_dict(self.tree) for c in sorted(self.tree.get_commands(), key=lambda c: c.qualified_name)]
+        blob = json.dumps({"app": self.application_id, "cmds": cmds}, sort_keys=True, default=str)
+        return hashlib.sha256(blob.encode()).hexdigest()
 
     async def _sync_commands(self) -> None:
         """Publish slash commands, but only when they actually changed.
@@ -106,14 +120,19 @@ class MusicBot(commands.Bot):
     async def _heartbeat(self) -> None:
         """Touch a file while the gateway is actually alive.
 
-        `restart: unless-stopped` only catches the process dying. This catches the other
-        failure mode — the process up but the websocket wedged — which the Docker
-        HEALTHCHECK then turns into a restart.
+        `restart: unless-stopped` only catches the process dying. The other failure mode
+        is the process up but the websocket wedged. The Docker HEALTHCHECK reads this
+        file, but a failing healthcheck only marks the container unhealthy; Docker never
+        restarts it for that. What turns a dead gateway into a restart is the watchdog
+        thread (`start_watchdog`), which reads `last_beat` and ends the process.
         """
         beat = self.cfg.log_dir / "healthy"
         while not self.is_closed():
             try:
                 if self.is_ready() and math.isfinite(self.latency):   # NaN before the first heartbeat
+                    # Before the touch, not after: an unwritable logs dir must not make the
+                    # watchdog restart a bot whose gateway is perfectly healthy.
+                    self.last_beat = time.monotonic()
                     beat.parent.mkdir(parents=True, exist_ok=True)
                     beat.touch()
             except OSError as e:
@@ -144,7 +163,10 @@ class MusicBot(commands.Bot):
         if isinstance(error, commands.CommandOnCooldown):
             await ctx.send(f"⏳ Slow down — try again in {error.retry_after:.0f}s.")
             return
-        if isinstance(error, (commands.MissingRequiredArgument, commands.BadArgument)):
+        # UserInputError, not just MissingRequiredArgument/BadArgument: an unbalanced quote
+        # (`!convert "https://…`) raises an ArgumentParsingError, which used to fall through
+        # to "something went wrong" and an ERROR traceback for a typo.
+        if isinstance(error, commands.UserInputError):
             await ctx.send(f"Usage: `{ctx.prefix}{ctx.command.qualified_name} {ctx.command.signature}`")  # type: ignore[union-attr]
             return
         if isinstance(error, commands.CheckFailure):
@@ -175,6 +197,34 @@ class MusicBot(commands.Bot):
                 await interaction.response.send_message(msg, ephemeral=True)
         except discord.HTTPException:
             pass
+
+
+def _watchdog(bot: MusicBot, limit: float, poll: float, exit_fn: Callable[[int], object]) -> None:
+    while True:
+        time.sleep(poll)
+        last = bot.last_beat
+        if last is None:         # not armed until the gateway has been alive once
+            continue
+        age = time.monotonic() - last
+        if age > limit:
+            bot.log.critical("gateway dead for %.0fs (no good heartbeat); exiting so the "
+                             "container's restart policy can recover", age)
+            exit_fn(1)
+            return
+
+
+def start_watchdog(bot: MusicBot, *, limit: float = WATCHDOG_LIMIT, poll: float = WATCHDOG_POLL,
+                   exit_fn: Callable[[int], object] = os._exit) -> threading.Thread:
+    """End the process once the gateway has been dead for `limit` seconds.
+
+    A failing HEALTHCHECK never restarts a container (restart policies act only when the
+    process exits), so a wedged bot used to sit offline, merely marked unhealthy. A thread
+    rather than a task, so it still fires when the event loop itself is blocked; and
+    os._exit, because close() can hang on a dead gateway.
+    """
+    t = threading.Thread(target=_watchdog, args=(bot, limit, poll, exit_fn), name="watchdog", daemon=True)
+    t.start()
+    return t
 
 
 def build_help(bot: MusicBot) -> None:
@@ -221,6 +271,11 @@ async def main() -> None:
         raise SystemExit(f"cannot create {cfg.download_dir}: {e}") from e
     bot = MusicBot(cfg)
     build_help(bot)
+    # Only under Docker, where a restart policy brings the process back. A bare
+    # `python -m bot` has no supervisor, so exiting there would turn a long Discord outage
+    # that discord.py rides out by itself into a bot that stays down for good.
+    if os.environ.get("DOCKER_CONTAINER", "").strip().lower() == "true":
+        start_watchdog(bot)
 
     loop = asyncio.get_running_loop()
     stop = asyncio.Event()
@@ -236,7 +291,12 @@ async def main() -> None:
         done, pending = await asyncio.wait({runner, waiter}, return_when=asyncio.FIRST_COMPLETED)
         try:
             if runner in done:
-                runner.result()    # re-raise login errors etc.
+                try:
+                    runner.result()    # re-raise login errors etc.
+                except discord.PrivilegedIntentsRequired:
+                    # The commonest setup mistake: say what to do instead of a traceback.
+                    raise SystemExit("Message Content intent is not enabled for this bot: turn it on under "
+                                     "Developer Portal -> Bot -> Privileged Gateway Intents, then restart") from None
             else:
                 logging.getLogger("bot").info("shutdown signal received")
                 await bot.close()  # lets `start()` finish its own gateway teardown
