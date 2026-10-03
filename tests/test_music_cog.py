@@ -1,5 +1,12 @@
-"""Pure helpers from the music cog (no Discord objects needed)."""
-from bot.cogs.music import split_too_long
+"""Helpers and command output of the music cog (no Discord connection needed)."""
+import logging
+import types
+
+from discord.ext import commands
+from discord.ext.commands.view import StringView
+
+from bot.cogs.music import Music, split_too_long
+from bot.core.player import GuildPlayer
 from bot.core.ytdl import Track
 
 MAX = 7200
@@ -111,3 +118,99 @@ def test_restored_volume_is_clamped():
 def test_restored_negative_volume_is_clamped():
     p = restore({(1, "volume"): -5.0})
     assert p.volume == 0.0
+
+
+# ------------------------------------------------- command output (real Music commands)
+class _Sink:
+    def __init__(self):
+        self.sent = []
+
+    async def send(self, content=None, **kw):
+        self.sent.append(content if content is not None else kw.get("embed"))
+
+
+def _cog_and_player():
+    """The real Music cog and a real GuildPlayer, with no voice connection."""
+    guild = types.SimpleNamespace(id=1, name="g", voice_client=None, get_member=lambda uid: None)
+    player = GuildPlayer(None, guild, None, max_queue=50, default_volume=0.5, idle_seconds=300)
+    cog = Music.__new__(Music)
+    cog.players = {guild.id: player}
+    sink = _Sink()
+    ctx = types.SimpleNamespace(guild=guild, send=sink.send, prefix="!", command=None)
+    return cog, player, ctx, sink
+
+
+async def test_nowplaying_shows_the_track_being_resolved_not_the_finished_one():
+    """While the next stream resolves, `current` is still the track that just ended, so
+    /nowplaying reported it as "Now playing" with a stale progress bar."""
+    cog, player, ctx, sink = _cog_and_player()
+    player.current, player._loading = t("finished", 100), t("next up", 100)
+    await Music.nowplaying.callback(cog, ctx)
+    assert isinstance(sink.sent[-1], str), "no now-playing embed for a track that has ended"
+    assert "Loading" in sink.sent[-1] and "next up" in sink.sent[-1]
+    assert "finished" not in sink.sent[-1]
+
+
+async def test_nowplaying_during_the_first_resolve_is_not_nothing_playing():
+    cog, player, ctx, sink = _cog_and_player()
+    player._loading = t("first", 100)
+    await Music.nowplaying.callback(cog, ctx)
+    assert "Loading" in sink.sent[-1] and "first" in sink.sent[-1]
+
+
+async def test_queue_lists_the_track_being_resolved():
+    """It had left the queue and was not `current`, so it appeared nowhere."""
+    cog, player, ctx, sink = _cog_and_player()
+    player.current, player._loading = t("finished", 100), t("next up", 100)
+    player.queue.extend([t("later", 100)])
+    await Music.queue.callback(cog, ctx, page=1)
+    embed = sink.sent[-1]
+    assert not isinstance(embed, str)
+    top = embed.fields[0]
+    assert "Loading" in top.name and "next up" in top.value
+    assert all("finished" not in f.value for f in embed.fields)
+    assert "later" in embed.description
+
+
+async def test_queue_during_the_first_resolve_is_not_empty():
+    cog, player, ctx, sink = _cog_and_player()
+    player._loading = t("first", 100)
+    await Music.queue.callback(cog, ctx, page=1)
+    assert sink.sent[-1] != "Queue is empty."
+    assert "first" in sink.sent[-1].fields[0].value
+
+
+async def test_remove_escapes_markdown_in_the_title(monkeypatch):
+    cog, player, ctx, sink = _cog_and_player()
+
+    async def same_channel(ctx, player):
+        return True
+
+    monkeypatch.setattr(cog, "_require_same_channel", same_channel)
+    player.queue.extend([t("**LIVE** ||spoiler|| __2024__", 100)])
+    await Music.remove.callback(cog, ctx, position=1)
+    assert sink.sent[-1] == "🗑️ Removed **\\*\\*LIVE\\*\\* \\|\\|spoiler\\|\\| \\_\\_2024\\_\\_**."
+
+
+async def test_volume_reads_back_the_level_that_was_set():
+    """`/volume 29` stored 0.29 and a bare `/volume` then said 28% (int truncation)."""
+    cog, player, ctx, sink = _cog_and_player()
+    player.set_volume(29 / 100)
+    await Music.volume.callback(cog, ctx, level=None)
+    assert sink.sent[-1] == "🔊 Volume: 29%"
+
+
+async def test_an_unbalanced_quote_gets_the_argument_hint_not_an_internal_error(caplog):
+    """`!remove "1` raises ExpectedClosingQuoteError, a UserInputError but not a
+    BadArgument: it fell through to "Something went wrong" and an ERROR traceback."""
+    cog, _, ctx, sink = _cog_and_player()
+    try:
+        StringView('"1').get_quoted_word()           # how discord.py parses `!remove "1`
+    except commands.ExpectedClosingQuoteError as e:
+        error = e
+    else:
+        raise AssertionError("discord.py no longer rejects an unbalanced quote")
+    with caplog.at_level(logging.ERROR, logger="bot.cogs.music"):
+        await Music.cog_command_error(cog, ctx, error)
+    assert sink.sent == ["That argument doesn't look right — check `/help`."]
+    assert not caplog.records, "a typo must not be logged as an internal error"

@@ -290,6 +290,21 @@ class GuildPlayer:
         return bool(vc and vc.is_paused())
 
     @property
+    def loading(self) -> Optional[Track]:
+        """The track whose stream is being resolved, if any.
+
+        `current` still names the PREVIOUS track for those seconds (loop modes need it), so
+        /nowplaying and /queue built on it alone showed a finished song as playing.
+        """
+        return self._loading
+
+    @property
+    def volume_percent(self) -> int:
+        """Volume as the whole percentage the user set. `int()` truncated binary floats, so
+        `/volume 29` (stored as 0.29, i.e. 28.999…) read back as 28%."""
+        return round(self.volume * 100)
+
+    @property
     def position(self) -> float:
         if not self.current or not self.started_at:
             return 0.0
@@ -573,7 +588,7 @@ class GuildPlayer:
         if track.requester_id:
             m = self.guild.get_member(track.requester_id)
             who = m.display_name if m else str(track.requester_id)
-            e.set_footer(text=f"Requested by {who} · volume {int(self.volume * 100)}%")
+            e.set_footer(text=f"Requested by {who} · volume {self.volume_percent}%")
         if track.thumbnail:
             e.set_thumbnail(url=track.thumbnail)
         return e

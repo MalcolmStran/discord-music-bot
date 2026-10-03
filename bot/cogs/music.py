@@ -363,7 +363,7 @@ class Music(commands.Cog):
     async def volume(self, ctx: commands.Context, level: Optional[int] = None):
         player = self.player(ctx.guild)  # type: ignore[arg-type]
         if level is None:
-            return await ctx.send(f"🔊 Volume: {int(player.volume * 100)}%")
+            return await ctx.send(f"🔊 Volume: {player.volume_percent}%")
         if not await self._require_same_channel(ctx, player):
             return
         if not 0 <= level <= 150:
@@ -378,14 +378,21 @@ class Music(commands.Cog):
     async def queue(self, ctx: commands.Context, page: int = 1):
         player = self.player(ctx.guild)  # type: ignore[arg-type]
         items = player.queue.snapshot()
-        if not items and not player.current:
+        # The track being resolved has left the queue but is not `current` yet (which still
+        # names the finished one), so it appeared nowhere and a first track read as empty.
+        loading = player.loading
+        if not items and not player.current and not loading:
             return await ctx.send("Queue is empty.")
         per = 10
         pages = max(1, (len(items) + per - 1) // per)
         page = max(1, min(page, pages))
         start = (page - 1) * per
         e = discord.Embed(title=f"📋 Queue — page {page}/{pages}", color=0x5865F2)
-        if player.current:
+        if loading:
+            e.add_field(name="⏳ Loading",
+                        value=f"**{escape_markdown(loading.title[:200])}** `{loading.pretty_duration}`",
+                        inline=False)
+        elif player.current:
             e.add_field(name="Now playing",
                         value=f"**{escape_markdown(player.current.title[:200])}** `{player.current.pretty_duration}`",
                         inline=False)
@@ -399,6 +406,10 @@ class Music(commands.Cog):
     @commands.guild_only()
     async def nowplaying(self, ctx: commands.Context):
         player = self.player(ctx.guild)  # type: ignore[arg-type]
+        # Checked first: while the next stream resolves, `current` is still the track that
+        # just ended, and the embed showed it as "Now playing" with a stale progress bar.
+        if player.loading:
+            return await ctx.send(f"⏳ Loading **{escape_markdown(player.loading.title[:200])}**…")
         if not player.current:
             return await ctx.send("Nothing is playing.")
         await ctx.send(embed=player.now_playing_embed())
@@ -441,7 +452,7 @@ class Music(commands.Cog):
         if not await self._require_same_channel(ctx, player):
             return
         t = player.queue.remove(position - 1)
-        await ctx.send(f"🗑️ Removed **{t.title}**." if t else "No track at that position.")
+        await ctx.send(f"🗑️ Removed **{escape_markdown(t.title[:200])}**." if t else "No track at that position.")
 
     @commands.hybrid_command(name="move", description="Move a queued track to another position")
     @commands.guild_only()
@@ -493,7 +504,7 @@ class Music(commands.Cog):
         e = discord.Embed(title="🔊 Player status", color=0x57F287 if player.connected else 0xED4245)
         e.add_field(name="Connected", value=f"{'✅ ' + player.channel.name if player.connected else '❌ no'}", inline=True)  # type: ignore[union-attr]
         e.add_field(name="State", value="playing" if vc and vc.is_playing() else "paused" if vc and vc.is_paused() else "idle", inline=True)
-        e.add_field(name="Volume", value=f"{int(player.volume * 100)}%", inline=True)
+        e.add_field(name="Volume", value=f"{player.volume_percent}%", inline=True)
         e.add_field(name="Queue", value=f"{len(player.queue)}/{player.queue.max_size}", inline=True)
         e.add_field(name="Loop", value=player.loop_mode.value, inline=True)
         e.add_field(name="Latency", value=f"{vc.latency * 1000:.0f} ms" if vc and vc.latency else "—", inline=True)
@@ -507,7 +518,9 @@ class Music(commands.Cog):
             await ctx.send("Music commands only work in a server.")
         elif isinstance(error, commands.MissingRequiredArgument):
             await ctx.send(f"Usage: `{ctx.prefix}{ctx.command.qualified_name} {ctx.command.signature}`")  # type: ignore[union-attr]
-        elif isinstance(error, commands.BadArgument):
+        elif isinstance(error, commands.UserInputError):
+            # not just BadArgument: an unbalanced quote (`!remove "1`) raises an
+            # ArgumentParsingError, which fell through to "something went wrong" plus a traceback
             await ctx.send("That argument doesn't look right — check `/help`.")
         elif isinstance(error, commands.CheckFailure):
             await ctx.send("🚫 You can't use that here.")

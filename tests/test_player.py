@@ -532,6 +532,35 @@ async def test_a_stop_during_the_resolve_does_not_requeue_under_loop_all(monkeyp
     assert p.queue.is_empty
 
 
+def test_loading_exposes_the_track_being_resolved():
+    p = make_player()
+    assert p.loading is None
+    p._loading = track("x")
+    assert p.loading.title == "x"
+
+
+def test_volume_percent_reads_back_every_level_the_user_can_set():
+    """int(0.29 * 100) is 28: seven of the 151 accepted levels displayed one lower."""
+    import json
+
+    p = make_player()
+    for level in range(151):
+        p.set_volume(level / 100)
+        assert p.volume_percent == level
+        p.set_volume(json.loads(json.dumps(p.volume)))    # the settings-file round trip
+        assert p.volume_percent == level
+
+
+def test_now_playing_footer_shows_the_volume_that_was_set():
+    p = make_player()
+    p.guild.get_member = lambda uid: None
+    p.set_volume(0.29)
+    t = track("a")
+    t.requester_id = 42
+    footer = p.now_playing_embed(t).footer.text
+    assert footer.endswith("volume 29%"), footer
+
+
 # --------------------------------------- a dead discord.py AudioPlayer after a voice drop
 class _VoiceConnection:
     """Stands in for discord.py's VoiceConnectionState, the only part of the voice stack
