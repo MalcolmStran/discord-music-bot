@@ -18,6 +18,7 @@ import re
 import shutil
 import time
 import uuid
+from collections.abc import Collection
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -593,13 +594,21 @@ async def to_gif(src: Path, limit_bytes: int, workdir: Path, *, info: Probe,
 
 
 # ------------------------------------------------------------------ cleanup
-def cleanup_dir(workdir: Path, older_than_seconds: int = 3600) -> int:
-    import time
+def cleanup_dir(workdir: Path, older_than_seconds: int = 3600, keep: Collection[Path] = frozenset()) -> int:
+    """Delete files older than the cutoff, except those in `keep`.
+
+    Age alone can't tell a stale file from a live job's source: a download is written once
+    and then only read, by every ffmpeg pass of every rung, so it looked stale to the floor
+    while a long encode (or one queued for a slot) still needed it. Callers pass the paths
+    their running jobs hold.
+    """
     n = 0
     if not workdir.exists():
         return 0
     cutoff = time.time() - older_than_seconds
     for p in workdir.iterdir():
+        if p in keep:
+            continue
         try:
             if p.is_file() and p.stat().st_mtime < cutoff:
                 p.unlink()

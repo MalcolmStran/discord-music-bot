@@ -160,6 +160,9 @@ class Media(commands.Cog):
         self.workdir.mkdir(parents=True, exist_ok=True)
         self.max_bytes = self.cfg.max_download_mb * 1024 * 1024
         self._inflight: set[int] = set()            # message ids being processed
+        # Work-dir files each running convert_and_send still needs, one entry per job so two
+        # jobs can never drop each other's paths. Cleanup skips them (see _in_use).
+        self._busy: dict[object, set[Path]] = {}
         self.stats = {"ok": 0, "failed": 0, "compressed": 0, "gif": 0, "skipped": 0}
         video.configure(self.cfg.max_concurrent_encodes)
         self.cleanup_loop.start()
@@ -167,12 +170,19 @@ class Media(commands.Cog):
     def cog_unload(self):
         self.cleanup_loop.cancel()
 
+    def _in_use(self) -> frozenset[Path]:
+        """Snapshot of every running job's files, taken on the event loop: the cleanup
+        thread must never iterate sets the loop is still changing."""
+        return frozenset(p for paths in self._busy.values() for p in paths)
+
     @tasks.loop(minutes=30)
     async def cleanup_loop(self):
         # An unhandled exception here would stop the loop for the rest of the process
         # lifetime and the temp dir would grow forever, so swallow and keep going.
         try:
-            n = await asyncio.to_thread(video.cleanup_dir, self.workdir, 3600)
+            # A job can outlive the hour (three rungs × two passes × the encode timeout,
+            # plus queueing for a slot), so its source is skipped, not judged by age.
+            n = await asyncio.to_thread(video.cleanup_dir, self.workdir, 3600, self._in_use())
         except Exception:
             log.exception("media cleanup failed")
             return
@@ -303,9 +313,13 @@ class Media(commands.Cog):
             pass
         src: Optional[Path] = None
         out: Optional[Path] = None
+        held: set[Path] = set()
+        job = object()
+        self._busy[job] = held
         try:
             src = await video.download(url, self.workdir, self.max_bytes,
                                        cookies_file=self.cfg.ytdl_cookies_file, rapidapi_key=self.cfg.rapidapi_key)
+            held.add(src)       # before any await: /media-cleanup must never see it unclaimed
             info = await video.probe(src)
             target = int(limit * 0.97)
             out = None
@@ -327,6 +341,7 @@ class Media(commands.Cog):
                     made_as = "compressed"
                 else:
                     out = src
+            held.add(out)
             ext = out.suffix.lower().lstrip(".") or "mp4"
             # A link posted inside ||spoiler|| tags must not come back as a clip playing inline.
             await message.reply(file=discord.File(out, filename=f"{kind}.{ext}", spoiler=spoiler),
@@ -370,6 +385,7 @@ class Media(commands.Cog):
                         p.unlink(missing_ok=True)
                     except OSError:
                         pass
+            del self._busy[job]
             try:
                 await message.remove_reaction("⏳", guild.me)
             except discord.HTTPException:
@@ -473,9 +489,11 @@ class Media(commands.Cog):
     @app_commands.default_permissions(manage_guild=True)
     @commands.guild_only()
     async def media_cleanup(self, ctx: commands.Context):
-        # older_than_seconds=0 would also delete files a conversion is still writing, so
-        # keep a small floor; the periodic loop reclaims the rest.
-        n = await asyncio.to_thread(video.cleanup_dir, self.workdir, 60)
+        # The 60 s floor only protects files still being written (yt-dlp fragments, ffmpeg
+        # output). A finished download is only read from then on, by every ffmpeg pass, so
+        # it looked stale while a long encode still needed it: running jobs' files are
+        # skipped explicitly. The periodic loop reclaims the rest.
+        n = await asyncio.to_thread(video.cleanup_dir, self.workdir, 60, self._in_use())
         await ctx.send(f"🧹 Removed {n} temp file(s).")
 
 

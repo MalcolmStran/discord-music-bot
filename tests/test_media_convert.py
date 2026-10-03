@@ -3,6 +3,8 @@
 video.download / probe / fit_under / to_gif are replaced by stand-ins that write real files
 into the real work dir, so what the cog uploads, counts and leaves on disk is the real thing.
 """
+import os
+import time
 from pathlib import Path
 
 import discord
@@ -110,6 +112,60 @@ async def test_an_ordinary_link_is_not(cog, small_clip):
     assert await cog.convert_and_send(msg, "https://x.com/a/status/1", "twitter", reply_errors=False)
     assert msg.uploads == [("twitter.mp4", False)]
     assert msg.edits == [{"suppress": True}], "/convert still suppresses straight away"
+
+
+# ------------------------------------------------- cleanup vs. running conversions
+class _Ctx:
+    def __init__(self):
+        self.sent = []
+
+    async def send(self, content=None, **kw):
+        self.sent.append(content)
+
+
+def _age(path, seconds):
+    t = time.time() - seconds
+    os.utime(path, (t, t))
+
+
+@pytest.mark.parametrize("run_cleanup", [
+    lambda cog: Media.media_cleanup.callback(cog, _Ctx()),     # /media-cleanup, 60 s floor
+    lambda cog: Media.cleanup_loop.coro(cog),                   # the periodic loop, 1 h floor
+], ids=["media-cleanup", "cleanup-loop"])
+async def test_cleanup_spares_the_source_of_a_conversion_still_encoding(cog, big_clip, monkeypatch, run_cleanup):
+    """The download is written once, then only read by each ffmpeg pass of each rung, so
+    by mtime it looked stale mid-ladder (or while queued for an encode slot) and was
+    deleted; every later pass then failed and the user was told to try a shorter clip."""
+    stale = cog.workdir / "dl_abandoned.mp4"
+    stale.write_bytes(b"old")
+    _age(stale, 2 * 3600)
+    seen = {}
+
+    async def fit_under(src, target, workdir, **kw):
+        _age(src, 2 * 3600)                 # rung 1 has been running a long time
+        await run_cleanup(cog)
+        seen["src survived"] = src.exists()
+        out = workdir / "enc_test.mp4"
+        out.write_bytes(b"\0" * 1024)
+        return out
+
+    monkeypatch.setattr(video, "fit_under", fit_under)
+    msg = _Message()
+    assert await cog.convert_and_send(msg, "https://x.com/a/status/1", "twitter", reply_errors=False)
+    assert seen == {"src survived": True}
+    assert msg.uploads == [("twitter.mp4", False)]
+    assert not stale.exists(), "genuinely stale files are still reclaimed"
+    assert cog._busy == {}, "a finished job releases its files"
+    assert list(cog.workdir.iterdir()) == []
+
+
+async def test_a_failed_job_releases_its_files_too(cog, big_clip, monkeypatch):
+    async def boom(*a, **kw):
+        raise video.VideoError("nope")
+
+    monkeypatch.setattr(video, "fit_under", boom)
+    assert not await cog.convert_and_send(_Message(), "https://x.com/a/status/1", "twitter", reply_errors=False)
+    assert cog._busy == {}
 
 
 # ------------------------------------------------------------- /mediainfo counters
