@@ -5,6 +5,7 @@ because this is where both the embed-fixer rule and the per-user opt-out actuall
 """
 from pathlib import Path
 
+import discord
 import pytest
 
 from bot.cogs.media import Media
@@ -19,17 +20,35 @@ class _Author:
 class _Guild:
     id = 7
     name = "guild"
+    me = object()
+
+
+class _Channel:
+    def __init__(self, perms):
+        self.perms = perms
+
+    def permissions_for(self, member):
+        assert member is _Guild.me
+        if isinstance(self.perms, Exception):
+            raise self.perms
+        return self.perms
+
+
+# What a bot that may post in the channel has.
+_CAN_POST = discord.Permissions(view_channel=True, send_messages=True, attach_files=True,
+                                read_message_history=True, add_reactions=True)
 
 
 class _Message:
     _seq = 0
 
-    def __init__(self, content, uid=100, is_bot=False, guild=True):
+    def __init__(self, content, uid=100, is_bot=False, guild=True, perms=_CAN_POST):
         _Message._seq += 1
         self.id = _Message._seq
         self.content = content
         self.author = _Author(uid, is_bot)
         self.guild = _Guild() if guild else None
+        self.channel = _Channel(perms)
         self.edits = []
 
     async def edit(self, **kw):
@@ -150,6 +169,27 @@ async def test_bots_dms_and_empty_messages_are_ignored(cog):
 async def test_at_most_two_links_per_message(cog):
     many = " ".join(f"https://x.com/u/status/{i}" for i in range(5))
     assert len(await urls(cog, many)) == 2
+
+
+@pytest.mark.parametrize("perms", [
+    # restricted to a #media channel: can read here, not post
+    discord.Permissions(view_channel=True, read_message_history=True, add_reactions=True),
+    # may post text but not files
+    discord.Permissions(view_channel=True, send_messages=True, read_message_history=True),
+    # may post files, but a reply (message_reference) also needs Read Message History
+    discord.Permissions(view_channel=True, send_messages=True, attach_files=True),
+])
+async def test_nothing_is_downloaded_where_the_upload_would_be_refused(cog, perms):
+    """Every link was downloaded and compressed, holding the encode slots, only for the
+    final reply to fail with 403."""
+    assert await urls(cog, "https://x.com/a/status/1", perms=perms) == []
+
+
+async def test_an_uncached_thread_parent_does_not_stop_conversion(cog):
+    """Thread.permissions_for raises when the parent channel isn't cached; that must not
+    turn into an error on every message in the thread."""
+    got = await urls(cog, "https://x.com/a/status/1", perms=discord.ClientException("Parent channel not found"))
+    assert got == ["https://x.com/a/status/1"]
 
 
 async def test_unsupported_links_are_ignored(cog):

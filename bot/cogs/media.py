@@ -229,6 +229,17 @@ class Media(commands.Cog):
         # and the lookup builds a set, which is wasted on every message with no link at all.
         if self.settings.is_media_optout(message.author.id):
             return  # this person asked us to leave their posts alone (/autoconvert off)
+        # Don't spend a download and an encode slot on an upload Discord will refuse: in a
+        # channel the bot may not post in, every link used to be fetched and compressed only
+        # to fail with 403 on the final reply. attach_files is already False wherever the
+        # bot can't send (discord.py applies that for threads too); a reply also needs Read
+        # Message History. A thread whose parent isn't cached raises, so try as before.
+        try:
+            perms = message.channel.permissions_for(message.guild.me)
+        except discord.ClientException:
+            perms = None
+        if perms is not None and not (perms.attach_files and perms.read_message_history):
+            return
         # at most 2 videos per message, and never process the same message twice
         if message.id in self._inflight:
             return
