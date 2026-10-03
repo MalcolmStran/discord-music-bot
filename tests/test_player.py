@@ -41,6 +41,9 @@ def make_player(max_queue: int = 50, idle_seconds: int = 300) -> GuildPlayer:
     p._loading = None
     p._failures = 0
     p._lock = asyncio.Lock()
+    # mirrors __init__; without it every attribute read here falls back to the class
+    # attribute, which is how the shipped grace test passed without touching the wiring
+    p.reconnect_grace = 45.0
     return p
 
 
@@ -329,7 +332,12 @@ def _with_voice(p, vc, monkeypatch):
 async def test_wait_for_reconnect_returns_true_once_voice_is_back(monkeypatch):
     """A Starlink blip: discord.py reconnects a few seconds later; the player must survive."""
     p = _with_voice(make_player(), _FlakyVoice(back_after=3), monkeypatch)
+    loop = asyncio.get_running_loop()
+    t0 = loop.time()
     assert await p.wait_for_reconnect(grace=5, poll=0.001) is True
+    # three polls at 1 ms, not at the 0.5 s default: `poll` has to be honoured or a
+    # recovering connection is noticed up to half a second late.
+    assert loop.time() - t0 < 0.3
 
 
 async def test_wait_for_reconnect_gives_up_after_the_grace(monkeypatch):
@@ -350,10 +358,17 @@ async def test_wait_for_reconnect_returns_at_once_when_discord_dropped_the_clien
 
 
 async def test_zero_grace_keeps_the_old_immediate_behaviour(monkeypatch):
-    p = _with_voice(make_player(), _FlakyVoice(back_after=None), monkeypatch)
+    """VOICE_RECONNECT_GRACE=0 is documented as "reset immediately, like before", so this has
+    to check the *immediacy*, not just the return value — asserting only `is False` made it a
+    duplicate of the timeout test above and let a `max(0.5, grace)` floor through."""
+    vc = _FlakyVoice(back_after=None)
+    p = _with_voice(make_player(), vc, monkeypatch)
+    loop = asyncio.get_running_loop()
+    t0 = loop.time()
     assert await p.wait_for_reconnect(grace=0, poll=0.01) is False
+    assert vc.polls == 1, "grace=0 must check once and return, not enter the poll loop"
+    assert loop.time() - t0 < 0.05, "grace=0 must not sleep at all"
 
 
-async def test_default_grace_outlasts_discord_py_reconnect_window():
-    """discord.py waits up to 30 s for a new voice server after a forced close."""
-    assert make_player().reconnect_grace > 30
+# The default-grace check lives in tests/test_voice_reconnect.py: it has to go through the real
+# GuildPlayer.__init__ to mean anything, and make_player() deliberately bypasses __init__.
