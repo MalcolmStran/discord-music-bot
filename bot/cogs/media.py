@@ -53,6 +53,11 @@ SUPPORTED = {
     for kind, domains in _REAL_DOMAINS.items()
 }
 
+# Real TikTok hosts that yt-dlp's TikTok extractors only match as www.tiktok.com. Once
+# video.download() stopped falling back to the generic extractor (which used to follow
+# TikTok's redirect), these links failed outright unless rewritten.
+_TIKTOK_ALIASES = {"tiktok.com", "m.tiktok.com"}
+
 
 def _host(url: str) -> str:
     """Hostname of an http(s) URL, lowercased, or "" if it is not one we should touch.
@@ -107,7 +112,8 @@ def is_embed_fixer(url: str) -> bool:
 
 
 def normalise(url: str, kind: str) -> str:
-    """Point a fixer link back at the real site, keeping the path and query.
+    """Point a fixer link (or a bare / m. TikTok link) at the canonical host yt-dlp
+    expects, keeping the path and query.
 
     Rewriting the host through the parser rather than a "www.-or-nothing" prefix regex is
     what makes subdomains work: that regex left ``d.fxtwitter.com`` — which
@@ -115,6 +121,9 @@ def normalise(url: str, kind: str) -> str:
     /convert handed the third-party host to yt-dlp instead of x.com.
     """
     url = url.strip().rstrip(_TRAILING)
+    if _host(url) in _TIKTOK_ALIASES:
+        parts = urlsplit(url)
+        return urlunsplit(("https", CANONICAL_HOST["tiktok"], parts.path, parts.query, ""))
     fixer = fixer_domain(url)
     if not fixer:
         return url
