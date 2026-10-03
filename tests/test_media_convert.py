@@ -5,6 +5,7 @@ into the real work dir, so what the cog uploads, counts and leaves on disk is th
 """
 from pathlib import Path
 
+import discord
 import pytest
 
 from bot.cogs.media import Media
@@ -26,10 +27,14 @@ class _Message:
         self.replies = []
         self.edits = []
 
+    reject_uploads = False
+
     async def reply(self, content=None, *, file=None, **kw):
         if file is not None:
-            self.uploads.append((file.filename, file.spoiler))
             file.close()
+            if self.reject_uploads:
+                raise discord.HTTPException(_Response(), "Request entity too large")
+            self.uploads.append((file.filename, file.spoiler))
         else:
             self.replies.append(content)
         return _Status()
@@ -42,6 +47,11 @@ class _Message:
 
     async def edit(self, **kw):
         self.edits.append(kw)
+
+
+class _Response:
+    status = 413
+    reason = "Payload Too Large"
 
 
 class _Status:
@@ -100,3 +110,63 @@ async def test_an_ordinary_link_is_not(cog, small_clip):
     assert await cog.convert_and_send(msg, "https://x.com/a/status/1", "twitter", reply_errors=False)
     assert msg.uploads == [("twitter.mp4", False)]
     assert msg.edits == [{"suppress": True}], "/convert still suppresses straight away"
+
+
+# ------------------------------------------------------------- /mediainfo counters
+@pytest.fixture
+def big_clip(monkeypatch):
+    """A clip over the 10 MB limit, so it has to be compressed."""
+    monkeypatch.setattr(video, "download", _fake_download(11 * MB))
+    monkeypatch.setattr(video, "probe", _probe)
+
+
+def _fit_under_ok():
+    async def fit_under(src, target, workdir, **kw):
+        out = workdir / "enc_test.mp4"
+        out.write_bytes(b"\0" * 1024)
+        return out
+    return fit_under
+
+
+async def test_a_successful_compression_is_counted(cog, big_clip, monkeypatch):
+    monkeypatch.setattr(video, "fit_under", _fit_under_ok())
+    assert await cog.convert_and_send(_Message(), "https://x.com/a/status/1", "twitter", reply_errors=False)
+    assert (cog.stats["ok"], cog.stats["compressed"], cog.stats["failed"]) == (1, 1, 0)
+
+
+async def test_a_compression_that_fails_is_not_counted_as_compressed(cog, big_clip, monkeypatch):
+    """The footer read "1 failed · 1 compressed" for a clip that was never compressed."""
+    async def too_long(*a, **kw):
+        raise video.VideoError("That video is 20:00 long — too long to fit in 10 MB")
+
+    monkeypatch.setattr(video, "fit_under", too_long)
+    assert not await cog.convert_and_send(_Message(), "https://x.com/a/status/1", "twitter", reply_errors=False)
+    assert (cog.stats["compressed"], cog.stats["failed"]) == (0, 1)
+
+
+async def test_a_rejected_upload_is_not_counted_as_compressed(cog, big_clip, monkeypatch):
+    monkeypatch.setattr(video, "fit_under", _fit_under_ok())
+    msg = _Message()
+    msg.reject_uploads = True
+    assert not await cog.convert_and_send(msg, "https://x.com/a/status/1", "twitter", reply_errors=False)
+    assert (cog.stats["compressed"], cog.stats["failed"]) == (0, 1)
+
+
+async def test_a_rejected_gif_is_not_counted_as_a_gif(cog, small_clip, monkeypatch):
+    async def to_gif(src, target, workdir, **kw):
+        out = workdir / "gif_test.gif"
+        out.write_bytes(b"GIF89a")
+        return out
+
+    cog.cfg = type("Cfg", (_Cfg,), {"max_gif_seconds": 30})()
+    monkeypatch.setattr(video, "should_gif", lambda info, cap: True)
+    monkeypatch.setattr(video, "to_gif", to_gif)
+    msg = _Message()
+    msg.reject_uploads = True
+    assert not await cog.convert_and_send(msg, "https://x.com/a/status/1", "twitter", reply_errors=False)
+    assert (cog.stats["gif"], cog.stats["failed"]) == (0, 1)
+
+    msg.reject_uploads = False
+    assert await cog.convert_and_send(msg, "https://x.com/a/status/1", "twitter", reply_errors=False)
+    assert msg.uploads == [("twitter.gif", False)]
+    assert (cog.stats["gif"], cog.stats["ok"]) == (1, 1)

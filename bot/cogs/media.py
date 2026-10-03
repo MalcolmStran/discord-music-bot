@@ -309,18 +309,22 @@ class Media(commands.Cog):
             info = await video.probe(src)
             target = int(limit * 0.97)
             out = None
+            # Which footer counter this job earns ("gif" / "compressed"). Counted only next to
+            # "ok": bumping it up front counted a compression that then raised (too long, no
+            # rung fit) or an upload Discord rejected as both compressed and failed.
+            made_as: Optional[str] = None
             # A silent clip is what GIF is for, and Discord autoplays a GIF inline instead of
             # showing the click-to-play card a muted MP4 gets.
             if video.should_gif(info, self.cfg.max_gif_seconds):
                 out = await video.to_gif(src, target, self.workdir, info=info,
                                          timeout=self.cfg.encode_timeout_seconds, progress=progress)
                 if out is not None:
-                    self.stats["gif"] += 1
+                    made_as = "gif"
             if out is None:                      # not silent, too long, or no rung fit
                 if src.stat().st_size > limit:
-                    self.stats["compressed"] += 1
                     out = await video.fit_under(src, target, self.workdir, info=info,
                                                 timeout=self.cfg.encode_timeout_seconds, progress=progress)
+                    made_as = "compressed"
                 else:
                     out = src
             ext = out.suffix.lower().lstrip(".") or "mp4"
@@ -328,6 +332,8 @@ class Media(commands.Cog):
             await message.reply(file=discord.File(out, filename=f"{kind}.{ext}", spoiler=spoiler),
                                 mention_author=False)
             self.stats["ok"] += 1
+            if made_as:
+                self.stats[made_as] += 1
             # Tidy: drop the original embed if we can. Discord's suppress flag applies to the
             # WHOLE message, which is why the listener passes False and decides once, after
             # all its links are done. An explicit /convert still suppresses straight away.
