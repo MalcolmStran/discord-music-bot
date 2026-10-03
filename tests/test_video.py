@@ -1,6 +1,7 @@
 """Encoder planning and ffmpeg argument construction (no ffmpeg needed), and download()
 driven through the real yt-dlp against a loopback server."""
 import itertools
+import os
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -307,6 +308,23 @@ def test_gif_ladder_degrades_monotonically():
         assert b.colors <= a.colors
     assert all(2 <= s.colors <= 256 for s in GIF_LADDER)
     assert all(s.fps > 0 for s in GIF_LADDER)
+
+
+# ------------------------------------------------------------------ probe()
+async def test_ffprobe_errors_stay_in_the_log_not_the_channel(tmp_path, monkeypatch, caplog):
+    """/convert replies with the VideoError text, and ffprobe's stderr opens with the
+    server's absolute temp path."""
+    shim = tmp_path / "bin" / "ffprobe"
+    shim.parent.mkdir()
+    shim.write_text('#!/bin/sh\nfor a; do last=$a; done\n'
+                    'echo "$last: Invalid data found when processing input" >&2\nexit 1\n')
+    shim.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{shim.parent}{os.pathsep}{os.environ['PATH']}")
+    src = tmp_path / "media_tmp" / "dl_3f9a1c2b7e.mp4"
+    with pytest.raises(video.VideoError) as e, caplog.at_level("WARNING", logger="bot.core.video"):
+        await video.probe(src)
+    assert str(e.value) == "That file isn't a readable video."
+    assert "Invalid data found" in caplog.text, "the operator still gets the reason"
 
 
 # ------------------------------------------------- download(): real yt-dlp, local server

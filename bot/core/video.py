@@ -314,7 +314,10 @@ async def probe(path: Path, *, timeout: int = 60) -> Probe:
         await _terminate(proc)
         raise VideoError("ffprobe timed out reading that file.") from e
     if proc.returncode != 0:
-        raise VideoError(f"ffprobe failed: {err.decode(errors='ignore')[:200]}")
+        # ffprobe's stderr opens with the file's absolute temp path, and /convert posts the
+        # error text in the channel, so the details go to the log only.
+        log.warning("ffprobe failed for %s: %s", path, err.decode(errors="ignore")[-300:].strip())
+        raise VideoError("That file isn't a readable video.")
     try:
         info = json.loads(out or b"{}")
     except ValueError as e:
