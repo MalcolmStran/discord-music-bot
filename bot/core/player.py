@@ -366,6 +366,9 @@ class GuildPlayer:
         self._stop_requested = False
         while self.queue.is_empty:
             self.current = None
+            # An old queue that ended on dead tracks must not hand its streak to the next
+            # /play: four left over plus one bad track in a fresh playlist wiped that playlist.
+            self._failures = 0
             self._wake.clear()
             try:
                 await asyncio.wait_for(self._wake.wait(), timeout=self.idle_seconds)
@@ -405,6 +408,12 @@ class GuildPlayer:
                 source.cleanup()
             except Exception:
                 pass
+            # A skip still cycles the track to the back under loop-all, as it does for one
+            # that started: a second /skip landing mid-resolve dropped it from the rotation.
+            # Not on /stop or disconnect(), which set _stop_requested and cleared the queue.
+            if self.loop_mode is LoopMode.ALL and not self._stop_requested:
+                if not self.queue.add(track):
+                    log.info("[%s] queue full; %s dropped from the loop", self.guild.name, track.title)
             self.current = None
             return
 
@@ -421,12 +430,26 @@ class GuildPlayer:
         self._paused_at = 0.0
         self._paused_total = 0.0
         try:
+            # Nothing of ours can still be playing here (the loop waited for _finished), so a
+            # player that says otherwise is a dead one: discord.py's AudioPlayer gives up on a
+            # voice drop without ever setting its end flag, and `is_playing()` then stays True.
+            # Every later play() raised "Already playing audio." until five "failures" wiped
+            # the queue. Stopping it only flips its events; its after-callback already ran.
+            if vc.is_playing() or vc.is_paused():
+                vc.stop()
             vc.play(self._source, after=_after)
         except discord.ClientException as e:
             log.warning("[%s] play() failed: %s", self.guild.name, e)
             self._release_source()       # otherwise the ffmpeg child outlives the track
             self.current = None
             self._finished.set()
+            if not vc.is_connected():
+                # Voice dropped while the stream resolved ("Not connected to voice."): hold the
+                # track like the loop does for the next one, instead of skipping it as broken.
+                # The local `vc`, not `self.connected`: if /play has since put a new client on
+                # the guild, the loop retries the track on that one.
+                self.queue.push_front(track)
+                return
             await self._on_track_failed(f"⚠️ Couldn't start **{escape_markdown(track.title)}**. Skipping.")
             return
         await self._announce_now_playing(track)

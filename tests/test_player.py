@@ -1,6 +1,7 @@
 """Playback state-machine tests: the loop-mode logic used to be entirely uncovered, and
 two real bugs lived in it."""
 import asyncio
+import types
 
 import pytest
 
@@ -375,3 +376,273 @@ async def test_zero_grace_keeps_the_old_immediate_behaviour(monkeypatch):
 
 # The default-grace check lives in tests/test_voice_reconnect.py: it has to go through the real
 # GuildPlayer.__init__ to mean anything, and make_player() deliberately bypasses __init__.
+
+
+# ------------------------------------------------- playback edge cases (review fixes)
+class _StreamYTDL:
+    """Resolves every track; `during` (if set) runs inside fetch_stream, i.e. mid-resolve."""
+
+    def __init__(self, during=None):
+        self.during = during
+
+    async def fetch_stream(self, track):
+        if self.during:
+            await self.during()
+        track.stream_url = "https://example.invalid/stream"
+
+    def make_source(self, track, volume):
+        return types.SimpleNamespace(cleanup=lambda: None, volume=volume)
+
+
+async def test_a_drained_queue_does_not_hand_its_failure_streak_to_the_next_play(monkeypatch):
+    """A queue that ended on four dead tracks left _failures at 4, so the first bad track of
+    the next /play hit the cap and wiped the whole fresh playlist."""
+    p = make_player()
+    p.ytdl = _FailingYTDL()
+    _, said = _wire(p, monkeypatch)
+    p._failures = 4                                   # what the previous queue left behind
+
+    waiting = asyncio.create_task(p._next_track())    # idles on the empty queue
+    await asyncio.sleep(0)
+    p.queue.extend([track("age-restricted")] + [track(f"good{i}") for i in range(5)])
+    p._wake.set()
+    nxt = await asyncio.wait_for(waiting, timeout=1)
+    await p._play_track(nxt)
+
+    assert p._failures == 1
+    assert len(p.queue) == 5, "one bad track must not wipe a freshly queued playlist"
+    assert not any("Too many tracks failed" in m for m in said)
+
+
+class _DroppingVC(_VC):
+    """discord.VoiceClient whose connection drops while a stream is still resolving.
+    play() raises like the real one does when not connected."""
+
+    def __init__(self):
+        super().__init__()
+        self.connected = True
+
+    def is_connected(self):
+        return self.connected
+
+    def play(self, source, after=None):
+        import discord
+        if not self.connected:
+            raise discord.ClientException("Not connected to voice.")
+        super().play(source, after)
+
+
+async def test_a_voice_drop_during_the_resolve_holds_the_track_instead_of_skipping_it(monkeypatch):
+    """play() raised "Not connected to voice." and the track was announced as "Couldn't
+    start", counted as a failure and lost, while the next one was held for the reconnect."""
+    p = make_player()
+    p.bot = types.SimpleNamespace(loop=asyncio.get_running_loop())
+    vc = _DroppingVC()
+    monkeypatch.setattr(type(p), "voice", property(lambda self: vc))
+    said = []
+
+    async def _announce(text):
+        said.append(text)
+
+    monkeypatch.setattr(p, "_announce", _announce)
+
+    async def drop():
+        vc.connected = False
+
+    p.ytdl = _StreamYTDL(during=drop)
+    p.queue.add(track("B"))
+
+    await p._play_track(track("A"))
+
+    assert [t.title for t in p.queue] == ["A", "B"], "A must go back to the front, ahead of B"
+    assert p._failures == 0, "a dropped connection is not a broken track"
+    assert not said, f"nothing should be announced as skipped: {said}"
+    assert p.current is None and p._source is None
+
+
+async def test_a_play_error_while_connected_still_counts_as_a_failure(monkeypatch):
+    """The hold above is only for a dropped connection; any other ClientException is a
+    track we could not start and must still feed the failure cap."""
+    import discord
+
+    p = make_player()
+    p.bot = types.SimpleNamespace(loop=asyncio.get_running_loop())
+    vc, said = _wire(p, monkeypatch)
+
+    def refuse(source, after=None):
+        raise discord.ClientException("something else")
+
+    vc.play = refuse
+    p.ytdl = _StreamYTDL()
+    await p._play_track(track("A"))
+    assert p._failures == 1
+    assert p.queue.is_empty
+    assert said and "Couldn't start" in said[0]
+
+
+async def test_a_skip_during_the_resolve_keeps_the_track_in_the_loop_all_rotation(monkeypatch):
+    """A second /skip landing while the next track resolved dropped that track from the
+    loop-all rotation for good: only a track that had started was cycled to the back."""
+    p = make_player()
+    p.loop_mode = LoopMode.ALL
+    _wire(p, monkeypatch)
+    p.queue.extend([track("C"), track("A")])          # A just played and was cycled back
+
+    async def user_skips():
+        p.skip()
+
+    p.ytdl = _StreamYTDL(during=user_skips)
+    await p._play_track(track("B"))
+
+    assert [t.title for t in p.queue] == ["C", "A", "B"]
+    assert p.current is None
+
+
+async def test_a_skip_during_the_resolve_is_not_requeued_outside_loop_all(monkeypatch):
+    p = make_player()
+    _wire(p, monkeypatch)
+    for mode in (LoopMode.OFF, LoopMode.ONE):
+        p.loop_mode = mode
+
+        async def user_skips():
+            p.skip()
+
+        p.ytdl = _StreamYTDL(during=user_skips)
+        await p._play_track(track("B"))
+        assert p.queue.is_empty, mode
+
+
+@pytest.mark.parametrize("how", ["stop", "disconnect"])
+async def test_a_stop_during_the_resolve_does_not_requeue_under_loop_all(monkeypatch, how):
+    """/stop and a teardown clear the queue; re-adding the abandoned track would leave it
+    behind for the next /play in that guild."""
+    p = make_player()
+    p.loop_mode = LoopMode.ALL
+    _wire(p, monkeypatch)
+    p.queue.extend([track("C")])
+
+    async def user_stops():
+        if how == "stop":
+            p.stop()
+        else:
+            await p.disconnect()
+
+    p.ytdl = _StreamYTDL(during=user_stops)
+    await p._play_track(track("B"))
+    assert p.queue.is_empty
+
+
+# --------------------------------------- a dead discord.py AudioPlayer after a voice drop
+class _VoiceConnection:
+    """Stands in for discord.py's VoiceConnectionState, the only part of the voice stack
+    faked here: VoiceClient.play/stop/is_playing and the AudioPlayer thread are real."""
+
+    def __init__(self):
+        self.connected = True
+        self.timeout = 30.0
+
+        async def speak(_state):
+            pass
+
+        self.ws = types.SimpleNamespace(speak=speak)
+
+    def is_connected(self):
+        return self.connected
+
+    def wait(self, timeout=None):
+        # The real one blocks up to `timeout` (30 s) for a reconnect; give up at once, as it
+        # does when that runs out or when disconnect(cleanup=False) "flips" the event.
+        return self.connected
+
+
+class _Opus:
+    """An endless, already-opus source, so the real AudioPlayer needs no encoder or ffmpeg."""
+
+    volume = 1.0
+
+    def __init__(self):
+        import discord
+
+        self.cleaned = 0
+        self._frame = discord.player.OPUS_SILENCE
+
+    def read(self):
+        return self._frame
+
+    def is_opus(self):
+        return True
+
+    def cleanup(self):
+        self.cleaned += 1
+
+
+async def test_a_dead_audio_player_left_by_a_voice_drop_does_not_wipe_the_queue(monkeypatch):
+    """discord.py's AudioPlayer gives up on a dropped connection WITHOUT setting its end
+    flag (player.py: `if self._end.is_set() or not connected: return`), and its reconnect
+    path calls disconnect(cleanup=False), which never calls VoiceClient.stop(). So
+    `vc.is_playing()` stayed True for good, every later play() raised "Already playing
+    audio.", and the fifth such "failure" cleared the whole queue."""
+    import functools
+
+    import discord
+
+    class _AudioSource(_Opus, discord.AudioSource):
+        pass
+
+    loop = asyncio.get_running_loop()
+    conn = _VoiceConnection()
+    vc = discord.VoiceClient.__new__(discord.VoiceClient)
+    vc._connection, vc._player, vc.encoder = conn, None, None
+    vc.client = types.SimpleNamespace(loop=loop)
+    vc.send_audio_packet = lambda data, encode=True: None
+
+    class _YT:
+        async def fetch_stream(self, t):
+            t.stream_url = "https://example.invalid/stream"
+
+        def make_source(self, t, volume):
+            return _AudioSource()
+
+    guild = types.SimpleNamespace(id=1, name="g", voice_client=vc, get_member=lambda uid: None)
+    p = GuildPlayer(types.SimpleNamespace(loop=loop), guild, _YT(), max_queue=50, default_volume=0.5,
+                    idle_seconds=300, reconnect_grace=5)
+    p.wait_for_reconnect = functools.partial(GuildPlayer.wait_for_reconnect, p, poll=0.005)
+    said = []
+
+    async def _announce(text):
+        said.append(text)
+
+    monkeypatch.setattr(p, "_announce", _announce)
+    monkeypatch.setattr(p, "_announce_now_playing", lambda t: asyncio.sleep(0))
+
+    async def until(cond, timeout=2.0):
+        deadline = loop.time() + timeout
+        while not cond():
+            assert loop.time() < deadline, "condition never became true"
+            await asyncio.sleep(0.005)
+
+    # duration <= 10 keeps the "ended after <3s" stream-failure branch out of the way
+    songs = [Track(title=f"song{i}", webpage_url=f"https://y/{i}", duration=5) for i in range(4)]
+    p.enqueue(songs)
+    try:
+        await until(lambda: p.current is songs[0] and vc._player is not None)
+        dead = vc._player
+
+        conn.connected = False                        # the uplink drops mid-song
+        await until(lambda: not dead.is_alive())      # the audio thread aborts...
+        assert vc.is_playing(), "precondition: discord.py's dead player still reports playing"
+        conn.connected = True                         # ...and discord.py reconnects
+
+        await until(lambda: p.current is songs[1] or said)
+        assert not said, f"tracks were failed against the dead player: {said}"
+        assert p.current is songs[1]
+        assert vc._player is not dead and vc._player.is_alive()
+        assert [t.title for t in p.queue] == ["song2", "song3"]
+    finally:
+        task, p._task = p._task, None
+        if task:
+            task.cancel()
+        player = vc._player
+        vc.stop()
+        if player is not None:
+            player.join(1)
