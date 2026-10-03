@@ -16,6 +16,6 @@ docker rm -f discord-music-bot 2>/dev/null || true
 docker run -d --name discord-music-bot --restart unless-stopped --network host \
   --env-file .env \
   -v "$PWD/logs:/app/logs" -v "${project}_bot-downloads:/app/downloads" \
-  --memory 768m --stop-timeout 20 \
+  --memory 768m --stop-timeout 30 \
   discord-music-bot:2
 docker logs -f discord-music-bot
