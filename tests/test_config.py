@@ -176,6 +176,22 @@ def test_an_unreadable_cookies_file_is_warned_about_and_not_used(monkeypatch, tm
     assert str(jar) in rec.getMessage() and "permissions" in rec.getMessage()
 
 
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs os.mkfifo")
+def test_a_cookies_path_that_is_not_a_regular_file_is_not_used(monkeypatch, tmp_path, caplog):
+    """A FIFO (or socket, or device) passes the read-permission check but is no cookies file;
+    YTDL and video.download skip anything but a regular file without a word, so this warning
+    is the only sign that cookies are not being sent."""
+    monkeypatch.setenv("DISCORD_TOKEN", "t")
+    fifo = tmp_path / "cookies.txt"
+    os.mkfifo(fifo)
+    monkeypatch.setenv("YTDL_COOKIES_FILE", str(fifo))
+    with caplog.at_level(logging.WARNING, logger="bot.config"):
+        cfg = Config.from_env()
+    assert cfg.ytdl_cookies_file is None
+    [rec] = [r for r in caplog.records if "YTDL_COOKIES_FILE" in r.getMessage()]
+    assert str(fifo) in rec.getMessage() and "not a file" in rec.getMessage()
+
+
 def test_existing_cookies_file_is_used_and_not_warned_about(monkeypatch, tmp_path, caplog):
     monkeypatch.setenv("DISCORD_TOKEN", "t")
     jar = tmp_path / "cookies.txt"

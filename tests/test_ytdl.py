@@ -9,7 +9,7 @@ import threading
 import pytest
 import yt_dlp
 from yt_dlp.extractor.common import InfoExtractor, SearchInfoExtractor
-from yt_dlp.utils import DownloadError, ExtractorError
+from yt_dlp.utils import DownloadError, ExtractorError, bug_reports_message
 
 from bot.core.ytdl import (
     FFMPEG_BEFORE,
@@ -113,12 +113,22 @@ def test_friendly_drops_yt_dlps_bug_report_text():
     assert _friendly(raw) == "Unable to extract uploader"
 
 
+def test_friendly_drops_the_capitalised_bug_report_text():
+    """bug_reports_message() capitalises "Please report this issue" when what precedes it
+    is empty or ends a sentence."""
+    raw = "ERROR: [youtube] x: Unable to fetch PO token. " + bug_reports_message(before="")
+    assert "Please report this issue" in raw
+    assert _friendly(raw) == "Unable to fetch PO token."
+
+
 @pytest.mark.parametrize("raw", [
     _download_error_text("Failed to extract any player response", video_id="dQw4w9WgXcQ", ie="youtube"),
     "ERROR: [youtube:tab] UCuAXFkgsw1L7xaCfnd5JJOw page 1: Unable to download API page: "
     "HTTP Error 403: Forbidden (caused by <HTTPError 403: Forbidden>)",
     "ERROR: [soundcloud] 123: Unable to download JSON metadata: HTTP Error 403: Forbidden",
     "ERROR: [youtube] x: Unable to download webpage: HTTP Error 429: Too Many Requests",
+    "ERROR: [youtube:tab] UCuAXFkgsw1L7xaCfnd5JJOw page 2: Unable to download API page: "
+    "The read operation timed out (caused by TransportError('The read operation timed out'))",
 ])
 def test_friendly_names_a_refused_request_without_naming_a_site(raw):
     assert _friendly(raw) == "The site refused the request; try again later (cookies may help)."
@@ -238,6 +248,27 @@ class _FakePagedIE(InfoExtractor):
         return self.playlist_result(pages(), pid)
 
 
+class _FakeNestedIE(InfoExtractor):
+    """Results yt-dlp builds inline rather than as url_results, so even a flat extraction
+    processes them: a tab holding a shelf (a playlist two levels down) and an entry that
+    fails (None under ignoreerrors), and an upload in parts (_type multi_video)."""
+    _VALID_URL = r"https://fake\.test/nested/(?P<id>shelf|gap|parts)"
+    IE_NAME = "fakenested"
+
+    def _inline(self, entries, pid, _type="playlist"):
+        return {**self.playlist_result(entries, pid, f"Inline {pid}"), "_type": _type,
+                "extractor": self.IE_NAME, "extractor_key": self.ie_key()}
+
+    def _real_extract(self, url):
+        kind = self._match_id(url)
+        if kind == "parts":
+            return self.playlist_result([self._inline([_video("p1"), _video("p2")], "mv", "multi_video")], kind)
+        odd = (self._inline([_video("deep")], "shelf") if kind == "shelf"
+               else {"id": "noformats", "title": "noformats", "extractor": self.IE_NAME,
+                     "extractor_key": self.ie_key()})
+        return self.playlist_result([self._inline([_video("a"), odd, _video("b")], "tab")], kind)
+
+
 class _FakeMultiPartIE(InfoExtractor):
     """Shaped like BiliBiliIE on a multi-part video: the plain video URL (no playlist hint)
     is the whole anthology unless noplaylist asks for just the one video."""
@@ -302,8 +333,8 @@ class _FakeSitesYDL(yt_dlp.YoutubeDL):
 
     def __init__(self, params=None, auto_init=True):
         super().__init__(params, auto_init=False)
-        for ie in (_FakeSearchIE, _FakeChannelIE, _FakeUserPageIE, _FakePagedIE, _FakeMultiPartIE,
-                   _FakeVideoIE, _FakeErrorIE, _FakeCrashyIE):
+        for ie in (_FakeSearchIE, _FakeChannelIE, _FakeUserPageIE, _FakePagedIE, _FakeNestedIE,
+                   _FakeMultiPartIE, _FakeVideoIE, _FakeErrorIE, _FakeCrashyIE):
             self.add_info_extractor(ie())
         self.add_default_info_extractors()
 
@@ -357,6 +388,26 @@ async def test_an_entry_named_as_a_track_is_queued_whatever_its_url(fake_sites):
     and playlists ("Playlist is empty or unavailable."); the album entry still goes."""
     tracks = await YTDL().resolve("https://fake.test/user/yandex")
     assert [(t.title, t.webpage_url) for t in tracks] == [("ytrack", "http://music.yandex.ru/album/1/track/2")]
+
+
+async def test_a_playlist_two_levels_down_is_not_queued_as_a_track(fake_sites):
+    """Only one level is flattened. A deeper playlist has no ie_key and no URL to judge it
+    by, and was queued as "Inline shelf" with nothing to play."""
+    tracks = await YTDL().resolve("https://fake.test/nested/shelf")
+    assert [t.title for t in tracks] == ["ta", "tb"]
+
+
+async def test_an_entry_that_failed_inside_a_tab_is_skipped(fake_sites):
+    """ignoreerrors leaves None where an entry failed; inside a tab it crashed the resolve."""
+    tracks = await YTDL().resolve("https://fake.test/nested/gap")
+    assert [t.title for t in tracks] == ["ta", "tb"]
+
+
+async def test_an_upload_in_parts_queues_each_part(fake_sites):
+    """A multi_video entry is not _type playlist but holds the parts; queued whole it was
+    one track with no stream of its own."""
+    tracks = await YTDL().resolve("https://fake.test/nested/parts")
+    assert [t.title for t in tracks] == ["tp1", "tp2"]
 
 
 async def test_a_failed_later_page_keeps_the_pages_that_loaded(fake_sites):
