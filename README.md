@@ -26,8 +26,12 @@ docker logs -f discord-music-bot
 You should see `online as <bot name> (<id>) in N guilds` within a few seconds. If you
 don't, jump to [Troubleshooting](#troubleshooting).
 
-Running without Docker needs Python 3.11+, `ffmpeg` (with `ffprobe`) and a JS runtime for
-yt-dlp (Node or Deno):
+Running without Docker needs Python 3.11+ and `ffmpeg` (with `ffprobe`). yt-dlp also needs
+Deno to solve YouTube's challenges; `requirements.txt` installs it on x86_64 and aarch64,
+macOS and 64-bit Windows, and skips it on other CPUs (32-bit ARM, i686, riscv64), where YouTube
+runs without the challenge solver unless you install Deno yourself. On musl (Alpine) or glibc
+older than 2.27 there's no Deno build for pip to install, so delete the `deno` line from
+`requirements.txt` first:
 
 ```bash
 pip install -r requirements.txt
@@ -44,10 +48,10 @@ The bot needs a little configuration on Discord's side before the token works.
 *New Application* → *Bot* → *Reset Token*. That token goes in `DISCORD_TOKEN`.
 
 **2. Enable the Message Content intent.** On the same *Bot* page, under
-*Privileged Gateway Intents*, turn on **Message Content**. This is not optional — without
-it the bot starts, connects, and then silently ignores every `!command` and every pasted
-link, because Discord delivers empty message bodies. It is the single most common reason
-for "the bot is online but does nothing".
+*Privileged Gateway Intents*, turn on **Message Content**. This is not optional: the bot
+asks for it on every connect, and without it Discord refuses the connection. The bot never
+comes online, it exits with `Message Content intent is not enabled for this bot`, and under
+Docker the container restarts in a loop. It is the single most common setup mistake.
 
 **3. Invite it.** Replace `YOUR_APP_ID` with the Application ID from the *General
 Information* page:
@@ -70,6 +74,16 @@ you prefix commands only. The permissions integer covers:
 
 *Add Reactions* and *Manage Messages* are the only optional ones — the bot still converts
 links without them, it just loses the progress marker and can't hide the redundant preview.
+Without *Attach Files* or *Read Message History* in a channel, the bot skips auto-conversion
+there rather than downloading a video it can't post.
+
+Two more are worth granting only if you need them, because they let the bot act on other
+members too:
+
+| Permission | Needed for |
+|---|---|
+| Move Members | joining a voice channel that is at its user limit (otherwise the bot says it's full) |
+| Mute Members | speaking in a **Stage** channel; without it the bot requests to speak and a Stage moderator has to invite it |
 
 Slash commands are published globally on first start and can take up to an hour to appear.
 Use `!sync` (owner only) to force a refresh.
@@ -93,22 +107,22 @@ Use `!sync` (owner only) to force a refresh.
 | `/shuffle` · `/clear` | | `clear` keeps the current track |
 | `/remove <n>` | `rm` | by queue position |
 | `/move <from> <to>` | | |
-| `/join` | `summon` | |
-| `/leave` | `dc`, `disconnect` | also happens automatically when left alone |
+| `/join` | `summon` | the bot leaves again after `VOICE_AUTO_DISCONNECT_TIMEOUT` if nothing is played |
+| `/leave` | `dc`, `disconnect` | refused for someone outside the bot's channel while people are listening, unless they have *Move Members*; also happens automatically when the bot is left alone |
 | `/status` | `voice-debug`, `vdebug` | voice and player diagnostics |
 
 ### Media
 
 | Command | Aliases | Notes |
 |---|---|---|
-| *(paste a Twitter/X or TikTok link)* | | converted automatically |
+| *(paste a Twitter/X or TikTok link)* | | converted automatically; the original embed is hidden only when every link in the message was converted. Links inside `\|\|spoiler\|\|` tags are uploaded as spoilers. Profile, hashtag, live and Space links are left alone (no ⏳, and they don't use up one of the two links converted per message) |
 | *(paste an fxtwitter / vxtwitter / fixupx / fixvx / twittpr / vxtiktok / tnktok link)* | | **left alone** — it already embeds its own video, so converting would post the clip twice |
 | *(a clip with no audio track)* | | sent as a looping GIF sized to fit the upload cap; set `MAX_GIF_SECONDS=0` to disable |
 | `/convert <url>` | | manual conversion, works on fixer links too |
 | `/autoconvert [on \| off]` | | opt your **own** posts out of auto-conversion. Applies in every server the bot is in, and works in DMs. Omit the argument to see your current setting. |
 | `/mediainfo` | `media-status` | status, limits, this server's upload cap |
 | `/media-toggle` | | *Manage Server* — per-server on/off, persisted |
-| `/media-cleanup` | | *Manage Server* — wipe temp files |
+| `/media-cleanup` | | *Manage Server* — wipe temp files (files a running conversion is using are kept) |
 
 Owner-only (`OWNER_IDS`, prefix-only): `!sync`, `!reload <music \| media>`.
 
@@ -119,8 +133,9 @@ Owner-only (`OWNER_IDS`, prefix-only): `!sync`, `!reload <music \| media>`.
 Every setting is an environment variable, read from `.env` (see `.env.example`).
 `DISCORD_TOKEN` is the only one you must set.
 
-> **Comments must be on their own line.** `docker run --env-file` does not strip trailing
-> comments, so `COMMAND_PREFIX=!  # note` sets the prefix to the literal `!  # note`.
+> **Comments go on their own line, and values are not quoted.** `docker run --env-file`
+> (used by `run.sh`) takes values verbatim: `COMMAND_PREFIX=!  # note` sets the prefix to the
+> literal `!  # note`, and `DISCORD_TOKEN="..."` keeps the quotes and fails to log in.
 
 | Variable | Default | Range | Notes |
 |---|---|---|---|
@@ -129,37 +144,51 @@ Every setting is an environment variable, read from `.env` (see `.env.example`).
 | `OWNER_IDS` | *(none)* | | comma- or semicolon-separated user ids for `!sync` / `!reload` |
 | `LOG_LEVEL` | `INFO` | CRITICAL … DEBUG | anything else falls back to `INFO` |
 | `LOG_DIR` | `./logs` | | |
-| `DOWNLOAD_DIR` | `./downloads` | | settings live in `<DOWNLOAD_DIR>/bot_settings/` |
+| `DOWNLOAD_DIR` | `./downloads` | | settings live in `<DOWNLOAD_DIR>/bot_settings/`; blank means the default |
 | `FORCE_COMMAND_SYNC` | `false` | | re-publish slash commands even if unchanged |
 | **Music** | | | |
-| `MAX_QUEUE_SIZE` | `50` | 1–10000 | also caps how many playlist entries are resolved |
-| `MAX_SONG_DURATION` | `7200` | ≥ 1 | seconds |
+| `MAX_QUEUE_SIZE` | `50` | 1–10000 | also caps how many entries a playlist, channel or artist link queues |
+| `MAX_SONG_DURATION` | `7200` | ≥ 1 | seconds; also checked when a track starts, for links whose length isn't known up front (Spotify matches, SoundCloud sets) |
 | `DEFAULT_VOLUME` | `0.5` | 0.0–1.0 | |
 | `VOICE_AUTO_DISCONNECT_TIMEOUT` | `300` | ≥ 10 | seconds idle in voice before leaving |
 | `VOICE_RECONNECT_GRACE` | `45` | 0–300 | seconds to wait for a dropped voice connection to recover before resetting the player (0 = reset immediately) |
 | **Media** | | | |
 | `MEDIA_ENABLED_DEFAULT` | `true` | | starting state for servers that haven't used `/media-toggle` |
-| `MAX_DOWNLOAD_MB` | `500` | ≥ 1 | refuse to download anything larger |
+| `MAX_DOWNLOAD_MB` | `500` | ≥ 1 | a download is stopped as soon as it passes this size; each download also has a 30-minute limit |
 | `MAX_CONCURRENT_ENCODES` | `2` | 1–16 | simultaneous ffmpeg jobs |
 | `ENCODE_TIMEOUT_SECONDS` | `600` | ≥ 30 | per encode |
 | `MAX_GIF_SECONDS` | `30` | 0–600 | silent clips up to this long become GIFs; `0` disables |
 | **Optional integrations** | | | |
 | `SPOTIFY_CLIENT_ID` / `SPOTIFY_CLIENT_SECRET` | *(none)* | | full playlists via the Web API; without them the keyless embed route caps out around 50–100 tracks |
 | `RAPIDAPI_KEY` | *(none)* | | TikTok download fallback; yt-dlp handles TikTok natively, so this is rarely needed |
-| `YTDL_COOKIES_FILE` | *(none)* | | path to a `cookies.txt` for age-gated or rate-limited content |
-| `YTDLP_AUTO_UPDATE` | `true` | | refresh yt-dlp on container start (Docker only) |
+| `YTDL_COOKIES_FILE` | *(none)* | | path to a `cookies.txt` for age-gated or rate-limited content; read only, never written back. Under Docker see [below](#cookies-under-docker) |
+| `YTDLP_AUTO_UPDATE` | `true` | | refresh yt-dlp on container start (Docker only). `1`/`true`/`yes`/`on` in any case; anything else turns it off and logs `yt-dlp: self-update disabled` |
 
 Numbers outside their range are clamped and logged as a warning rather than taken at face
 value, so a typo degrades the bot instead of breaking it: `MAX_QUEUE_SIZE=0` used to make
 every `/play` report a full queue with no hint as to why.
 
+### Cookies under Docker
+
+A host path in `YTDL_COOKIES_FILE` doesn't exist inside the container. Put the file next to
+`docker-compose.yml`, uncomment the `./cookies.txt:/app/cookies.txt:ro` line there, and set
+`YTDL_COOKIES_FILE=/app/cookies.txt`. Create the file first, or Docker creates a directory
+in its place. With `run.sh`, add `-v "$PWD/cookies.txt:/app/cookies.txt:ro"` to its
+`docker run` line.
+
+If the path is missing, is a directory, or can't be read, the bot logs a warning at start-up
+and runs without cookies rather than failing every download. If Docker already created a
+`cookies.txt` directory, remove it on the host (`rmdir cookies.txt`), create the file, and
+recreate the container.
+
 ---
 
 ## Troubleshooting
 
-**The bot is online but ignores `!commands` and pasted links.**
-The Message Content intent is off. See [Discord setup](#discord-setup) step 2. Slash
-commands keep working, which is what makes this confusing.
+**The bot never comes online, and the log says `Message Content intent is not enabled`.**
+Turn it on as in [Discord setup](#discord-setup) step 2, then restart. Slash commands may
+still appear in Discord, because they are published before the bot connects, but nothing
+answers them.
 
 **Slash commands don't show up.**
 Global commands can take up to an hour to propagate. Check the invite used the
@@ -170,8 +199,11 @@ Either `.env` is missing, or the token is still the `your_discord_token_here` pl
 
 **YouTube playback suddenly fails everywhere.**
 YouTube changed something and yt-dlp needs updating. The container self-updates on start,
-so `docker compose restart` usually fixes it. If it persists, the video may be age-gated or
-rate-limited — point `YTDL_COOKIES_FILE` at an exported `cookies.txt`.
+so `docker compose restart` usually fixes it; if the log shows `yt-dlp: self-update
+disabled`, `YTDLP_AUTO_UPDATE` is off. "The site refused the request" means YouTube (or the
+source site) turned the bot away, which is usually rate-limiting of the bot's IP. If it persists, the video may be age-gated or
+rate-limited — export a `cookies.txt` and set it up as in
+[Cookies under Docker](#cookies-under-docker).
 
 **"That video is X long — too long to fit in N MB at watchable quality."**
 The clip provably can't be compressed to fit, and the bot says so in about a second rather
@@ -186,9 +218,9 @@ log shows `bot left voice (external); waiting up to 45s for a reconnect` followe
 `voice connection recovered`. If drops end the song instead, raise `VOICE_RECONNECT_GRACE`.
 
 **The container restarts in a loop.**
-The `HEALTHCHECK` watches a heartbeat file the bot touches only while its gateway
-connection is live, so this usually means the bot can't stay connected — check the token,
-then `docker logs discord-music-bot`.
+The process keeps exiting, and `docker logs discord-music-bot` says why. The usual causes are
+a wrong token, the Message Content intent being off (see above), or the bot's watchdog giving
+up on a gateway connection that stayed dead for 10 minutes (`gateway dead for …s`).
 
 ---
 
@@ -196,7 +228,7 @@ then `docker logs discord-music-bot`.
 
 ```bash
 ./check.sh --install      # install dev deps, then lint + the whole suite
-./check.sh                # lint + tests (320, no Discord and no network)
+./check.sh                # lint + tests (596, no Discord and no network)
 ./check.sh --docker       # also build the image and run the suite inside it
 ```
 
@@ -204,7 +236,7 @@ Or run the pieces directly: `ruff check bot tests` and `python -m pytest`.
 
 There is no CI workflow — hosted runners bill against the repository owner's account — so
 `check.sh` is the thing to run before pushing. The suite is entirely offline and takes
-about a second.
+about ten seconds.
 
 ### Layout
 
@@ -224,18 +256,24 @@ tests/             offline unit tests: queue/settings/links, player loop modes, 
                    recovery, encoder planning, config parsing, ytdl helpers, Spotify parsing,
                    media cog
 check.sh           lint + tests (+ optional Docker build)
-Dockerfile         python:3.13-slim + ffmpeg + node, runs as an unprivileged user
+Dockerfile         python:3.13-slim + ffmpeg (+ Deno via pip), runs as an unprivileged user
 entrypoint.sh      optional yt-dlp self-update, then starts the bot
 docker-compose.yml the supported way to run it
-run.sh             plain `docker run` alternative
+run.sh             plain `docker run` alternative; mounts the same settings volume as compose
 ```
 
 ### Deployment notes
 
 The container runs as an unprivileged user and keeps guild settings in the `bot-downloads`
-volume (`bot_settings/guild_settings.json`; the v1 format is migrated automatically). A
-`HEALTHCHECK` watches a heartbeat file the bot touches only while its gateway connection is
-live, so a wedged-but-running bot gets restarted too.
+volume (`bot_settings/guild_settings.json`; the v1 format is migrated automatically).
+
+A wedged-but-running bot is restarted by the bot itself, not by the `HEALTHCHECK`. The
+healthcheck only *reports*: it marks the container `(unhealthy)` in `docker ps` when the bot
+stops touching its heartbeat file, and plain Docker and compose never restart a container
+for that. What does restart it is an in-process watchdog: under Docker, if the gateway has
+been dead for 10 minutes, the bot logs `gateway dead for …s` and exits, and
+`restart: unless-stopped` brings it back. A bare `python -m bot` run has no supervisor, so the
+watchdog is off there and discord.py keeps trying to reconnect instead.
 
 ---
 
@@ -259,6 +297,13 @@ left voice" event cancelled that reconnect and ended the song, so `wait_for_reco
 waits up to `VOICE_RECONNECT_GRACE` (default 45 s, deliberately longer than discord.py's
 window) and only resets if the connection didn't come back. If discord.py has already dropped
 its voice client — a real kick or a deleted channel — it resets at once.
+
+**Joining and leaving are serialised.** `connect()` and `disconnect()` share a lock, and a
+reconnect waiter treats a join in progress as "not given up yet", so a waiter whose grace
+runs out can't tear down the connection `/play` is building. The bot's own leaves are
+counted, so the "bot left voice" event Discord echoes back for them isn't mistaken for a kick.
+After a drop, the bot also clears the dead audio player discord.py leaves behind, which
+otherwise made every following track fail with "Already playing audio".
 
 **Playlists resolve flat** (one yt-dlp call, about a second for 100 items). Individual
 stream URLs are fetched immediately before each track plays, so a long playlist queues
@@ -301,9 +346,13 @@ lock, because a `get()` then `set()` would drop one of two concurrent opt-outs.
 **Link allowlisting parses the host with `urlsplit`** and matches it against an exact
 domain/subdomain list. This must never be reimplemented with string splitting: a `#` or `?`
 can smuggle an allowlisted suffix past that check and turn the auto-converter into an SSRF
-primitive.
+primitive. The host check alone isn't enough, though: a tweet with no video makes yt-dlp
+hand off to whatever link the tweet contains. So downloads are also restricted to yt-dlp's
+`twitter`, `tiktok` and `vm.tiktok` extractors, and the generic one can never run.
 
-**yt-dlp needs a JS runtime** for YouTube; the image ships Node.
+**yt-dlp needs a JS runtime** for YouTube, and by default it only uses Deno. The image ships
+Deno as the pip `deno` wheel. Debian's Node is below yt-dlp's minimum version, and
+yt-dlp ignores Node unless it's told to use it.
 
 ---
 

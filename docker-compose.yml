@@ -15,10 +15,19 @@ services:
     volumes:
       - ./logs:/app/logs
       - bot-downloads:/app/downloads   # temp media + guild settings (persisted)
+      # yt-dlp cookies: a host path in YTDL_COOKIES_FILE doesn't exist in the container, so the bot
+      # warns at start-up and runs without cookies. Create ./cookies.txt FIRST, then uncomment this
+      # and set YTDL_COOKIES_FILE=/app/cookies.txt. Mounting a missing file makes Docker create a
+      # directory in its place; the bot ignores that with a warning too, but it stays on the host
+      # until you `rmdir cookies.txt`, create the file and recreate the container.
+      # The bot only reads it (cookies are never written back), so :ro is fine.
+      # - ./cookies.txt:/app/cookies.txt:ro
     # `deploy.resources` is swarm-only and is ignored by `docker compose up`, so the cap
     # was never actually applied. mem_limit is the compose-v2 key.
     mem_limit: 768m         # two concurrent x265 encodes need headroom
-    stop_grace_period: 20s
+    # cog_unload's voice disconnects are bounded at 8 s, then closing the gateway can take up
+    # to 10 s more; 20 s left almost no margin before Docker SIGKILLs a clean shutdown.
+    stop_grace_period: 30s
 
 volumes:
   bot-downloads:

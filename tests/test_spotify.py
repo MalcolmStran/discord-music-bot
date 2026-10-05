@@ -164,6 +164,57 @@ async def test_via_embed_respects_max_tracks(monkeypatch):
     assert len(tracks) == 1
 
 
+class _FakeApiResponse:
+    def __init__(self, payload):
+        self._payload = payload
+
+    def raise_for_status(self):
+        pass
+
+    async def json(self):
+        return self._payload
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+
+class _FakeApiSession:
+    """Answers like the Web API, and 400s an album-tracks page over Spotify's 50 limit."""
+    def __init__(self, urls):
+        self.urls = urls
+
+    def post(self, url, **kw):
+        return _FakeApiResponse({"access_token": "tok", "expires_in": 3600})
+
+    def get(self, url, **kw):
+        self.urls.append(url)
+        if "/tracks?" not in url:
+            return _FakeApiResponse({"images": [{"url": "cover.jpg"}]})
+        limit = int(url.rsplit("limit=", 1)[1].split("&")[0])
+        if limit > 50:
+            raise AssertionError(f"400 Invalid limit: {url}")
+        return _FakeApiResponse({"items": [{"name": "Song", "artists": [{"name": "A"}]}], "next": None})
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+
+async def test_api_album_pages_ask_for_at_most_50_tracks(monkeypatch):
+    """Album tracks allow limit <= 50; asking for 100 got a 400, so with API credentials
+    every album still fell back to the truncated embed page."""
+    urls: list[str] = []
+    monkeypatch.setattr("bot.core.spotify.aiohttp.ClientSession", lambda *a, **kw: _FakeApiSession(urls))
+    tracks = await Spotify("id", "secret")._via_api("album", "5ht7ItJgpBH7W6vJ5BqpPr", requester_id=None)
+    assert [t.search_query for t in tracks] == ["A - Song"]
+    assert urls[-1].endswith("/albums/5ht7ItJgpBH7W6vJ5BqpPr/tracks?limit=50")
+
+
 async def test_artist_links_are_rejected_before_any_network_call():
     with pytest.raises(LookupError, match="Artist links"):
         await Spotify().resolve("https://open.spotify.com/artist/1vCWHaC5f2uS3yhpwWbIA6")

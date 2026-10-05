@@ -1,9 +1,9 @@
 """yt-dlp integration: resolve queries/URLs into Tracks, and build audio sources.
 
 Design notes
-* Resolution is *flat* for playlists (one yt-dlp call, no per-entry fetch), so a 50-song
-  playlist queues in ~1 s. The real stream URL is fetched lazily right before playback
-  (stream URLs expire anyway).
+* Resolution is *flat* (one yt-dlp call, no per-entry fetch) and capped at max_playlist
+  entries, so a 50-song playlist queues in ~1 s and a channel link can't expand to thousands.
+  The real stream URL is fetched lazily right before playback (stream URLs expire anyway).
 * We keep only the small fields we need per Track — the v1 code kept the entire yt-dlp
   info dict (with every format) for every queued song.
 * All yt-dlp calls run in a thread via asyncio.to_thread.
@@ -11,8 +11,10 @@ Design notes
 from __future__ import annotations
 
 import asyncio
+import itertools
 import logging
 import re
+import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -21,7 +23,7 @@ from typing import Any, Optional
 import aiohttp
 import discord
 import yt_dlp
-from yt_dlp.utils import DownloadError
+from yt_dlp.utils import DownloadError, YoutubeDLError
 
 log = logging.getLogger(__name__)
 
@@ -38,6 +40,13 @@ FFMPEG_OPTS = "-vn -loglevel error"
 # shape of request ffmpeg makes) before handing it over; a client that fails is skipped for a while.
 YT_CLIENT_ORDER = ("default", "android")
 YT_CLIENT_PENALTY_SECONDS = 600
+
+
+class TooLong(LookupError):
+    """The real length (known only once fetch_stream extracts it) is over MAX_SONG_DURATION.
+
+    A separate type so the player can skip the track without counting it as a playback failure.
+    """
 
 
 @dataclass
@@ -81,34 +90,91 @@ def looks_like_playlist(q: str) -> bool:
     return looks_like_url(q) and bool(_PLAYLIST_HINT.search(q))
 
 
+# Flat entries that are collections, not tracks: a channel's /playlists tab and YouTube Music
+# shelves (YoutubeTab), SoundCloud user pages listing their sets, Bandcamp discographies.
+# Queued, each failed in fetch_stream with "No playable stream found." and fed the failure streak.
+_COLLECTION_IES = frozenset({"YoutubeTab", "YoutubePlaylist", "SoundcloudSet", "SoundcloudPlaylist",
+                             "SoundcloudUser", "BandcampAlbum", "BandcampUser",
+                             "YandexMusicAlbum", "YandexMusicPlaylist"})
+
+
+def _is_collection(entry: dict[str, Any]) -> bool:
+    # multi_video (an upload in parts) holds its parts as entries too; two levels down it is
+    # past the one level _track_entries flattens, and queued whole it has no stream of its own
+    if entry.get("_type") in ("playlist", "multi_video"):
+        return True
+    # The extractor yt-dlp named for an entry beats the URL's shape: every Yandex Music track
+    # is http://music.yandex.ru/album/<id>/track/<id>, and the /album/ hint dropped them all.
+    if entry.get("ie_key"):
+        return entry["ie_key"] in _COLLECTION_IES
+    return looks_like_playlist(entry.get("url") or "")
+
+
+def _track_entries(entries):
+    """The entries of a flat result that can be queued, with one nested level flattened.
+
+    A channel root (youtube.com/@name, a YouTube Music artist) is a playlist of its tabs, and
+    yt-dlp fills each tab with its videos even when flat. Taking the tabs as entries queued
+    "X - Videos", "X - Live" and "X - Shorts", none of them playable, and dropped the videos.
+    """
+    for e in entries:
+        if not e:
+            continue
+        if e.get("_type") == "playlist" or e.get("entries") is not None:
+            for sub in e.get("entries") or []:
+                # a tab's live stream never ends, so it would hold the queue forever
+                if sub and sub.get("live_status") != "is_live" and not _is_collection(sub):
+                    yield sub
+        elif not _is_collection(e):
+            yield e
+
+
 class YTDL:
     """Thin async wrapper around yt_dlp.YoutubeDL."""
 
-    def __init__(self, cookies_file: Optional[Path] = None, max_playlist: int = 100):
+    def __init__(self, cookies_file: Optional[Path] = None, max_playlist: int = 100, max_duration: int = 0):
         self.max_playlist = max_playlist
+        self.max_duration = max_duration   # seconds; 0 = no limit
+        # No "ignoreerrors": any truthy value (the CLI's "only_download" included) makes yt-dlp
+        # log ExtractorErrors and return None instead of raising, so a private or age-gated
+        # video reached the user as "No results." and _friendly() never saw the real reason.
+        # (Resolving turns it back on below, with a logger that keeps that reason.)
         base: dict[str, Any] = {
             "format": "bestaudio[acodec=opus]/bestaudio/best",
             "quiet": True,
             "no_warnings": True,
             "noprogress": True,
-            "ignoreerrors": "only_download",
             "default_search": "ytsearch",
             "source_address": "0.0.0.0",
             "logger": _QuietLogger(),
         }
-        if cookies_file and cookies_file.exists():
+        # is_file(), not exists(): a directory (what Docker mounts when the source file is
+        # missing) made yt-dlp fail every extraction with "Is a directory".
+        if cookies_file and cookies_file.is_file():
             base["cookiefile"] = str(cookies_file)
         self._opts = base
-        # separate instances: flat (for resolving) and full (for stream urls, one per YT client)
-        self._flat = yt_dlp.YoutubeDL({**base, "extract_flat": "in_playlist", "playlistend": max_playlist})
-        self._full = yt_dlp.YoutubeDL({**base, "noplaylist": True})
+        # Resolving is always flat and capped. A non-hinted URL can still be a collection by
+        # itself (a channel, an artist or likes page); without these it was fully extracted,
+        # one request per entry and with no MAX_QUEUE_SIZE cap, which held a worker thread for
+        # hours. 'in_playlist' leaves a single video's own extraction untouched.
+        # Resolving does ignore errors: yt-dlp fetches each later page of a channel or long
+        # playlist under its error handler, and without this one 403/429 on page 2 failed the
+        # whole /play instead of queueing the pages that loaded. Each call's _ErrorCapture
+        # keeps the error yt-dlp logs instead of raising, so a private video still says so.
+        self._resolve_opts = {**base, "extract_flat": "in_playlist", "playlistend": max_playlist,
+                              "ignoreerrors": "only_download"}
+        # fetch_stream only ever wants ONE video. A queued entry that is itself a collection (a
+        # channel tab or an album from a flat listing) must fail fast with "No playable stream
+        # found." instead of fully extracting everything in it inside the player loop.
+        self._fetch_opts = {**base, "noplaylist": True, "extract_flat": "in_playlist", "playlistend": 1}
+        # long-lived instances for stream urls, one per YT client
+        self._full = yt_dlp.YoutubeDL({**self._fetch_opts})
         self._full_by_client: dict[str, yt_dlp.YoutubeDL] = {"default": self._full}
         self._client_bad_until: dict[str, float] = {}
 
     def _full_for(self, client: str) -> yt_dlp.YoutubeDL:
         if client not in self._full_by_client:
-            opts = {**self._opts, "noplaylist": True,
-                    "extractor_args": {"youtube": {"player_client": [client]}}}
+            opts = {**self._fetch_opts, "extractor_args": {"youtube": {"player_client": [client]}}}
             self._full_by_client[client] = yt_dlp.YoutubeDL(opts)
         return self._full_by_client[client]
 
@@ -116,21 +182,27 @@ class YTDL:
     async def resolve(self, query: str, requester_id: Optional[int] = None) -> list[Track]:
         """Return one or more Tracks for a search query, video URL or playlist URL."""
         query = query.strip()
-        use_flat = looks_like_playlist(query)
-        ydl = self._flat if use_flat else self._full
-        q = query if looks_like_url(query) else f"ytsearch1:{query}"
+        errors = _ErrorCapture()
+        opts = {**self._resolve_opts, "logger": errors}
+        if not looks_like_playlist(query):
+            opts["noplaylist"] = True        # watch?v=..&list=.. without a hint: just the video
+        is_search = not looks_like_url(query)
+        q = f"ytsearch1:{query}" if is_search else query
         try:
-            info = await asyncio.to_thread(ydl.extract_info, q, False)
+            info = await asyncio.to_thread(_extract_once, opts, q)
         except DownloadError as e:
             raise LookupError(_friendly(str(e))) from e
         if not info:
-            raise LookupError("No results.")
+            raise LookupError(errors.friendly("No results."))
         entries = info.get("entries")
         if entries is None:
             return [self._to_track(info, requester_id)]
-        tracks = [self._to_track(e, requester_id) for e in entries if e]
+        # playlistend caps each channel tab on its own, so the total is capped here
+        tracks = [self._to_track(e, requester_id)
+                  for e in itertools.islice(_track_entries(entries), self.max_playlist)]
         if not tracks:
-            raise LookupError("Playlist is empty or unavailable.")
+            # a search with zero hits is an empty playlist to yt-dlp, not to the user
+            raise LookupError(errors.friendly("No results." if is_search else "Playlist is empty or unavailable."))
         return tracks
 
     async def fetch_stream(self, track: Track) -> Track:
@@ -152,8 +224,21 @@ class YTDL:
                 last_err = _friendly(str(e))
                 log.info("extract via %s failed for %s: %s", client, track.webpage_url, last_err)
                 continue
+            except Exception as e:
+                # Without ignoreerrors, an extractor crash (not an ExtractorError, e.g. after a
+                # site change) escapes as itself; still give the next client its turn.
+                last_err = "Could not load stream."
+                log.warning("extract via %s crashed for %s: %r", client, track.webpage_url, e)
+                continue
             if not info:
                 continue
+            # Check here, not only at /play: flat entries (SoundCloud sets) and Spotify's
+            # YouTube matches have no trustworthy length until now. Every client reports the
+            # same length, so raise instead of trying the next one; checked before the probe
+            # so a rejected track costs no request and can't penalise the client.
+            dur = int(info.get("duration") or 0)
+            if self.max_duration and dur > self.max_duration:
+                raise TooLong(f"Too long ({fmt_duration(dur)}; max {fmt_duration(self.max_duration)}).")
             url = info.get("url")
             fmt = _audio_format(info)
             if not url and fmt:
@@ -187,13 +272,14 @@ class YTDL:
     async def _resolve_search(self, track: Track) -> None:
         """Spotify/other metadata-only tracks: find the matching YouTube video by search."""
         q = f"ytsearch1:{track.search_query}"
+        errors = _ErrorCapture()
         try:
-            info = await asyncio.to_thread(self._flat.extract_info, q, False)
+            info = await asyncio.to_thread(_extract_once, {**self._resolve_opts, "logger": errors}, q)
         except DownloadError as e:
             raise LookupError(_friendly(str(e))) from e
         entries = [e for e in (info or {}).get("entries", []) if e]
         if not entries:
-            raise LookupError(f"No YouTube match for “{track.search_query}”.")
+            raise LookupError(errors.friendly(f"No YouTube match for “{track.search_query}”."))
         hit = entries[0]
         url = hit.get("webpage_url") or hit.get("url") or ""
         if url and not looks_like_url(url):
@@ -244,6 +330,25 @@ class YTDL:
         return discord.PCMVolumeTransformer(src, volume=volume)
 
 
+def _extract_once(opts: dict[str, Any], query: str) -> Optional[dict[str, Any]]:
+    """extract_info on a YoutubeDL built for this one call, inside the worker thread.
+
+    Resolving used to share long-lived instances across threads. yt-dlp's playlist recursion
+    guard (`_playlist_urls`) is per instance, and a search is a playlist, so while one `/play`
+    of a search or playlist link was in flight an identical one got None: "No results.".
+    YoutubeDL keeps `opts` as its own params dict, so callers pass a fresh copy.
+    """
+    ydl = yt_dlp.YoutubeDL(opts)
+    try:
+        return ydl.extract_info(query, download=False)
+    finally:
+        # No `with`: close() saves the cookie jar back to YTDL_COOKIES_FILE, which would rewrite
+        # the operator's file on every resolve, race concurrent resolves, and fail on a
+        # read-only mount. Drop it so close() only releases the sockets.
+        ydl.params.pop("cookiefile", None)
+        ydl.close()
+
+
 def _clean_header(value: str) -> str:
     """Strip CR/LF so a header value cannot inject extra header lines into ffmpeg's blob."""
     return str(value).replace("\r", "").replace("\n", "").strip()
@@ -283,7 +388,42 @@ class _QuietLogger:
         log.warning("yt-dlp: %s", msg)
 
 
+class _ErrorCapture(_QuietLogger):
+    """One resolve's logger: keeps the last error yt-dlp reported.
+
+    Under 'ignoreerrors' yt-dlp logs an ExtractorError and returns None (or no entries)
+    instead of raising, so this is the only place the real reason is left for _friendly().
+    """
+
+    CRASHED = "Couldn't load that; it's been logged."
+
+    def __init__(self) -> None:
+        self.last: Optional[str] = None
+        self.crashed = False
+
+    def error(self, msg):
+        self.last = msg
+        # 'ignoreerrors' also swallows extractor crashes (a TypeError after a site change) and
+        # passes on only str(e): "'NoneType' object is not subscriptable" reached Discord and
+        # the traceback was lost. yt-dlp reports from inside its except block, so the
+        # exception is still live here; anything outside its own hierarchy is a crash.
+        exc = sys.exc_info()[1]
+        self.crashed = exc is not None and not isinstance(exc, YoutubeDLError)
+        if self.crashed:
+            log.warning("yt-dlp crashed: %s", msg, exc_info=exc)
+        else:
+            super().error(msg)
+
+    def friendly(self, default: str) -> str:
+        if self.crashed:
+            return self.CRASHED
+        return _friendly(self.last) if self.last else default
+
+
 def _friendly(err: str) -> str:
+    # Unexpected ExtractorErrors end in yt-dlp's "; please report this issue on
+    # https://github.com/yt-dlp/..." boilerplate, which reached Discord (link embed and all).
+    err = re.split(r";?\s*please report this issue", err, flags=re.I)[0]
     low = err.lower()
     if "private video" in low:
         return "That video is private."
@@ -304,6 +444,11 @@ def _friendly(err: str) -> str:
         return "No results."
     if "is live" in low or "premieres in" in low:
         return "That stream hasn't started yet."
+    # Last, so it shadows none of the specific reasons above. Not YouTube-specific: this also
+    # serves SoundCloud, Bandcamp etc.
+    if any(s in low for s in ("failed to extract any player response", "unable to download api page",
+                              "http error 403", "http error 429")):
+        return "The site refused the request; try again later (cookies may help)."
     # strip yt-dlp's "ERROR: [youtube] xyz: " prefix
     m = re.search(r"ERROR:\s*(?:\[[^\]]+\]\s*)?(?:[\w-]+:\s*)?(.*)", err)
     return (m.group(1) if m else err).strip()[:200] or "Could not load that."

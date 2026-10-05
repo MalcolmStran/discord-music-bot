@@ -1,4 +1,8 @@
 """Environment parsing: degenerate values used to be accepted verbatim and brick the bot."""
+import logging
+import os
+from pathlib import Path
+
 import pytest
 
 from bot.config import Config, _bool, _float, _int, _log_level, _prefix
@@ -109,6 +113,94 @@ def test_derived_paths_live_under_download_dir(monkeypatch, tmp_path):
     monkeypatch.setenv("DOWNLOAD_DIR", str(tmp_path))
     cfg = Config.from_env()
     assert cfg.data_dir.parent == tmp_path and cfg.media_tmp_dir.parent == tmp_path
+
+
+@pytest.mark.parametrize("raw", ["", "   "])
+def test_blank_download_dir_falls_back_to_the_default(monkeypatch, raw):
+    """Path("") is ".", which put guild settings in ./bot_settings, outside the persisted
+    volume, so they were lost on every container rebuild."""
+    monkeypatch.setenv("DISCORD_TOKEN", "t")
+    monkeypatch.setenv("DOWNLOAD_DIR", raw)
+    cfg = Config.from_env()
+    assert cfg.download_dir == Path("./downloads")
+    assert cfg.data_dir == Path("./downloads/bot_settings")
+
+
+def test_missing_cookies_file_is_warned_about(monkeypatch, tmp_path, caplog):
+    """yt-dlp's callers skip a missing cookies file silently; under Docker a host path never
+    exists inside the container, so cookies looked configured but were never sent."""
+    monkeypatch.setenv("DISCORD_TOKEN", "t")
+    missing = tmp_path / "nope" / "cookies.txt"
+    monkeypatch.setenv("YTDL_COOKIES_FILE", str(missing))
+    with caplog.at_level(logging.WARNING, logger="bot.config"):
+        cfg = Config.from_env()
+    assert cfg.ytdl_cookies_file is None
+    [rec] = [r for r in caplog.records if "YTDL_COOKIES_FILE" in r.getMessage()]
+    assert rec.levelno == logging.WARNING
+    assert str(missing) in rec.getMessage() and "inside the container" in rec.getMessage()
+
+
+def test_a_cookies_directory_is_warned_about_and_not_used(monkeypatch, tmp_path, caplog):
+    """Docker creates a directory at the mount point when the cookies file it mounts is
+    missing. exists() let it through without a word, and yt-dlp then failed every /play and
+    every conversion with "Is a directory"."""
+    monkeypatch.setenv("DISCORD_TOKEN", "t")
+    made_by_docker = tmp_path / "cookies.txt"
+    made_by_docker.mkdir()
+    monkeypatch.setenv("YTDL_COOKIES_FILE", str(made_by_docker))
+    with caplog.at_level(logging.WARNING, logger="bot.config"):
+        cfg = Config.from_env()
+    assert cfg.ytdl_cookies_file is None
+    [rec] = [r for r in caplog.records if "YTDL_COOKIES_FILE" in r.getMessage()]
+    assert rec.levelno == logging.WARNING
+    assert "is a directory" in rec.getMessage() and "rmdir cookies.txt" in rec.getMessage()
+
+
+def test_an_unreadable_cookies_file_is_warned_about_and_not_used(monkeypatch, tmp_path, caplog):
+    """yt-dlp skips a cookies file it can't read without a word, so cookies looked configured
+    but were never sent."""
+    monkeypatch.setenv("DISCORD_TOKEN", "t")
+    jar = tmp_path / "cookies.txt"
+    jar.write_text("# Netscape HTTP Cookie File\n")
+    jar.chmod(0)
+    monkeypatch.setenv("YTDL_COOKIES_FILE", str(jar))
+    # root reads a mode-000 file anyway (and the suite runs as root in the container), so
+    # answer the permission check the way it is answered for the bot's unprivileged user
+    real_access = os.access
+    monkeypatch.setattr(os, "access", lambda p, mode: False if Path(p) == jar else real_access(p, mode))
+    with caplog.at_level(logging.WARNING, logger="bot.config"):
+        cfg = Config.from_env()
+    assert cfg.ytdl_cookies_file is None
+    [rec] = [r for r in caplog.records if "YTDL_COOKIES_FILE" in r.getMessage()]
+    assert rec.levelno == logging.WARNING
+    assert str(jar) in rec.getMessage() and "permissions" in rec.getMessage()
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs os.mkfifo")
+def test_a_cookies_path_that_is_not_a_regular_file_is_not_used(monkeypatch, tmp_path, caplog):
+    """A FIFO (or socket, or device) passes the read-permission check but is no cookies file;
+    YTDL and video.download skip anything but a regular file without a word, so this warning
+    is the only sign that cookies are not being sent."""
+    monkeypatch.setenv("DISCORD_TOKEN", "t")
+    fifo = tmp_path / "cookies.txt"
+    os.mkfifo(fifo)
+    monkeypatch.setenv("YTDL_COOKIES_FILE", str(fifo))
+    with caplog.at_level(logging.WARNING, logger="bot.config"):
+        cfg = Config.from_env()
+    assert cfg.ytdl_cookies_file is None
+    [rec] = [r for r in caplog.records if "YTDL_COOKIES_FILE" in r.getMessage()]
+    assert str(fifo) in rec.getMessage() and "not a file" in rec.getMessage()
+
+
+def test_existing_cookies_file_is_used_and_not_warned_about(monkeypatch, tmp_path, caplog):
+    monkeypatch.setenv("DISCORD_TOKEN", "t")
+    jar = tmp_path / "cookies.txt"
+    jar.write_text("# Netscape HTTP Cookie File\n")
+    monkeypatch.setenv("YTDL_COOKIES_FILE", str(jar))
+    with caplog.at_level(logging.WARNING, logger="bot.config"):
+        cfg = Config.from_env()
+    assert cfg.ytdl_cookies_file == jar
+    assert not [r for r in caplog.records if "YTDL_COOKIES_FILE" in r.getMessage()]
 
 
 def test_blank_bool_falls_back_to_the_default(monkeypatch):

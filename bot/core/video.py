@@ -1,6 +1,6 @@
 """Video download + "fit under N bytes" compression for Discord uploads.
 
-* download():   yt-dlp (Twitter/X, TikTok, and anything else yt-dlp supports), with an
+* download():   yt-dlp, restricted to its Twitter/X and TikTok post extractors, with an
                 optional RapidAPI fallback for TikTok.
 * fit_under():  ffprobe → pick bitrate for the target size → two-pass encode; ladder of
                 attempts (x264 source-res → x264 480p → x265 480p) until it fits, skipping
@@ -11,18 +11,22 @@ links can never fork unbounded encoders (the 2026-04-14 PSP lesson).
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import logging
 import os
 import re
 import shutil
+import time
 import uuid
+from collections.abc import Collection
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
 import aiohttp
 import yt_dlp
+from yt_dlp.extractor import gen_extractor_classes
 from yt_dlp.utils import DownloadError
 
 log = logging.getLogger(__name__)
@@ -114,10 +118,64 @@ def _sem(kind: str) -> asyncio.Semaphore:
 
 
 # ------------------------------------------------------------------ download
+# The only yt-dlp extractors download() may run (full-match regexes on extractor names).
+# The cog's host allowlist only vets the URL the user posted: with every extractor enabled,
+# a tweet with no video of its own made TwitterIE hand its link (any host the tweet's
+# author chose) to the generic extractor, which fetched it from the bot's network and
+# uploaded whatever came back — an SSRF into the operator's LAN. The short list also stops
+# profile, hashtag, Space and broadcast links (tiktok:user, twitter:broadcast, ...) from
+# uploading some arbitrary video nobody asked for.
+ALLOWED_EXTRACTORS = ["twitter", "tiktok", "vm.tiktok"]
+
+
+@functools.cache
+def _allowed_ies() -> tuple[type, ...]:
+    """The extractor classes ALLOWED_EXTRACTORS enables, picked the way yt-dlp's
+    add_default_info_extractors picks them (case-insensitive full match on IE_NAME)."""
+    every = {ie.IE_NAME.lower(): ie for ie in gen_extractor_classes()}
+    return tuple(ie for name, ie in every.items()
+                 if any(re.fullmatch(pat, name, re.I) for pat in ALLOWED_EXTRACTORS))
+
+
+def downloadable(url: str) -> bool:
+    """Whether download() could fetch this (normalised) link at all, decided offline.
+
+    yt-dlp only refuses a profile, hashtag, live or Space link once download() runs, so
+    the listener reacted ⏳ to it, counted it as failed and let it take one of a message's
+    two conversion slots ahead of a real post. This is the same suitable() test yt-dlp
+    applies to the same extractors, so the two cannot drift apart.
+    """
+    return any(ie.suitable(url) for ie in _allowed_ies())
+
+
+# Wall-clock cap on one download. Generous on purpose (500 MB still fits at ~0.3 MB/s):
+# it only stops a crawling source from holding a download slot indefinitely.
+DOWNLOAD_TIMEOUT_SECONDS = 1800
+
+
+class _TooBig(Exception):
+    """Raised from the progress hook to abort a download that went over max_bytes."""
+
+
+class _TooSlow(Exception):
+    """Raised from the progress hook to abort a download that ran past its deadline."""
+
+
 async def download(url: str, workdir: Path, max_bytes: int, *, cookies_file: Optional[Path] = None,
-                   rapidapi_key: Optional[str] = None) -> Path:
+                   rapidapi_key: Optional[str] = None, timeout: float = DOWNLOAD_TIMEOUT_SECONDS) -> Path:
     workdir.mkdir(parents=True, exist_ok=True)
     stem = workdir / f"dl_{uuid.uuid4().hex[:10]}"
+
+    def _guard(d: dict) -> None:
+        # yt-dlp's max_filesize is only checked against a Content-Length header, so HLS
+        # fragments and chunked responses streamed straight past MAX_DOWNLOAD_MB and were
+        # refused only once the whole file was on disk. downloaded_bytes is per format, so
+        # a merged bv+ba can still land over the cap: the size check below stays.
+        if d.get("status") == "downloading" and (d.get("downloaded_bytes") or 0) > max_bytes:
+            raise _TooBig
+        if time.monotonic() > deadline:
+            raise _TooSlow
+
     opts = {
         "format": "bv*[ext=mp4][height<=1080]+ba[ext=m4a]/b[ext=mp4][height<=1080]/b[height<=1080]/b",
         "merge_output_format": "mp4",
@@ -127,19 +185,51 @@ async def download(url: str, workdir: Path, max_bytes: int, *, cookies_file: Opt
         "max_filesize": max_bytes,
         "retries": 3,
         "logger": _Quiet(),
+        "allowed_extractors": ALLOWED_EXTRACTORS,
+        "progress_hooks": [_guard],
+        # Live streams are recorded by FFmpegFD, which only calls progress hooks once the
+        # stream ends, so _guard could never stop one. Skip them up front instead.
+        "match_filter": yt_dlp.utils.match_filter_func("!is_live"),
     }
-    if cookies_file and cookies_file.exists():
+    # is_file(), not exists(): when the file to bind-mount is missing, Docker creates a
+    # directory in its place, and yt-dlp then failed EVERY download with "Is a directory".
+    # Anything but a regular file means going without cookies.
+    if cookies_file and cookies_file.is_file():
         opts["cookiefile"] = str(cookies_file)
     too_big = False
     async with _sem("download"):
+        # The clock starts once the slot is ours: a job queued behind three slow downloads
+        # holds nothing while it waits, yet it used to reach its slot with the budget spent
+        # and fail on its first chunk as "took too long", however small the video.
+        deadline = time.monotonic() + timeout
         def _run() -> None:
-            with yt_dlp.YoutubeDL(opts) as ydl:      # closing it releases yt-dlp's sockets
+            ydl = yt_dlp.YoutubeDL(opts)
+            try:
                 ydl.download([url])
+            finally:
+                # close() releases yt-dlp's sockets, but it also writes the cookie jar back
+                # to cookiefile: on a read-only mount that raised after a finished download,
+                # which was then swept as "Couldn't download that video", and otherwise it
+                # rewrote the operator's file. Cookies are read, never written back — the
+                # long-lived instances in ytdl.py never write them either.
+                ydl.params.pop("cookiefile", None)
+                ydl.close()
         try:
             await asyncio.to_thread(_run)
+        except _TooBig as e:
+            _sweep(workdir, stem.name)
+            raise VideoError(f"Video is larger than {max_bytes // 1024 // 1024} MB.") from e
+        except _TooSlow as e:
+            _sweep(workdir, stem.name)
+            raise VideoError("That video took too long to download.") from e
         except DownloadError as e:
             msg = str(e)
-            if "tiktok" in url.lower() and rapidapi_key:
+            # A link no allowed extractor handles (a profile, a live page) would only spend a
+            # paid API call before failing anyway, so it never goes to the fallback. Only that
+            # refusal ("No suitable extractor"): "Unsupported URL" is what TikTokVMIE raises
+            # when a vm./vt. short link does not redirect for the bot, which is exactly the
+            # IP-level refusal the paid fallback is for.
+            if "tiktok" in url.lower() and rapidapi_key and "no suitable extractor" not in msg.lower():
                 log.info("yt-dlp failed for TikTok (%s); trying RapidAPI fallback", msg[:80])
                 try:
                     fallback = await _tiktok_rapidapi(url, stem.with_suffix(".mp4"), max_bytes, rapidapi_key)
@@ -257,7 +347,10 @@ async def probe(path: Path, *, timeout: int = 60) -> Probe:
         await _terminate(proc)
         raise VideoError("ffprobe timed out reading that file.") from e
     if proc.returncode != 0:
-        raise VideoError(f"ffprobe failed: {err.decode(errors='ignore')[:200]}")
+        # ffprobe's stderr opens with the file's absolute temp path, and /convert posts the
+        # error text in the channel, so the details go to the log only.
+        log.warning("ffprobe failed for %s: %s", path, err.decode(errors="ignore")[-300:].strip())
+        raise VideoError("That file isn't a readable video.")
     try:
         info = json.loads(out or b"{}")
     except ValueError as e:
@@ -533,13 +626,21 @@ async def to_gif(src: Path, limit_bytes: int, workdir: Path, *, info: Probe,
 
 
 # ------------------------------------------------------------------ cleanup
-def cleanup_dir(workdir: Path, older_than_seconds: int = 3600) -> int:
-    import time
+def cleanup_dir(workdir: Path, older_than_seconds: int = 3600, keep: Collection[Path] = frozenset()) -> int:
+    """Delete files older than the cutoff, except those in `keep`.
+
+    Age alone can't tell a stale file from a live job's source: a download is written once
+    and then only read, by every ffmpeg pass of every rung, so it looked stale to the floor
+    while a long encode (or one queued for a slot) still needed it. Callers pass the paths
+    their running jobs hold.
+    """
     n = 0
     if not workdir.exists():
         return 0
     cutoff = time.time() - older_than_seconds
     for p in workdir.iterdir():
+        if p in keep:
+            continue
         try:
             if p.is_file() and p.stat().st_mtime < cutoff:
                 p.unlink()
@@ -560,10 +661,14 @@ class _Quiet:
     def error(self, m):   log.info("yt-dlp: %s", m)
 
 
+_UNSUPPORTED = "That link isn't supported."
+
+
 def _friendly(err: str) -> str:
     low = err.lower()
-    if "unsupported url" in low:
-        return "That link isn't supported."
+    # "No suitable extractor" is how yt-dlp refuses a link ALLOWED_EXTRACTORS rules out.
+    if "unsupported url" in low or "no suitable extractor" in low:
+        return _UNSUPPORTED
     if "no video" in low or "no media" in low:
         return "No video found at that link."
     if "private" in low or "login" in low or "sign in" in low or "nsfw" in low:

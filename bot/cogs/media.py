@@ -18,6 +18,9 @@ from ..core.settings import GuildSettings
 log = logging.getLogger(__name__)
 
 URL_RE = re.compile(r"https?://[^\s<>()\[\]]+", re.I)
+# A ||spoiler|| span, non-greedy and across lines. A stray "||" can make a link look
+# spoilered when it is not, which only ever errs towards hiding it.
+_SPOILER_RE = re.compile(r"\|\|.+?\|\|", re.S)
 _ON_WORDS = ("on", "yes", "true", "1", "enable", "enabled", "start")
 _OFF_WORDS = ("off", "no", "false", "0", "disable", "disabled", "stop")
 # Trailing characters Discord markdown / prose commonly glues onto a link.
@@ -52,6 +55,11 @@ SUPPORTED = {
     kind: (*domains, *(f for f, k in EMBED_FIXERS.items() if k == kind))
     for kind, domains in _REAL_DOMAINS.items()
 }
+
+# Real TikTok hosts that yt-dlp's TikTok extractors only match as www.tiktok.com. Once
+# video.download() stopped falling back to the generic extractor (which used to follow
+# TikTok's redirect), these links failed outright unless rewritten.
+_TIKTOK_ALIASES = {"tiktok.com", "m.tiktok.com"}
 
 
 def _host(url: str) -> str:
@@ -107,7 +115,8 @@ def is_embed_fixer(url: str) -> bool:
 
 
 def normalise(url: str, kind: str) -> str:
-    """Point a fixer link back at the real site, keeping the path and query.
+    """Point a fixer link (or a bare / m. TikTok link) at the canonical host yt-dlp
+    expects, keeping the path and query.
 
     Rewriting the host through the parser rather than a "www.-or-nothing" prefix regex is
     what makes subdomains work: that regex left ``d.fxtwitter.com`` — which
@@ -115,6 +124,9 @@ def normalise(url: str, kind: str) -> str:
     /convert handed the third-party host to yt-dlp instead of x.com.
     """
     url = url.strip().rstrip(_TRAILING)
+    if _host(url) in _TIKTOK_ALIASES:
+        parts = urlsplit(url)
+        return urlunsplit(("https", CANONICAL_HOST["tiktok"], parts.path, parts.query, ""))
     fixer = fixer_domain(url)
     if not fixer:
         return url
@@ -123,6 +135,18 @@ def normalise(url: str, kind: str) -> str:
         return url
     parts = urlsplit(url)
     return urlunsplit(("https", target, parts.path, parts.query, ""))
+
+
+def _post_key(url: str, kind: str) -> tuple[str, str, str]:
+    """Which post a supported link points at, to spot the same one twice in a message.
+
+    The raw string was not enough: x.com / twitter.com / mobile.twitter.com forms and
+    ?s=20 share-tracking queries of one tweet each got converted and uploaded again. The
+    query is dropped because the post id lives in the path on both sites.
+    """
+    parts = urlsplit(normalise(url, kind))
+    host = CANONICAL_HOST["twitter"] if kind == "twitter" else (parts.hostname or "").lower()
+    return kind, host, parts.path.rstrip("/")
 
 
 class Media(commands.Cog):
@@ -136,6 +160,9 @@ class Media(commands.Cog):
         self.workdir.mkdir(parents=True, exist_ok=True)
         self.max_bytes = self.cfg.max_download_mb * 1024 * 1024
         self._inflight: set[int] = set()            # message ids being processed
+        # Work-dir files each running convert_and_send still needs, one entry per job so two
+        # jobs can never drop each other's paths. Cleanup skips them (see _in_use).
+        self._busy: dict[object, set[Path]] = {}
         self.stats = {"ok": 0, "failed": 0, "compressed": 0, "gif": 0, "skipped": 0}
         video.configure(self.cfg.max_concurrent_encodes)
         self.cleanup_loop.start()
@@ -143,12 +170,19 @@ class Media(commands.Cog):
     def cog_unload(self):
         self.cleanup_loop.cancel()
 
+    def _in_use(self) -> frozenset[Path]:
+        """Snapshot of every running job's files, taken on the event loop: the cleanup
+        thread must never iterate sets the loop is still changing."""
+        return frozenset(p for paths in self._busy.values() for p in paths)
+
     @tasks.loop(minutes=30)
     async def cleanup_loop(self):
         # An unhandled exception here would stop the loop for the rest of the process
         # lifetime and the temp dir would grow forever, so swallow and keep going.
         try:
-            n = await asyncio.to_thread(video.cleanup_dir, self.workdir, 3600)
+            # A job can outlive the hour (three rungs × two passes × the encode timeout,
+            # plus queueing for a slot), so its source is skipped, not judged by age.
+            n = await asyncio.to_thread(video.cleanup_dir, self.workdir, 3600, self._in_use())
         except Exception:
             log.exception("media cleanup failed")
             return
@@ -173,54 +207,104 @@ class Media(commands.Cog):
             return  # the command path handles it (/convert), don't convert twice
         if not self.settings.media_enabled(message.guild.id):
             return
+        spoilers = [m.span() for m in _SPOILER_RE.finditer(message.content)]
         # One parse per URL: classify() and is_embed_fixer() each re-parsed it otherwise.
-        links, fixers = [], 0
-        for u in URL_RE.findall(message.content):
+        links: dict[tuple[str, str, str], list] = {}   # post -> [url, kind, spoiler], first seen wins
+        found: list[Optional[tuple[str, str, str]]] = []  # each URL's post, None if we don't convert it
+        skipped, any_spoiler = 0, False
+        for m in URL_RE.finditer(message.content):
+            u = m.group()
+            # Test where the link STARTS: URL_RE runs on through the closing "||", so the
+            # match always ends past the spoiler span it sits in.
+            spoiler = any(s <= m.start() < e for s, e in spoilers)
+            any_spoiler = any_spoiler or spoiler
+            found.append(None)
             host = _host(u)
             kind = classify_host(host)
             if not kind:
                 continue
             if _matched_domain(host, EMBED_FIXERS):
                 # already embeds its own video; converting would post the clip twice
-                fixers += 1
+                skipped += 1
                 continue
-            links.append((u, kind))
-        self.stats["skipped"] += fixers
+            if not video.downloadable(normalise(u, kind)):
+                # A profile, hashtag, live or Space link: download() can only refuse it, so
+                # it must not flash ⏳, count as failed, or take a slot from a real post.
+                # Its key stays None, so the message keeps its embeds.
+                skipped += 1
+                continue
+            key = found[-1] = _post_key(u, kind)
+            if key in links:
+                links[key][2] = links[key][2] or spoiler    # spoilered anywhere → upload blurred
+            else:
+                links[key] = [u, kind, spoiler]
+        self.stats["skipped"] += skipped
         if not links:
             return
         # Checked here rather than above: this is the only point where the answer matters,
         # and the lookup builds a set, which is wasted on every message with no link at all.
         if self.settings.is_media_optout(message.author.id):
             return  # this person asked us to leave their posts alone (/autoconvert off)
+        # Don't spend a download and an encode slot on an upload Discord will refuse: in a
+        # channel the bot may not post in, every link used to be fetched and compressed only
+        # to fail with 403 on the final reply. attach_files is already False wherever the
+        # bot can't send (discord.py applies that for threads too); a reply also needs Read
+        # Message History. A thread whose parent isn't cached raises, so try as before. So
+        # does any other channel type: discord.py hands over a PartialMessageable for a
+        # channel or thread it hasn't cached, and its permissions_for() is always none(),
+        # which read as "may not post" and silently dropped every link there.
+        perms = None
+        if isinstance(message.channel, (discord.abc.GuildChannel, discord.Thread)):
+            try:
+                perms = message.channel.permissions_for(message.guild.me)
+            except discord.ClientException:
+                pass
+        if perms is not None and not (perms.attach_files and perms.read_message_history):
+            log.debug("no permission to upload in channel %s; leaving its links alone", message.channel.id)
+            return
         # at most 2 videos per message, and never process the same message twice
         if message.id in self._inflight:
             return
         self._inflight.add(message.id)
         try:
-            for url, kind in links[:2]:
-                await self.convert_and_send(message, normalise(url, kind), kind, reply_errors=False,
-                                            suppress_embeds=not fixers)
+            done = set()
+            for key, (url, kind, spoiler) in list(links.items())[:2]:
+                if await self.convert_and_send(message, normalise(url, kind), kind, reply_errors=False,
+                                               suppress_embeds=False, spoiler=spoiler):
+                    done.add(key)
+            # Discord's suppress flag removes EVERY embed on the message, so drop them only
+            # once each link in it has been replaced by an upload. Suppressing per conversion
+            # wiped the embeds of a YouTube link beside the tweet, of a third link past the
+            # cap, of a link whose conversion failed, and of an embed-fixer link (which the
+            # listener skipped precisely to keep its embed). A spoilered link's embed is the
+            # blurred copy the poster chose, so a spoiler anywhere keeps them all.
+            if not any_spoiler and all(k in done for k in found):
+                try:
+                    await message.edit(suppress=True)
+                except discord.HTTPException:
+                    pass
         finally:
             self._inflight.discard(message.id)
 
     async def _is_command_invocation(self, message: discord.Message) -> bool:
-        """True if this message starts with any prefix the bot answers to.
+        """True if this message is a real command: a prefix the bot answers to AND a known
+        command, which the command path handles (/convert), so don't convert twice.
 
         `commands.when_mentioned_or(...)` means the bot mention is a prefix as well as the
         configured one, so checking only cfg.prefix let `@Bot convert <link>` be converted
-        twice — once here and once by the command.
+        twice. But a prefix alone was too broad: "!!! look <link>" or "@Bot what is this
+        <link>" runs no command (CommandNotFound is ignored), so the link was silently
+        dropped.
         """
         try:
-            prefixes = await self.bot.get_prefix(message)
+            ctx = await self.bot.get_context(message)
         except Exception:
-            prefixes = self.cfg.prefix
-        if isinstance(prefixes, str):
-            prefixes = [prefixes]
-        return any(p and message.content.startswith(p) for p in prefixes)
+            return message.content.startswith(self.cfg.prefix)
+        return ctx.valid
 
     # ---------------------------------------------------------------- core
     async def convert_and_send(self, message: discord.Message, url: str, kind: str, *,
-                               reply_errors: bool, suppress_embeds: bool = True) -> bool:
+                               reply_errors: bool, suppress_embeds: bool = True, spoiler: bool = False) -> bool:
         guild = message.guild
         assert guild is not None
         limit = guild.filesize_limit                     # honours server boost level
@@ -242,33 +326,45 @@ class Media(commands.Cog):
             pass
         src: Optional[Path] = None
         out: Optional[Path] = None
+        held: set[Path] = set()
+        job = object()
+        self._busy[job] = held
         try:
             src = await video.download(url, self.workdir, self.max_bytes,
                                        cookies_file=self.cfg.ytdl_cookies_file, rapidapi_key=self.cfg.rapidapi_key)
+            held.add(src)       # before any await: /media-cleanup must never see it unclaimed
             info = await video.probe(src)
             target = int(limit * 0.97)
             out = None
+            # Which footer counter this job earns ("gif" / "compressed"). Counted only next to
+            # "ok": bumping it up front counted a compression that then raised (too long, no
+            # rung fit) or an upload Discord rejected as both compressed and failed.
+            made_as: Optional[str] = None
             # A silent clip is what GIF is for, and Discord autoplays a GIF inline instead of
             # showing the click-to-play card a muted MP4 gets.
             if video.should_gif(info, self.cfg.max_gif_seconds):
                 out = await video.to_gif(src, target, self.workdir, info=info,
                                          timeout=self.cfg.encode_timeout_seconds, progress=progress)
                 if out is not None:
-                    self.stats["gif"] += 1
+                    made_as = "gif"
             if out is None:                      # not silent, too long, or no rung fit
                 if src.stat().st_size > limit:
-                    self.stats["compressed"] += 1
                     out = await video.fit_under(src, target, self.workdir, info=info,
                                                 timeout=self.cfg.encode_timeout_seconds, progress=progress)
+                    made_as = "compressed"
                 else:
                     out = src
+            held.add(out)
             ext = out.suffix.lower().lstrip(".") or "mp4"
-            await message.reply(file=discord.File(out, filename=f"{kind}.{ext}"), mention_author=False)
+            # A link posted inside ||spoiler|| tags must not come back as a clip playing inline.
+            await message.reply(file=discord.File(out, filename=f"{kind}.{ext}", spoiler=spoiler),
+                                mention_author=False)
             self.stats["ok"] += 1
+            if made_as:
+                self.stats[made_as] += 1
             # Tidy: drop the original embed if we can. Discord's suppress flag applies to the
-            # WHOLE message, so when the same message also carries an embed-fixer link we
-            # must leave it alone — suppressing here would destroy the very embed the
-            # listener skipped that link to preserve.
+            # WHOLE message, which is why the listener passes False and decides once, after
+            # all its links are done. An explicit /convert still suppresses straight away.
             if suppress_embeds:
                 try:
                     await message.edit(suppress=True)
@@ -302,6 +398,7 @@ class Media(commands.Cog):
                         p.unlink(missing_ok=True)
                     except OSError:
                         pass
+            del self._busy[job]
             try:
                 await message.remove_reaction("⏳", guild.me)
             except discord.HTTPException:
@@ -323,6 +420,9 @@ class Media(commands.Cog):
         kind = classify(url)
         if not kind:
             return await ctx.send("❌ Only Twitter/X and TikTok links are supported.")
+        if not video.downloadable(normalise(url, kind)):
+            # a profile, hashtag, live or Space link: say so now, not after a download slot
+            return await ctx.send("❌ That link isn't supported.")
         if ctx.interaction:
             await ctx.interaction.response.send_message(f"⏳ Converting {kind} link…", ephemeral=True)
             # for slash commands we attach to a fresh message so replies have an anchor
@@ -392,7 +492,7 @@ class Media(commands.Cog):
         e.add_field(name="Your links",
                     value="🚫 not converted" if self.settings.is_media_optout(ctx.author.id) else "✅ converted",
                     inline=True)
-        e.add_field(name="Fixer links left alone", value=str(s["skipped"]), inline=True)
+        e.add_field(name="Links left alone", value=str(s["skipped"]), inline=True)
         e.add_field(name="Silent clips → GIF",
                     value=f"≤ {self.cfg.max_gif_seconds}s" if self.cfg.max_gif_seconds else "🚫 disabled",
                     inline=True)
@@ -405,9 +505,11 @@ class Media(commands.Cog):
     @app_commands.default_permissions(manage_guild=True)
     @commands.guild_only()
     async def media_cleanup(self, ctx: commands.Context):
-        # older_than_seconds=0 would also delete files a conversion is still writing, so
-        # keep a small floor; the periodic loop reclaims the rest.
-        n = await asyncio.to_thread(video.cleanup_dir, self.workdir, 60)
+        # The 60 s floor only protects files still being written (yt-dlp fragments, ffmpeg
+        # output). A finished download is only read from then on, by every ffmpeg pass, so
+        # it looked stale while a long encode still needed it: running jobs' files are
+        # skipped explicitly. The periodic loop reclaims the rest.
+        n = await asyncio.to_thread(video.cleanup_dir, self.workdir, 60, self._in_use())
         await ctx.send(f"🧹 Removed {n} temp file(s).")
 
 

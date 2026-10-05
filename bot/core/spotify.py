@@ -125,7 +125,9 @@ class Spotify:
                 meta = await r.json()
             cover = (meta.get("images") or [{}])[0].get("url")
             out: list[Track] = []
-            nxt = f"{base}/{kind}s/{sid}/tracks?limit=100"
+            # album tracks allow at most 50 per page (playlists 100); asking for 100 got a 400,
+            # so every album silently fell back to the truncated embed page
+            nxt = f"{base}/{kind}s/{sid}/tracks?limit={50 if kind == 'album' else 100}"
             while nxt and len(out) < self.max_tracks:
                 async with s.get(nxt, headers=h) as r:
                     r.raise_for_status()
