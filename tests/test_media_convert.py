@@ -3,6 +3,7 @@
 video.download / probe / fit_under / to_gif are replaced by stand-ins that write real files
 into the real work dir, so what the cog uploads, counts and leaves on disk is the real thing.
 """
+import asyncio
 import os
 import time
 from pathlib import Path
@@ -166,6 +167,59 @@ async def test_a_failed_job_releases_its_files_too(cog, big_clip, monkeypatch):
     monkeypatch.setattr(video, "fit_under", boom)
     assert not await cog.convert_and_send(_Message(), "https://x.com/a/status/1", "twitter", reply_errors=False)
     assert cog._busy == {}
+
+
+async def test_one_job_finishing_does_not_release_another_jobs_files(cog, monkeypatch):
+    """Each job claims its own entry: one shared set (or clearing it) let the first job to
+    finish hand the other job's source, mid-encode, to the next cleanup."""
+    async def download(url, workdir, max_bytes, **kw):
+        p = workdir / f"dl_{url[-1]}.mp4"
+        p.write_bytes(b"\0" * (11 * MB))
+        return p
+
+    a_done, seen = asyncio.Event(), {}
+
+    async def fit_under(src, target, workdir, **kw):
+        if src.name == "dl_b.mp4":
+            await a_done.wait()                  # B is still encoding when A finishes
+            _age(src, 2 * 3600)
+            await Media.media_cleanup.callback(cog, _Ctx())
+            seen["B's source survived"] = src.exists()
+        out = workdir / f"enc_{src.name}"
+        out.write_bytes(b"\0" * 1024)
+        return out
+
+    monkeypatch.setattr(video, "download", download)
+    monkeypatch.setattr(video, "probe", _probe)
+    monkeypatch.setattr(video, "fit_under", fit_under)
+    b = asyncio.create_task(cog.convert_and_send(_Message(), "https://x.com/u/status/b", "twitter",
+                                                 reply_errors=False))
+    await asyncio.sleep(0)                       # B is running
+    assert await cog.convert_and_send(_Message(), "https://x.com/u/status/a", "twitter", reply_errors=False)
+    a_done.set()
+    assert await b
+    assert seen == {"B's source survived": True}
+
+
+async def test_cleanup_spares_the_output_while_it_is_being_uploaded(cog, big_clip, monkeypatch):
+    """The encoded file is claimed too: a big upload can outlast /media-cleanup's 60 s
+    floor, and the cleanup used to count the file under the upload as stale and delete it."""
+    monkeypatch.setattr(video, "fit_under", _fit_under_ok())
+    msg, seen = _Message(), {}
+    reply = msg.reply
+
+    async def slow_upload(content=None, *, file=None, **kw):
+        if file is not None:
+            out = cog.workdir / "enc_test.mp4"
+            _age(out, 2 * 3600)
+            ctx = _Ctx()
+            await Media.media_cleanup.callback(cog, ctx)
+            seen["cleanup"], seen["output survived"] = ctx.sent, out.exists()
+        return await reply(content, file=file, **kw)
+
+    msg.reply = slow_upload
+    assert await cog.convert_and_send(msg, "https://x.com/a/status/1", "twitter", reply_errors=False)
+    assert seen == {"cleanup": ["🧹 Removed 0 temp file(s)."], "output survived": True}
 
 
 # ------------------------------------------------------------- /mediainfo counters

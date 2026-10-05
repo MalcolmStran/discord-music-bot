@@ -272,6 +272,14 @@ async def test_one_spoilered_link_keeps_every_embed(cog):
     assert not suppressed(cog)
 
 
+async def test_a_spoilered_link_with_text_glued_after_the_bars_is_still_a_spoiler(cog):
+    """URL_RE runs on through "||," here, so the match ends past the spoiler span: only
+    where the link STARTS says whether it is inside one."""
+    await urls(cog, "||https://x.com/a/status/1||, lol")
+    assert cog.spoilered == [True]
+    assert not suppressed(cog)
+
+
 async def test_a_link_after_a_closed_spoiler_is_not_spoilered(cog):
     await urls(cog, "||no peeking|| https://x.com/a/status/1")
     assert cog.spoilered == [False]
