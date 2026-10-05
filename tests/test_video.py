@@ -1,13 +1,16 @@
 """Encoder planning and ffmpeg argument construction (no ffmpeg needed), and download()
 driven through the real yt-dlp against a loopback server."""
+import asyncio
 import itertools
 import os
 import threading
+import types
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 import yt_dlp
 import yt_dlp.cookies
+import yt_dlp.extractor.tiktok as yt_tiktok
 import yt_dlp.extractor.twitter as yt_twitter
 
 from bot.core import video
@@ -419,6 +422,30 @@ async def test_a_tiktok_profile_is_refused_without_spending_a_rapidapi_call(tmp_
     assert called == []
 
 
+@pytest.mark.parametrize("short", [
+    "https://vm.tiktok.com/ZMabcdef/",
+    "https://vt.tiktok.com/ZSe4FqkKd",
+    "https://www.tiktok.com/t/ZTabcdef/",
+])
+async def test_a_short_link_tiktok_will_not_redirect_still_goes_to_rapidapi(tmp_path, monkeypatch, short):
+    """When TikTok answers the short link's HEAD without redirecting (refusing the bot's
+    IP), TikTokVMIE raises "Unsupported URL". That is when the paid fallback earns its keep,
+    but it was skipped like a profile link and the user told the link wasn't supported."""
+    called = []
+
+    async def fallback(url, dest, max_bytes, key):
+        called.append(url)
+        dest.write_bytes(b"\0" * 1024)
+        return dest
+
+    monkeypatch.setattr(yt_tiktok.TikTokVMIE, "_request_webpage",
+                        lambda self, req, *a, **kw: types.SimpleNamespace(url=req.url))
+    monkeypatch.setattr(video, "_tiktok_rapidapi", fallback)
+    out = await video.download(short, tmp_path, 10 * MB, rapidapi_key="k")
+    assert called == [short]
+    assert list(tmp_path.iterdir()) == [out]
+
+
 def test_only_the_post_extractors_are_enabled():
     """Names are full-match regexes: "twitter" must not also enable twitter:broadcast."""
     ydl = yt_dlp.YoutubeDL({"quiet": True, "allowed_extractors": video.ALLOWED_EXTRACTORS})
@@ -442,6 +469,24 @@ async def test_a_download_past_its_deadline_is_abandoned(tmp_path, monkeypatch, 
     with pytest.raises(video.VideoError, match="too long to download"):
         await video.download(TWEET, tmp_path, 10 * MB, timeout=0)
     assert list(tmp_path.iterdir()) == []
+
+
+async def test_time_spent_waiting_for_a_download_slot_does_not_count(tmp_path, monkeypatch, server):
+    """The deadline caps how long a job may HOLD a slot. Started before the job queued, it
+    failed a quick video that waited behind slow ones as "took too long to download"."""
+    clock = types.SimpleNamespace(now=1000.0)
+    monkeypatch.setattr(video, "time", types.SimpleNamespace(monotonic=lambda: clock.now))
+    monkeypatch.setattr(video, "_download_sem", asyncio.Semaphore(1))
+    src = server()
+    _tweet_returns(monkeypatch, _video_at(src.url))
+    await video._download_sem.acquire()             # a slow download holds the only slot
+    job = asyncio.create_task(video.download(TWEET, tmp_path, 10 * MB, timeout=60))
+    await asyncio.sleep(0)                          # queued for the slot
+    assert not job.done()
+    clock.now += 3600                               # an hour later the slot frees up
+    video._download_sem.release()
+    out = await job
+    assert out.stat().st_size == src.size
 
 
 async def test_a_live_stream_is_skipped_rather_than_recorded(tmp_path, monkeypatch, server):
@@ -474,6 +519,37 @@ async def test_the_operators_cookies_file_is_read_but_never_rewritten(tmp_path, 
     _tweet_returns(monkeypatch, _video_at(src.url))
     await video.download(TWEET, tmp_path / "w", 10 * MB, cookies_file=cookies)
     assert cookies.read_text() == _COOKIES
+
+
+async def test_a_cookies_path_that_is_a_directory_means_no_cookies_not_no_downloads(tmp_path, monkeypatch, server):
+    """Bind-mounting a cookies file that doesn't exist makes Docker create a directory
+    there. exists() let it through as cookiefile and every download failed with
+    "Is a directory"."""
+    cookies = tmp_path / "cookies.txt"
+    cookies.mkdir()
+    src = server()
+    _tweet_returns(monkeypatch, _video_at(src.url))
+    out = await video.download(TWEET, tmp_path / "w", 10 * MB, cookies_file=cookies)
+    assert out.stat().st_size == src.size
+
+
+async def test_yt_dlp_is_closed_after_every_download(tmp_path, monkeypatch, server):
+    """close() releases yt-dlp's request handlers and their sockets; dropping the `with`
+    for the cookie fix must not have dropped it too."""
+    closed = []
+
+    class Recording(yt_dlp.YoutubeDL):
+        def close(self):
+            closed.append(self)
+            super().close()
+
+    monkeypatch.setattr(yt_dlp, "YoutubeDL", Recording)
+    src = server()
+    _tweet_returns(monkeypatch, _video_at(src.url))
+    await video.download(TWEET, tmp_path / "ok", 10 * MB)
+    with pytest.raises(video.VideoError):
+        await video.download(TWEET, tmp_path / "too-big", 1024)
+    assert len(closed) == 2
 
 
 async def test_a_read_only_cookies_file_does_not_throw_away_a_finished_download(tmp_path, monkeypatch, server):

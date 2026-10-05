@@ -142,7 +142,6 @@ async def download(url: str, workdir: Path, max_bytes: int, *, cookies_file: Opt
                    rapidapi_key: Optional[str] = None, timeout: float = DOWNLOAD_TIMEOUT_SECONDS) -> Path:
     workdir.mkdir(parents=True, exist_ok=True)
     stem = workdir / f"dl_{uuid.uuid4().hex[:10]}"
-    deadline = time.monotonic() + timeout
 
     def _guard(d: dict) -> None:
         # yt-dlp's max_filesize is only checked against a Content-Length header, so HLS
@@ -169,10 +168,17 @@ async def download(url: str, workdir: Path, max_bytes: int, *, cookies_file: Opt
         # stream ends, so _guard could never stop one. Skip them up front instead.
         "match_filter": yt_dlp.utils.match_filter_func("!is_live"),
     }
-    if cookies_file and cookies_file.exists():
+    # is_file(), not exists(): when the file to bind-mount is missing, Docker creates a
+    # directory in its place, and yt-dlp then failed EVERY download with "Is a directory".
+    # Anything but a regular file means going without cookies.
+    if cookies_file and cookies_file.is_file():
         opts["cookiefile"] = str(cookies_file)
     too_big = False
     async with _sem("download"):
+        # The clock starts once the slot is ours: a job queued behind three slow downloads
+        # holds nothing while it waits, yet it used to reach its slot with the budget spent
+        # and fail on its first chunk as "took too long", however small the video.
+        deadline = time.monotonic() + timeout
         def _run() -> None:
             ydl = yt_dlp.YoutubeDL(opts)
             try:
@@ -196,8 +202,11 @@ async def download(url: str, workdir: Path, max_bytes: int, *, cookies_file: Opt
         except DownloadError as e:
             msg = str(e)
             # A link no allowed extractor handles (a profile, a live page) would only spend a
-            # paid API call before failing anyway, so it never goes to the fallback.
-            if "tiktok" in url.lower() and rapidapi_key and _friendly(msg) != _UNSUPPORTED:
+            # paid API call before failing anyway, so it never goes to the fallback. Only that
+            # refusal ("No suitable extractor"): "Unsupported URL" is what TikTokVMIE raises
+            # when a vm./vt. short link does not redirect for the bot, which is exactly the
+            # IP-level refusal the paid fallback is for.
+            if "tiktok" in url.lower() and rapidapi_key and "no suitable extractor" not in msg.lower():
                 log.info("yt-dlp failed for TikTok (%s); trying RapidAPI fallback", msg[:80])
                 try:
                     fallback = await _tiktok_rapidapi(url, stem.with_suffix(".mp4"), max_bytes, rapidapi_key)
