@@ -230,6 +230,20 @@ class _FakePagedIE(InfoExtractor):
         return self.playlist_result(pages(), pid)
 
 
+class _FakeMultiPartIE(InfoExtractor):
+    """Shaped like BiliBiliIE on a multi-part video: the plain video URL (no playlist hint)
+    is the whole anthology unless noplaylist asks for just the one video."""
+    _VALID_URL = r"https://fake\.test/multi/(?P<id>\w+)"
+    IE_NAME = "fakemultipart"
+
+    def _real_extract(self, url):
+        vid = self._match_id(url)
+        if self._yes_playlist(vid, vid):
+            return self.playlist_result([_video(f"{vid}p{p}") for p in (1, 2, 3)], vid)
+        return {"id": vid, "title": f"t{vid}", "duration": 200, "url": f"https://cdn.fake.test/{vid}.m4a",
+                "ext": "m4a", "acodec": "opus", "vcodec": "none"}
+
+
 class _FakeSearchIE(SearchInfoExtractor):
     """Shaped like YoutubeSearchIE: a lazy generator consumed inside process_ie_result."""
     _SEARCH_KEY = "ytsearch"
@@ -278,7 +292,7 @@ class _FakeSitesYDL(yt_dlp.YoutubeDL):
 
     def __init__(self, params=None, auto_init=True):
         super().__init__(params, auto_init=False)
-        for ie in (_FakeSearchIE, _FakeChannelIE, _FakeUserPageIE, _FakePagedIE,
+        for ie in (_FakeSearchIE, _FakeChannelIE, _FakeUserPageIE, _FakePagedIE, _FakeMultiPartIE,
                    _FakeVideoIE, _FakeErrorIE, _FakeCrashyIE):
             self.add_info_extractor(ie())
         self.add_default_info_extractors()
@@ -345,6 +359,13 @@ async def test_a_single_video_url_is_still_fully_extracted(fake_sites):
     tracks = await YTDL(max_playlist=50).resolve("https://fake.test/v/7")
     assert [(t.title, t.duration) for t in tracks] == [("t7", 200)]
     assert _FakeVideoIE.extractions == 1
+
+
+async def test_a_plain_video_url_queues_just_that_video(fake_sites):
+    """Some sites (bilibili multi-part videos) treat a plain video URL as the whole
+    playlist unless noplaylist is set; without a playlist hint /play means the one video."""
+    tracks = await YTDL().resolve("https://fake.test/multi/x")
+    assert [(t.title, t.duration) for t in tracks] == [("tx", 200)]
 
 
 async def test_fetch_stream_does_not_walk_a_queued_collection(fake_sites):
