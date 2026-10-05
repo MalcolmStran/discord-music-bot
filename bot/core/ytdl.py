@@ -338,6 +338,9 @@ class _QuietLogger:
 
 
 def _friendly(err: str) -> str:
+    # Unexpected ExtractorErrors end in yt-dlp's "; please report this issue on
+    # https://github.com/yt-dlp/..." boilerplate, which reached Discord (link embed and all).
+    err = re.split(r";?\s*please report this issue", err, flags=re.I)[0]
     low = err.lower()
     if "private video" in low:
         return "That video is private."
@@ -358,6 +361,11 @@ def _friendly(err: str) -> str:
         return "No results."
     if "is live" in low or "premieres in" in low:
         return "That stream hasn't started yet."
+    # Last, so it shadows none of the specific reasons above. Not YouTube-specific: this also
+    # serves SoundCloud, Bandcamp etc.
+    if any(s in low for s in ("failed to extract any player response", "unable to download api page",
+                              "http error 403", "http error 429")):
+        return "The site refused the request; try again later (cookies may help)."
     # strip yt-dlp's "ERROR: [youtube] xyz: " prefix
     m = re.search(r"ERROR:\s*(?:\[[^\]]+\]\s*)?(?:[\w-]+:\s*)?(.*)", err)
     return (m.group(1) if m else err).strip()[:200] or "Could not load that."

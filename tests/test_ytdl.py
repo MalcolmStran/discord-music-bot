@@ -7,7 +7,7 @@ import threading
 import pytest
 import yt_dlp
 from yt_dlp.extractor.common import InfoExtractor, SearchInfoExtractor
-from yt_dlp.utils import ExtractorError
+from yt_dlp.utils import DownloadError, ExtractorError
 
 from bot.core.ytdl import (
     FFMPEG_BEFORE,
@@ -97,6 +97,35 @@ def test_friendly_never_returns_empty():
     assert _friendly("") and _friendly("ERROR: ")
 
 
+def _download_error_text(msg, **kw):
+    """str() of the DownloadError yt-dlp raises for an ExtractorError, boilerplate and all."""
+    return str(DownloadError("ERROR: " + str(ExtractorError(msg, **kw))))
+
+
+def test_friendly_drops_yt_dlps_bug_report_text():
+    """Unexpected ExtractorErrors end in "; please report this issue on https://github.com/
+    ...", which reached Discord replies and had its link unfurled."""
+    raw = _download_error_text("Unable to extract uploader", video_id="x", ie="soundcloud")
+    assert "please report this issue" in raw          # the real bug_reports_message
+    assert _friendly(raw) == "Unable to extract uploader"
+
+
+@pytest.mark.parametrize("raw", [
+    _download_error_text("Failed to extract any player response", video_id="dQw4w9WgXcQ", ie="youtube"),
+    "ERROR: [youtube:tab] UCuAXFkgsw1L7xaCfnd5JJOw page 1: Unable to download API page: "
+    "HTTP Error 403: Forbidden (caused by <HTTPError 403: Forbidden>)",
+    "ERROR: [soundcloud] 123: Unable to download JSON metadata: HTTP Error 403: Forbidden",
+    "ERROR: [youtube] x: Unable to download webpage: HTTP Error 429: Too Many Requests",
+])
+def test_friendly_names_a_refused_request_without_naming_a_site(raw):
+    assert _friendly(raw) == "The site refused the request; try again later (cookies may help)."
+
+
+def test_a_refused_request_does_not_hide_a_specific_reason():
+    assert _friendly("ERROR: [youtube] x: Sign in to confirm your age (HTTP Error 403)") == \
+        "That video is age-restricted (cookies needed)."
+
+
 @pytest.mark.parametrize("q,is_url,is_playlist", [
     ("https://youtu.be/x", True, False),
     ("https://www.youtube.com/playlist?list=PL1", True, True),
@@ -166,12 +195,15 @@ class _FakeSearchIE(SearchInfoExtractor):
 
 
 class _FakeErrorIE(InfoExtractor):
-    _VALID_URL = r"https://fake\.test/(?P<id>private|agegate)"
+    _VALID_URL = r"https://fake\.test/(?P<id>private|agegate|broken)"
     IE_NAME = "fakeerror"
 
     def _real_extract(self, url):
-        if self._match_id(url) == "private":
+        vid = self._match_id(url)
+        if vid == "private":
             raise ExtractorError("Private video. Sign in if you've been granted access to this video", expected=True)
+        if vid == "broken":       # unexpected: yt-dlp appends its "please report this issue" text
+            raise ExtractorError("Unable to extract title", video_id=vid, ie=self.IE_NAME)
         raise ExtractorError("Sign in to confirm your age. This video may be inappropriate", expected=True)
 
 
@@ -276,6 +308,16 @@ async def test_resolve_reports_why_a_video_cannot_be_used(fake_sites):
     with pytest.raises(LookupError) as exc:
         await YTDL().resolve("https://fake.test/private")
     assert str(exc.value) == "That video is private."
+
+
+async def test_yt_dlps_bug_report_text_never_reaches_the_user(fake_sites):
+    """An unexpected ExtractorError ends in "; please report this issue on https://github.com/
+    ...": it reached /play replies and skip messages, and Discord unfurled the link."""
+    with pytest.raises(LookupError) as resolved:
+        await YTDL().resolve("https://fake.test/broken")
+    with pytest.raises(LookupError) as fetched:
+        await YTDL().fetch_stream(Track(title="x", webpage_url="https://fake.test/broken"))
+    assert str(resolved.value) == str(fetched.value) == "Unable to extract title"
 
 
 async def test_fetch_stream_reports_why_a_video_cannot_be_used(fake_sites):
