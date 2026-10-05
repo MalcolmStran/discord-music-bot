@@ -6,6 +6,8 @@ so it can fire in milliseconds without ending the test process.
 """
 import asyncio
 import logging
+import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -74,6 +76,31 @@ def test_watchdog_leaves_a_live_gateway_alone(mbot):
     mbot.last_beat = time.monotonic() - 120
     assert dead.called.wait(2)
     t.join(1)
+
+
+_STUCK_BOT = """
+import sys, time
+from pathlib import Path
+from bot.__main__ import MusicBot, start_watchdog
+from bot.config import Config
+d = Path(sys.argv[1])
+b = MusicBot(Config(token="x", download_dir=d / "dl", log_dir=d / "logs"))
+b.last_beat = time.monotonic() - 5
+start_watchdog(b, limit=1, poll=0.01)     # the default exit_fn, as main() calls it
+time.sleep(60)                            # the main thread is wedged; only the watchdog can end it
+"""
+
+
+def test_watchdog_default_exit_ends_the_whole_process(tmp_path):
+    """The other tests inject exit_fn, so this pins the default: sys.exit in a thread only
+    raises SystemExit there, ending the watchdog thread and leaving the wedged process up."""
+    try:
+        proc = subprocess.run([sys.executable, "-c", _STUCK_BOT, str(tmp_path)], cwd=Path(entry.__file__).parents[1],
+                              capture_output=True, text=True, timeout=15)
+    except subprocess.TimeoutExpired:
+        pytest.fail("the watchdog fired but the process kept running")
+    assert proc.returncode == 1, proc.stderr
+    assert "gateway dead" in proc.stderr
 
 
 async def _beat_once(mbot, monkeypatch, *, ready=True):

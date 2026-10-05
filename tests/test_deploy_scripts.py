@@ -2,7 +2,8 @@
 
 Each stub on PATH records its argv (shell-quoted, one call per line) and does nothing else, so
 the scripts' own logic — which settings turn the yt-dlp self-update on, which volume run.sh
-mounts — is what gets tested, without root, pip, network or a Docker daemon.
+mounts — is what gets tested, without root, pip, network or a Docker daemon. requirements.txt
+and the Dockerfile are checked statically alongside them.
 
 These are repository checks, so they skip where the scripts are not next to tests/ (the
 Docker image ships bot/ and tests/ under /app, with the entrypoint at /entrypoint.sh).
@@ -144,6 +145,23 @@ def test_entrypoint_self_update_keeps_the_requirement_extras(sandbox):
     specs = [a for a in pip if _ytdlp_extras(a) is not None]
     assert specs, pip
     assert _ytdlp_extras(specs[0]) >= _requirement_extras() | {"deno"}
+
+
+def _apt_packages(dockerfile: str):
+    text = dockerfile.replace("\\\n", " ")       # join RUN continuation lines
+    pkgs = []
+    for m in re.finditer(r"apt-get install ([^&\n]*)", text):
+        pkgs += [w for w in m.group(1).split() if not w.startswith("-")]
+    return pkgs
+
+
+@pytest.mark.skipif(not (REPO / "Dockerfile").is_file(), reason="no Dockerfile next to tests/")
+def test_dockerfile_does_not_install_nodejs():
+    """yt-dlp never uses it (it enables only Deno by default, and rejects Node below 22,
+    newer than Debian ships), so apt's nodejs was dead weight in the image."""
+    pkgs = _apt_packages((REPO / "Dockerfile").read_text())
+    assert "ffmpeg" in pkgs, pkgs                 # the parse found the real install line
+    assert "nodejs" not in pkgs
 
 
 # ---------------------------------------------------------------- run.sh settings volume
