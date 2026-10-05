@@ -20,7 +20,7 @@ def _handled(ies, url):
     return [ie.IE_NAME for ie in ies if ie.suitable(url)]
 
 
-@pytest.mark.parametrize("posted", [
+POSTS = [
     "https://www.tiktok.com/@u/video/7123456789012345678",
     "https://tiktok.com/@u/video/7123456789012345678",          # bare host
     "https://m.tiktok.com/@u/video/7123456789012345678?lang=en",  # mobile host
@@ -34,14 +34,47 @@ def _handled(ies, url):
     "https://mobile.twitter.com/a/status/1234567890",
     "https://www.x.com/a/status/1234567890",
     "https://x.com/i/status/1234567890",
+    "https://x.com/i/web/status/1234567890",
     "https://x.com/a/status/1234567890/video/1",
+    "https://x.com/a/status/1234567890/photo/2",
     "https://fxtwitter.com/a/status/1234567890",                  # fixer, via /convert
-])
+]
+
+NOT_POSTS = [
+    "https://www.tiktok.com/@someartist",        # tiktok:user
+    "https://tiktok.com/@someartist",
+    "https://www.tiktok.com/@u/live",            # tiktok:live
+    "https://www.tiktok.com/tag/cats",           # tiktok:tag
+    "https://www.tiktok.com/music/original-sound-7123456789012345678",
+    "https://x.com/someone",                     # a profile
+    "https://x.com/i/broadcasts/1ZkJzbdvLgyJv",  # twitter:broadcast
+    "https://x.com/i/spaces/1zqKVPlQNApJB",      # twitter:spaces
+]
+
+
+@pytest.mark.parametrize("posted", POSTS)
 def test_every_accepted_post_link_reaches_an_allowed_extractor(allowed, posted):
     kind = classify(posted)
     assert kind is not None
     url = normalise(posted, kind)
     assert _handled(allowed, url), f"{url} would fail with 'No suitable extractor'"
+
+
+@pytest.mark.parametrize("posted", POSTS)
+def test_every_accepted_post_link_is_downloadable(posted):
+    assert video.downloadable(normalise(posted, classify(posted)))
+
+
+@pytest.mark.parametrize("posted", NOT_POSTS)
+def test_profile_live_tag_and_space_links_are_not_downloadable(posted):
+    """The listener checks this before reacting, so these never take a conversion slot."""
+    assert not video.downloadable(normalise(posted, classify(posted)))
+
+
+def test_downloadable_asks_exactly_the_extractors_yt_dlp_loads(allowed):
+    """Picked from ALLOWED_EXTRACTORS the way yt-dlp picks them, so the pre-check and the
+    download itself cannot disagree about a link."""
+    assert sorted(ie.IE_NAME for ie in video._allowed_ies()) == sorted(ie.IE_NAME for ie in allowed)
 
 
 @pytest.mark.parametrize("raw,expected", [

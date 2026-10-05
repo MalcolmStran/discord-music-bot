@@ -309,6 +309,31 @@ async def test_skipped_fixer_links_are_counted(cog):
     assert cog.stats["skipped"] == 2
 
 
+# ------------------------------------------------- links no allowed extractor can fetch
+@pytest.mark.parametrize("link", [
+    "https://www.tiktok.com/@me",
+    "https://tiktok.com/@me",
+    "https://www.tiktok.com/@me/live",
+    "https://www.tiktok.com/tag/cats",
+    "https://x.com/me",
+    "https://x.com/i/spaces/1zqKVPlQNApJB",
+])
+async def test_a_profile_link_does_not_take_a_real_posts_slot(cog, link):
+    """It used to get ⏳, fail inside yt-dlp, count as failed, and push the second real
+    post past the two-per-message cap so it was never converted."""
+    got = await urls(cog, f"follow me {link} latest https://www.tiktok.com/@me/video/7300000000000000001 "
+                          "and https://x.com/me/status/1800000000000000000")
+    assert got == ["https://www.tiktok.com/@me/video/7300000000000000001", "https://x.com/me/status/1800000000000000000"]
+    assert cog.stats["skipped"] == 1
+    assert not suppressed(cog), "the profile link's own embed is kept"
+
+
+async def test_a_message_with_only_a_profile_link_starts_nothing(cog):
+    assert await urls(cog, "https://www.tiktok.com/@me") == []
+    assert cog.stats["skipped"] == 1
+    assert cog.last.edits == []
+
+
 async def test_an_opted_out_user_does_not_bump_the_skip_counter_twice(cog):
     cog.settings.set_media_optout(555, True)
     await urls(cog, "https://x.com/a/status/1", uid=555)

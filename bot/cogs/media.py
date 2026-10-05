@@ -211,7 +211,7 @@ class Media(commands.Cog):
         # One parse per URL: classify() and is_embed_fixer() each re-parsed it otherwise.
         links: dict[tuple[str, str, str], list] = {}   # post -> [url, kind, spoiler], first seen wins
         found: list[Optional[tuple[str, str, str]]] = []  # each URL's post, None if we don't convert it
-        fixers, any_spoiler = 0, False
+        skipped, any_spoiler = 0, False
         for m in URL_RE.finditer(message.content):
             u = m.group()
             # Test where the link STARTS: URL_RE runs on through the closing "||", so the
@@ -225,14 +225,20 @@ class Media(commands.Cog):
                 continue
             if _matched_domain(host, EMBED_FIXERS):
                 # already embeds its own video; converting would post the clip twice
-                fixers += 1
+                skipped += 1
+                continue
+            if not video.downloadable(normalise(u, kind)):
+                # A profile, hashtag, live or Space link: download() can only refuse it, so
+                # it must not flash ⏳, count as failed, or take a slot from a real post.
+                # Its key stays None, so the message keeps its embeds.
+                skipped += 1
                 continue
             key = found[-1] = _post_key(u, kind)
             if key in links:
                 links[key][2] = links[key][2] or spoiler    # spoilered anywhere → upload blurred
             else:
                 links[key] = [u, kind, spoiler]
-        self.stats["skipped"] += fixers
+        self.stats["skipped"] += skipped
         if not links:
             return
         # Checked here rather than above: this is the only point where the answer matters,
@@ -414,6 +420,9 @@ class Media(commands.Cog):
         kind = classify(url)
         if not kind:
             return await ctx.send("❌ Only Twitter/X and TikTok links are supported.")
+        if not video.downloadable(normalise(url, kind)):
+            # a profile, hashtag, live or Space link: say so now, not after a download slot
+            return await ctx.send("❌ That link isn't supported.")
         if ctx.interaction:
             await ctx.interaction.response.send_message(f"⏳ Converting {kind} link…", ephemeral=True)
             # for slash commands we attach to a fresh message so replies have an anchor
@@ -483,7 +492,7 @@ class Media(commands.Cog):
         e.add_field(name="Your links",
                     value="🚫 not converted" if self.settings.is_media_optout(ctx.author.id) else "✅ converted",
                     inline=True)
-        e.add_field(name="Fixer links left alone", value=str(s["skipped"]), inline=True)
+        e.add_field(name="Links left alone", value=str(s["skipped"]), inline=True)
         e.add_field(name="Silent clips → GIF",
                     value=f"≤ {self.cfg.max_gif_seconds}s" if self.cfg.max_gif_seconds else "🚫 disabled",
                     inline=True)

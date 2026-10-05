@@ -136,6 +136,49 @@ async def test_only_a_real_command_is_left_to_the_command_path(real_bot, content
     assert await c._is_command_invocation(_Msg(content)) is is_command
 
 
+# ------------------------------------------------------------------------- /convert
+class _Guild:
+    id = 7
+
+
+class _ConvertCtx(_Ctx):
+    interaction = None
+    guild = _Guild()
+    message = object()
+
+
+@pytest.mark.parametrize("url", [
+    "https://www.tiktok.com/@someartist",
+    "https://x.com/i/spaces/1zqKVPlQNApJB",
+    "<https://tiktok.com/@someartist/live>",
+])
+async def test_convert_refuses_a_link_no_extractor_can_fetch_straight_away(cog, url):
+    """It used to queue for a download slot only for yt-dlp to refuse it."""
+    started = []
+
+    async def convert_and_send(*a, **kw):
+        started.append(a)
+
+    cog.settings.set_media_enabled(_Guild.id, True)
+    cog.convert_and_send = convert_and_send
+    ctx = _ConvertCtx()
+    await Media.convert.callback(cog, ctx, url)
+    assert ctx.replies == ["❌ That link isn't supported."]
+    assert started == []
+
+
+async def test_convert_still_converts_a_post(cog):
+    started = []
+
+    async def convert_and_send(anchor, url, kind, **kw):
+        started.append((url, kind))
+
+    cog.settings.set_media_enabled(_Guild.id, True)
+    cog.convert_and_send = convert_and_send
+    await Media.convert.callback(cog, _ConvertCtx(), "https://tiktok.com/@u/video/7123456789012345678")
+    assert started == [("https://www.tiktok.com/@u/video/7123456789012345678", "tiktok")]
+
+
 async def test_the_command_only_affects_the_caller(cog):
     await run(cog, _Ctx(7), "off")
     assert cog.settings.media_optout() == {7}

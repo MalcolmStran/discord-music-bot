@@ -11,6 +11,7 @@ links can never fork unbounded encoders (the 2026-04-14 PSP lesson).
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import logging
 import os
@@ -25,6 +26,7 @@ from typing import Optional
 
 import aiohttp
 import yt_dlp
+from yt_dlp.extractor import gen_extractor_classes
 from yt_dlp.utils import DownloadError
 
 log = logging.getLogger(__name__)
@@ -124,6 +126,27 @@ def _sem(kind: str) -> asyncio.Semaphore:
 # profile, hashtag, Space and broadcast links (tiktok:user, twitter:broadcast, ...) from
 # uploading some arbitrary video nobody asked for.
 ALLOWED_EXTRACTORS = ["twitter", "tiktok", "vm.tiktok"]
+
+
+@functools.cache
+def _allowed_ies() -> tuple[type, ...]:
+    """The extractor classes ALLOWED_EXTRACTORS enables, picked the way yt-dlp's
+    add_default_info_extractors picks them (case-insensitive full match on IE_NAME)."""
+    every = {ie.IE_NAME.lower(): ie for ie in gen_extractor_classes()}
+    return tuple(ie for name, ie in every.items()
+                 if any(re.fullmatch(pat, name, re.I) for pat in ALLOWED_EXTRACTORS))
+
+
+def downloadable(url: str) -> bool:
+    """Whether download() could fetch this (normalised) link at all, decided offline.
+
+    yt-dlp only refuses a profile, hashtag, live or Space link once download() runs, so
+    the listener reacted ⏳ to it, counted it as failed and let it take one of a message's
+    two conversion slots ahead of a real post. This is the same suitable() test yt-dlp
+    applies to the same extractors, so the two cannot drift apart.
+    """
+    return any(ie.suitable(url) for ie in _allowed_ies())
+
 
 # Wall-clock cap on one download. Generous on purpose (500 MB still fits at ~0.3 MB/s):
 # it only stops a crawling source from holding a download slot indefinitely.
