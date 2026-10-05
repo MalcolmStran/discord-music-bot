@@ -159,13 +159,16 @@ async def test_position_freezes_while_paused():
 
 
 async def test_position_excludes_time_spent_paused():
+    """Relative to now: time.monotonic() counts from boot, so a fixed started_at of 100.0
+    made the expected position negative (and the real one clamp to 0) on any machine up for
+    less than ~110 s, e.g. a freshly started container."""
+    import time as _t
     p = make_player()
     p.current = track("a")
-    p.started_at = 100.0
+    p.started_at = _t.monotonic() - 50.0
     p._paused_at = 0.0
     p._paused_total = 10.0
-    import time as _t
-    assert p.position == pytest.approx(_t.monotonic() - 110.0, abs=1.0)
+    assert p.position == pytest.approx(40.0, abs=1.0)
 
 
 def test_no_track_means_no_position():
