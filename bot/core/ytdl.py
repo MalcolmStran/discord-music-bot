@@ -106,7 +106,9 @@ class YTDL:
             "source_address": "0.0.0.0",
             "logger": _QuietLogger(),
         }
-        if cookies_file and cookies_file.exists():
+        # is_file(), not exists(): a directory (what Docker mounts when the source file is
+        # missing) made yt-dlp fail every extraction with "Is a directory".
+        if cookies_file and cookies_file.is_file():
             base["cookiefile"] = str(cookies_file)
         self._opts = base
         # Resolving is always flat and capped. A non-hinted URL can still be a collection by

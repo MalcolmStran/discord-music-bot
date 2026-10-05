@@ -93,6 +93,32 @@ def _log_level(default: str = "INFO") -> str:
     return level
 
 
+def _cookies_file(raw: str) -> Optional[Path]:
+    """YTDL_COOKIES_FILE if yt-dlp can actually use it; otherwise warn and return None.
+
+    Only checking exists() let a directory through: Docker creates one at the mount point when
+    the source file is missing, and yt-dlp then failed every extraction with "Is a directory".
+    yt-dlp skips an unreadable file without a word, so cookies looked configured but were
+    never sent; the same was true of a missing file before it was warned about.
+    """
+    path = Path(raw)
+    if path.is_dir():
+        log.warning("YTDL_COOKIES_FILE=%s is a directory, not a cookies file; cookies will not be "
+                    "used. Docker creates a directory there when the file it mounts is missing: "
+                    "remove that directory on the host (rmdir cookies.txt), create the file, then "
+                    "recreate the container.", raw)
+    elif not path.exists():
+        log.warning("YTDL_COOKIES_FILE=%s does not exist; cookies will not be used. Under Docker "
+                    "the path is resolved inside the container: mount the file into it and "
+                    "point YTDL_COOKIES_FILE at the mounted path.", raw)
+    elif not path.is_file() or not os.access(path, os.R_OK):
+        log.warning("YTDL_COOKIES_FILE=%s is not a file the bot's user can read; cookies will not "
+                    "be used. Check its permissions (e.g. chmod 644).", raw)
+    else:
+        return path
+    return None
+
+
 @dataclass(frozen=True)
 class Config:
     token: str
@@ -140,12 +166,7 @@ class Config:
             raise SystemExit("DISCORD_TOKEN is not set (put it in .env)")
         owners = frozenset(int(x) for x in os.getenv("OWNER_IDS", "").replace(";", ",").split(",") if x.strip().isdigit())
         cookies = os.getenv("YTDL_COOKIES_FILE", "").strip()
-        if cookies and not Path(cookies).exists():
-            # both yt-dlp callers skip a missing file without a word, so cookies looked
-            # configured while never being sent
-            log.warning("YTDL_COOKIES_FILE=%s does not exist; cookies will not be used. Under Docker "
-                        "the path is resolved inside the container: mount the file into it and "
-                        "point YTDL_COOKIES_FILE at the mounted path.", cookies)
+        cookies_file = _cookies_file(cookies) if cookies else None
         logs = os.getenv("LOG_DIR", "").strip()
         # blank means "unset", like LOG_DIR: Path("") is ".", which moved the settings file
         # out of the persisted volume
@@ -169,7 +190,7 @@ class Config:
             spotify_client_secret=(os.getenv("SPOTIFY_CLIENT_SECRET") or "").strip() or None,
             download_dir=Path(downloads) if downloads else Path("./downloads"),
             log_dir=Path(logs) if logs else Path("./logs"),
-            ytdl_cookies_file=Path(cookies) if cookies else None,
+            ytdl_cookies_file=cookies_file,
             log_level=_log_level(),
             force_sync=_bool("FORCE_COMMAND_SYNC", False),
         )

@@ -1,5 +1,6 @@
 """Environment parsing: degenerate values used to be accepted verbatim and brick the bot."""
 import logging
+import os
 from pathlib import Path
 
 import pytest
@@ -133,19 +134,56 @@ def test_missing_cookies_file_is_warned_about(monkeypatch, tmp_path, caplog):
     monkeypatch.setenv("YTDL_COOKIES_FILE", str(missing))
     with caplog.at_level(logging.WARNING, logger="bot.config"):
         cfg = Config.from_env()
-    assert cfg.ytdl_cookies_file == missing
+    assert cfg.ytdl_cookies_file is None
     [rec] = [r for r in caplog.records if "YTDL_COOKIES_FILE" in r.getMessage()]
     assert rec.levelno == logging.WARNING
     assert str(missing) in rec.getMessage() and "inside the container" in rec.getMessage()
 
 
-def test_existing_cookies_file_is_not_warned_about(monkeypatch, tmp_path, caplog):
+def test_a_cookies_directory_is_warned_about_and_not_used(monkeypatch, tmp_path, caplog):
+    """Docker creates a directory at the mount point when the cookies file it mounts is
+    missing. exists() let it through without a word, and yt-dlp then failed every /play and
+    every conversion with "Is a directory"."""
+    monkeypatch.setenv("DISCORD_TOKEN", "t")
+    made_by_docker = tmp_path / "cookies.txt"
+    made_by_docker.mkdir()
+    monkeypatch.setenv("YTDL_COOKIES_FILE", str(made_by_docker))
+    with caplog.at_level(logging.WARNING, logger="bot.config"):
+        cfg = Config.from_env()
+    assert cfg.ytdl_cookies_file is None
+    [rec] = [r for r in caplog.records if "YTDL_COOKIES_FILE" in r.getMessage()]
+    assert rec.levelno == logging.WARNING
+    assert "is a directory" in rec.getMessage() and "rmdir cookies.txt" in rec.getMessage()
+
+
+def test_an_unreadable_cookies_file_is_warned_about_and_not_used(monkeypatch, tmp_path, caplog):
+    """yt-dlp skips a cookies file it can't read without a word, so cookies looked configured
+    but were never sent."""
+    monkeypatch.setenv("DISCORD_TOKEN", "t")
+    jar = tmp_path / "cookies.txt"
+    jar.write_text("# Netscape HTTP Cookie File\n")
+    jar.chmod(0)
+    monkeypatch.setenv("YTDL_COOKIES_FILE", str(jar))
+    # root reads a mode-000 file anyway (and the suite runs as root in the container), so
+    # answer the permission check the way it is answered for the bot's unprivileged user
+    real_access = os.access
+    monkeypatch.setattr(os, "access", lambda p, mode: False if Path(p) == jar else real_access(p, mode))
+    with caplog.at_level(logging.WARNING, logger="bot.config"):
+        cfg = Config.from_env()
+    assert cfg.ytdl_cookies_file is None
+    [rec] = [r for r in caplog.records if "YTDL_COOKIES_FILE" in r.getMessage()]
+    assert rec.levelno == logging.WARNING
+    assert str(jar) in rec.getMessage() and "permissions" in rec.getMessage()
+
+
+def test_existing_cookies_file_is_used_and_not_warned_about(monkeypatch, tmp_path, caplog):
     monkeypatch.setenv("DISCORD_TOKEN", "t")
     jar = tmp_path / "cookies.txt"
     jar.write_text("# Netscape HTTP Cookie File\n")
     monkeypatch.setenv("YTDL_COOKIES_FILE", str(jar))
     with caplog.at_level(logging.WARNING, logger="bot.config"):
-        Config.from_env()
+        cfg = Config.from_env()
+    assert cfg.ytdl_cookies_file == jar
     assert not [r for r in caplog.records if "YTDL_COOKIES_FILE" in r.getMessage()]
 
 

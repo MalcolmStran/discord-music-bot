@@ -329,3 +329,13 @@ async def test_resolving_never_rewrites_the_cookie_file(fake_sites, tmp_path):
     await y.resolve("https://fake.test/v/1")
     await y.resolve("never gonna give you up")
     assert jar.read_text() == text
+
+
+async def test_a_cookies_directory_is_not_handed_to_yt_dlp(fake_sites, tmp_path):
+    """Docker mounts a directory when the cookies file is missing; as cookiefile it failed
+    every extraction with "Is a directory" instead of going without cookies."""
+    made_by_docker = tmp_path / "cookies.txt"
+    made_by_docker.mkdir()
+    y = YTDL(cookies_file=made_by_docker)
+    assert "cookiefile" not in y._opts
+    assert [t.title for t in await y.resolve("https://fake.test/v/1")] == ["t1"]
