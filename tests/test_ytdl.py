@@ -169,6 +169,10 @@ class _FakeVideoIE(InfoExtractor):
                 "url": f"https://cdn.fake.test/{vid}.m4a", "ext": "m4a", "acodec": "opus", "vcodec": "none"}
 
 
+def _video(vid, **kw):
+    return InfoExtractor.url_result(f"https://fake.test/v/{vid}", _FakeVideoIE, vid, f"t{vid}", **kw)
+
+
 class _FakeChannelIE(InfoExtractor):
     """A collection URL with no playlist hint in it, like youtube.com/@name."""
     _VALID_URL = r"https://fake\.test/@chan"
@@ -177,6 +181,23 @@ class _FakeChannelIE(InfoExtractor):
     def _real_extract(self, url):
         return self.playlist_result(
             (self.url_result(f"https://fake.test/v/{i}", _FakeVideoIE) for i in range(500)), "chan", "Channel")
+
+
+class _FakePagedIE(InfoExtractor):
+    """Pages lazily like a channel tab (30 per page, fetched as iteration reaches them);
+    the continuation request is refused, as YouTube does to datacenter IPs."""
+    _VALID_URL = r"https://fake\.test/paged/(?P<id>\w+)"
+    IE_NAME = "fakepaged"
+
+    def _real_extract(self, url):
+        pid = self._match_id(url)
+
+        def pages():
+            if pid != "deadfirst":
+                yield from (_video(f"p{i}") for i in range(30))
+            raise ExtractorError("Unable to download API page: HTTP Error 403: Forbidden",
+                                 video_id=f"{pid} page {0 if pid == 'deadfirst' else 1}", expected=True)
+        return self.playlist_result(pages(), pid)
 
 
 class _FakeSearchIE(SearchInfoExtractor):
@@ -188,6 +209,9 @@ class _FakeSearchIE(SearchInfoExtractor):
     def _search_results(self, query):
         if query == "zero hits":
             return
+        if query == "rate limited":
+            raise ExtractorError("Unable to download API page: HTTP Error 429: Too Many Requests",
+                                 video_id=query, expected=True)
         if self.barrier:
             self.barrier.wait()          # both identical searches must be in flight at once
         yield self.url_result("https://www.youtube.com/watch?v=dQw4w9WgXcQ", "Youtube", "dQw4w9WgXcQ",
@@ -224,7 +248,7 @@ class _FakeSitesYDL(yt_dlp.YoutubeDL):
 
     def __init__(self, params=None, auto_init=True):
         super().__init__(params, auto_init=False)
-        for ie in (_FakeSearchIE, _FakeChannelIE, _FakeVideoIE, _FakeErrorIE, _FakeCrashyIE):
+        for ie in (_FakeSearchIE, _FakeChannelIE, _FakePagedIE, _FakeVideoIE, _FakeErrorIE, _FakeCrashyIE):
             self.add_info_extractor(ie())
         self.add_default_info_extractors()
 
@@ -253,6 +277,19 @@ async def test_a_channel_url_resolves_flat_and_capped(fake_sites):
     tracks = await y.resolve("https://fake.test/@chan")
     assert len(tracks) == 50
     assert _FakeVideoIE.extractions == 0
+
+
+async def test_a_failed_later_page_keeps_the_pages_that_loaded(fake_sites):
+    """Without ignoreerrors, one 403/429 on a channel's second page failed the whole /play
+    with the raw yt-dlp text, where it used to queue the first page's 30 videos."""
+    tracks = await YTDL(max_playlist=50).resolve("https://fake.test/paged/chan")
+    assert [t.webpage_url for t in tracks] == [f"https://fake.test/v/p{i}" for i in range(30)]
+
+
+async def test_a_collection_whose_first_page_fails_says_why(fake_sites):
+    with pytest.raises(LookupError) as exc:
+        await YTDL().resolve("https://fake.test/paged/deadfirst")
+    assert str(exc.value) == "The site refused the request; try again later (cookies may help)."
 
 
 async def test_a_single_video_url_is_still_fully_extracted(fake_sites):
@@ -302,12 +339,26 @@ async def test_a_search_with_no_hits_says_no_results(fake_sites):
     assert str(exc.value) == "No results."         # not "Playlist is empty or unavailable."
 
 
-async def test_resolve_reports_why_a_video_cannot_be_used(fake_sites):
-    """ignoreerrors made yt-dlp swallow the ExtractorError and return None, so a private
-    video was answered with "No results."."""
+@pytest.mark.parametrize("url", ["https://fake.test/private", "https://fake.test/private?list=PL1"])
+async def test_resolve_reports_why_a_video_cannot_be_used(fake_sites, url):
+    """ignoreerrors makes yt-dlp swallow the ExtractorError and return None; without the
+    error it logged, a private video was answered with "No results."."""
     with pytest.raises(LookupError) as exc:
-        await YTDL().resolve("https://fake.test/private")
+        await YTDL().resolve(url)
     assert str(exc.value) == "That video is private."
+
+
+async def test_a_failed_search_says_why_not_no_results(fake_sites):
+    with pytest.raises(LookupError) as exc:
+        await YTDL().resolve("rate limited")
+    assert str(exc.value) == "The site refused the request; try again later (cookies may help)."
+
+
+async def test_a_failed_spotify_match_says_why_not_no_match(fake_sites):
+    t = Track(title="Song — A", webpage_url="", search_query="rate limited")
+    with pytest.raises(LookupError) as exc:
+        await YTDL()._resolve_search(t)
+    assert str(exc.value) == "The site refused the request; try again later (cookies may help)."
 
 
 async def test_yt_dlps_bug_report_text_never_reaches_the_user(fake_sites):

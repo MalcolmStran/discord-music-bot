@@ -97,6 +97,7 @@ class YTDL:
         # No "ignoreerrors": any truthy value (the CLI's "only_download" included) makes yt-dlp
         # log ExtractorErrors and return None instead of raising, so a private or age-gated
         # video reached the user as "No results." and _friendly() never saw the real reason.
+        # (Resolving turns it back on below, with a logger that keeps that reason.)
         base: dict[str, Any] = {
             "format": "bestaudio[acodec=opus]/bestaudio/best",
             "quiet": True,
@@ -115,7 +116,12 @@ class YTDL:
         # itself (a channel, an artist or likes page); without these it was fully extracted,
         # one request per entry and with no MAX_QUEUE_SIZE cap, which held a worker thread for
         # hours. 'in_playlist' leaves a single video's own extraction untouched.
-        self._resolve_opts = {**base, "extract_flat": "in_playlist", "playlistend": max_playlist}
+        # Resolving does ignore errors: yt-dlp fetches each later page of a channel or long
+        # playlist under its error handler, and without this one 403/429 on page 2 failed the
+        # whole /play instead of queueing the pages that loaded. Each call's _ErrorCapture
+        # keeps the error yt-dlp logs instead of raising, so a private video still says so.
+        self._resolve_opts = {**base, "extract_flat": "in_playlist", "playlistend": max_playlist,
+                              "ignoreerrors": "only_download"}
         # fetch_stream only ever wants ONE video. A queued entry that is itself a collection (a
         # channel tab or an album from a flat listing) must fail fast with "No playable stream
         # found." instead of fully extracting everything in it inside the player loop.
@@ -135,7 +141,8 @@ class YTDL:
     async def resolve(self, query: str, requester_id: Optional[int] = None) -> list[Track]:
         """Return one or more Tracks for a search query, video URL or playlist URL."""
         query = query.strip()
-        opts = {**self._resolve_opts}
+        errors = _ErrorCapture()
+        opts = {**self._resolve_opts, "logger": errors}
         if not looks_like_playlist(query):
             opts["noplaylist"] = True        # watch?v=..&list=.. without a hint: just the video
         is_search = not looks_like_url(query)
@@ -145,14 +152,14 @@ class YTDL:
         except DownloadError as e:
             raise LookupError(_friendly(str(e))) from e
         if not info:
-            raise LookupError("No results.")
+            raise LookupError(errors.friendly("No results."))
         entries = info.get("entries")
         if entries is None:
             return [self._to_track(info, requester_id)]
         tracks = [self._to_track(e, requester_id) for e in entries if e]
         if not tracks:
             # a search with zero hits is an empty playlist to yt-dlp, not to the user
-            raise LookupError("No results." if is_search else "Playlist is empty or unavailable.")
+            raise LookupError(errors.friendly("No results." if is_search else "Playlist is empty or unavailable."))
         return tracks
 
     async def fetch_stream(self, track: Track) -> Track:
@@ -222,13 +229,14 @@ class YTDL:
     async def _resolve_search(self, track: Track) -> None:
         """Spotify/other metadata-only tracks: find the matching YouTube video by search."""
         q = f"ytsearch1:{track.search_query}"
+        errors = _ErrorCapture()
         try:
-            info = await asyncio.to_thread(_extract_once, {**self._resolve_opts}, q)
+            info = await asyncio.to_thread(_extract_once, {**self._resolve_opts, "logger": errors}, q)
         except DownloadError as e:
             raise LookupError(_friendly(str(e))) from e
         entries = [e for e in (info or {}).get("entries", []) if e]
         if not entries:
-            raise LookupError(f"No YouTube match for “{track.search_query}”.")
+            raise LookupError(errors.friendly(f"No YouTube match for “{track.search_query}”."))
         hit = entries[0]
         url = hit.get("webpage_url") or hit.get("url") or ""
         if url and not looks_like_url(url):
@@ -335,6 +343,24 @@ class _QuietLogger:
 
     def error(self, msg):
         log.warning("yt-dlp: %s", msg)
+
+
+class _ErrorCapture(_QuietLogger):
+    """One resolve's logger: keeps the last error yt-dlp reported.
+
+    Under 'ignoreerrors' yt-dlp logs an ExtractorError and returns None (or no entries)
+    instead of raising, so this is the only place the real reason is left for _friendly().
+    """
+
+    def __init__(self) -> None:
+        self.last: Optional[str] = None
+
+    def error(self, msg):
+        self.last = msg
+        super().error(msg)
+
+    def friendly(self, default: str) -> str:
+        return _friendly(self.last) if self.last else default
 
 
 def _friendly(err: str) -> str:
