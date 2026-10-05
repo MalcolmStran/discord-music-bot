@@ -202,11 +202,17 @@ class _FakeChannelIE(InfoExtractor):
 class _FakeUserPageIE(InfoExtractor):
     """A flat listing whose entries are partly collections: a SoundCloud user page links its
     sets (no ie_key), a Bandcamp discography its albums, a YouTube Music artist its albums
-    (ie_key YoutubeTab, browse URL with no playlist hint)."""
-    _VALID_URL = r"https://fake\.test/user/(?P<id>mixed|only)"
+    (ie_key YoutubeTab, browse URL with no playlist hint). A Yandex Music album lists its
+    tracks as music.yandex.ru/album/<id>/track/<id>, an artist page its albums."""
+    _VALID_URL = r"https://fake\.test/user/(?P<id>mixed|only|yandex)"
     IE_NAME = "fakeuserpage"
 
     def _real_extract(self, url):
+        if self._match_id(url) == "yandex":
+            return self.playlist_result([
+                self.url_result("http://music.yandex.ru/album/1/track/2", "YandexMusicTrack", "2", "ytrack"),
+                self.url_result("http://music.yandex.ru/album/3", "YandexMusicAlbum", "3"),
+            ], "user")
         entries = [self.url_result("https://soundcloud.com/u/sets/mix"),
                    self.url_result("https://u.bandcamp.com/album/lp"),
                    self.url_result("https://music.youtube.com/browse/MPREb_x", "YoutubeTab")]
@@ -344,6 +350,13 @@ async def test_entries_that_are_collections_are_not_queued_as_tracks(fake_sites)
     assert [t.webpage_url for t in tracks] == ["https://fake.test/v/9"]
     with pytest.raises(LookupError, match=r"^Playlist is empty or unavailable\.$"):
         await YTDL().resolve("https://fake.test/user/only")
+
+
+async def test_an_entry_named_as_a_track_is_queued_whatever_its_url(fake_sites):
+    """Every Yandex Music track URL has /album/ in it, so the URL hint dropped whole albums
+    and playlists ("Playlist is empty or unavailable."); the album entry still goes."""
+    tracks = await YTDL().resolve("https://fake.test/user/yandex")
+    assert [(t.title, t.webpage_url) for t in tracks] == [("ytrack", "http://music.yandex.ru/album/1/track/2")]
 
 
 async def test_a_failed_later_page_keeps_the_pages_that_loaded(fake_sites):

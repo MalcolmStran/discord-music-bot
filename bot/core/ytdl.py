@@ -94,12 +94,18 @@ def looks_like_playlist(q: str) -> bool:
 # shelves (YoutubeTab), SoundCloud user pages listing their sets, Bandcamp discographies.
 # Queued, each failed in fetch_stream with "No playable stream found." and fed the failure streak.
 _COLLECTION_IES = frozenset({"YoutubeTab", "YoutubePlaylist", "SoundcloudSet", "SoundcloudPlaylist",
-                             "SoundcloudUser", "BandcampAlbum", "BandcampUser"})
+                             "SoundcloudUser", "BandcampAlbum", "BandcampUser",
+                             "YandexMusicAlbum", "YandexMusicPlaylist"})
 
 
 def _is_collection(entry: dict[str, Any]) -> bool:
-    return (entry.get("_type") == "playlist" or entry.get("ie_key") in _COLLECTION_IES
-            or looks_like_playlist(entry.get("url") or ""))
+    if entry.get("_type") == "playlist":
+        return True
+    # The extractor yt-dlp named for an entry beats the URL's shape: every Yandex Music track
+    # is http://music.yandex.ru/album/<id>/track/<id>, and the /album/ hint dropped them all.
+    if entry.get("ie_key"):
+        return entry["ie_key"] in _COLLECTION_IES
+    return looks_like_playlist(entry.get("url") or "")
 
 
 def _track_entries(entries):
