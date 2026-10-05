@@ -14,6 +14,7 @@ import asyncio
 import itertools
 import logging
 import re
+import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -22,7 +23,7 @@ from typing import Any, Optional
 import aiohttp
 import discord
 import yt_dlp
-from yt_dlp.utils import DownloadError
+from yt_dlp.utils import DownloadError, YoutubeDLError
 
 log = logging.getLogger(__name__)
 
@@ -386,14 +387,28 @@ class _ErrorCapture(_QuietLogger):
     instead of raising, so this is the only place the real reason is left for _friendly().
     """
 
+    CRASHED = "Couldn't load that; it's been logged."
+
     def __init__(self) -> None:
         self.last: Optional[str] = None
+        self.crashed = False
 
     def error(self, msg):
         self.last = msg
-        super().error(msg)
+        # 'ignoreerrors' also swallows extractor crashes (a TypeError after a site change) and
+        # passes on only str(e): "'NoneType' object is not subscriptable" reached Discord and
+        # the traceback was lost. yt-dlp reports from inside its except block, so the
+        # exception is still live here; anything outside its own hierarchy is a crash.
+        exc = sys.exc_info()[1]
+        self.crashed = exc is not None and not isinstance(exc, YoutubeDLError)
+        if self.crashed:
+            log.warning("yt-dlp crashed: %s", msg, exc_info=exc)
+        else:
+            super().error(msg)
 
     def friendly(self, default: str) -> str:
+        if self.crashed:
+            return self.CRASHED
         return _friendly(self.last) if self.last else default
 
 

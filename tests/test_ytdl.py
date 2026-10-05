@@ -2,6 +2,7 @@
 resolve/fetch_stream driven through a real YoutubeDL with offline fake extractors."""
 import asyncio
 import itertools
+import logging
 import shlex
 import threading
 
@@ -17,6 +18,7 @@ from bot.core.ytdl import (
     Track,
     _audio_format,
     _clean_header,
+    _ErrorCapture,
     _friendly,
     _shq,
     fmt_duration,
@@ -253,6 +255,8 @@ class _FakeSearchIE(SearchInfoExtractor):
     def _search_results(self, query):
         if query == "zero hits":
             return
+        if query == "crash":
+            raise TypeError("'NoneType' object is not subscriptable")
         if query == "rate limited":
             raise ExtractorError("Unable to download API page: HTTP Error 429: Too Many Requests",
                                  video_id=query, expected=True)
@@ -439,6 +443,41 @@ async def test_yt_dlps_bug_report_text_never_reaches_the_user(fake_sites):
     with pytest.raises(LookupError) as fetched:
         await YTDL().fetch_stream(Track(title="x", webpage_url="https://fake.test/broken"))
     assert str(resolved.value) == str(fetched.value) == "Unable to extract title"
+
+
+async def test_an_extractor_crash_is_logged_and_not_shown_to_the_user(fake_sites, caplog):
+    """ignoreerrors swallows a non-ExtractorError too and passes on only str(e): /play and
+    Spotify skips answered "'NoneType' object is not subscriptable", and the traceback the
+    operator needs was never logged."""
+    t = Track(title="Song — A", webpage_url="", search_query="crash")
+    with caplog.at_level(logging.WARNING, logger="bot.core.ytdl"):
+        with pytest.raises(LookupError) as resolved:
+            await YTDL().resolve("https://fake.test/crashy")
+        with pytest.raises(LookupError) as matched:
+            await YTDL()._resolve_search(t)
+    assert str(resolved.value) == str(matched.value) == "Couldn't load that; it's been logged."
+    crashes = [r for r in caplog.records if r.exc_info]
+    assert [r.exc_info[0] for r in crashes] == [TypeError, TypeError]
+    assert all("not subscriptable" in r.getMessage() for r in crashes)
+    assert "_real_extract" in logging.Formatter().formatException(crashes[0].exc_info)
+
+
+def test_the_last_error_reported_is_the_one_explained():
+    """After a crash on one item, a later expected error still names its own reason; and a
+    report made outside any exception is not a crash."""
+    cap = _ErrorCapture()
+    try:
+        raise TypeError("boom")
+    except TypeError:
+        cap.error("ERROR: boom")
+    try:
+        raise ExtractorError("Private video", expected=True)
+    except ExtractorError:
+        cap.error("ERROR: Private video")
+    assert cap.friendly("No results.") == "That video is private."
+    quiet = _ErrorCapture()
+    quiet.error("ERROR: Video unavailable")
+    assert quiet.friendly("No results.") == "That video is unavailable."
 
 
 async def test_fetch_stream_reports_why_a_video_cannot_be_used(fake_sites):
