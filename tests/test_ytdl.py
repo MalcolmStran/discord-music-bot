@@ -252,7 +252,7 @@ class _FakeNestedIE(InfoExtractor):
     """Results yt-dlp builds inline rather than as url_results, so even a flat extraction
     processes them: a tab holding a shelf (a playlist two levels down) and an entry that
     fails (None under ignoreerrors), and an upload in parts (_type multi_video)."""
-    _VALID_URL = r"https://fake\.test/nested/(?P<id>shelf|gap|parts)"
+    _VALID_URL = r"https://fake\.test/nested/(?P<id>shelf|gap|parts|deepparts)"
     IE_NAME = "fakenested"
 
     def _inline(self, entries, pid, _type="playlist"):
@@ -264,6 +264,7 @@ class _FakeNestedIE(InfoExtractor):
         if kind == "parts":
             return self.playlist_result([self._inline([_video("p1"), _video("p2")], "mv", "multi_video")], kind)
         odd = (self._inline([_video("deep")], "shelf") if kind == "shelf"
+               else self._inline([_video("d1"), _video("d2")], "mv", "multi_video") if kind == "deepparts"
                else {"id": "noformats", "title": "noformats", "extractor": self.IE_NAME,
                      "extractor_key": self.ie_key()})
         return self.playlist_result([self._inline([_video("a"), odd, _video("b")], "tab")], kind)
@@ -408,6 +409,14 @@ async def test_an_upload_in_parts_queues_each_part(fake_sites):
     one track with no stream of its own."""
     tracks = await YTDL().resolve("https://fake.test/nested/parts")
     assert [t.title for t in tracks] == ["tp1", "tp2"]
+
+
+async def test_an_upload_in_parts_two_levels_down_is_not_queued_as_a_track(fake_sites):
+    """Like a shelf, a multi_video inside a tab is past the one level that is flattened. Only
+    _type playlist was recognised as a collection, so it was queued as "Inline mv" with nothing
+    to play."""
+    tracks = await YTDL().resolve("https://fake.test/nested/deepparts")
+    assert [t.title for t in tracks] == ["ta", "tb"]
 
 
 async def test_a_failed_later_page_keeps_the_pages_that_loaded(fake_sites):

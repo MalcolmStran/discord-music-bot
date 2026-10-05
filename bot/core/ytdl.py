@@ -99,7 +99,9 @@ _COLLECTION_IES = frozenset({"YoutubeTab", "YoutubePlaylist", "SoundcloudSet", "
 
 
 def _is_collection(entry: dict[str, Any]) -> bool:
-    if entry.get("_type") == "playlist":
+    # multi_video (an upload in parts) holds its parts as entries too; two levels down it is
+    # past the one level _track_entries flattens, and queued whole it has no stream of its own
+    if entry.get("_type") in ("playlist", "multi_video"):
         return True
     # The extractor yt-dlp named for an entry beats the URL's shape: every Yandex Music track
     # is http://music.yandex.ru/album/<id>/track/<id>, and the /album/ hint dropped them all.
