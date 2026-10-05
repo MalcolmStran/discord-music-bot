@@ -23,9 +23,12 @@ class _Guild:
     me = object()
 
 
-class _Channel:
+class _Channel(discord.abc.GuildChannel):
+    """A guild text channel as far as the permission pre-check can tell."""
+
     def __init__(self, perms):
         self.perms = perms
+        self.id = 42
 
     def permissions_for(self, member):
         assert member is _Guild.me
@@ -42,13 +45,13 @@ _CAN_POST = discord.Permissions(view_channel=True, send_messages=True, attach_fi
 class _Message:
     _seq = 0
 
-    def __init__(self, content, uid=100, is_bot=False, guild=True, perms=_CAN_POST):
+    def __init__(self, content, uid=100, is_bot=False, guild=True, perms=_CAN_POST, channel=None):
         _Message._seq += 1
         self.id = _Message._seq
         self.content = content
         self.author = _Author(uid, is_bot)
         self.guild = _Guild() if guild else None
-        self.channel = _Channel(perms)
+        self.channel = channel or _Channel(perms)
         self.edits = []
 
     async def edit(self, **kw):
@@ -190,6 +193,14 @@ async def test_an_uncached_thread_parent_does_not_stop_conversion(cog):
     turn into an error on every message in the thread."""
     got = await urls(cog, "https://x.com/a/status/1", perms=discord.ClientException("Parent channel not found"))
     assert got == ["https://x.com/a/status/1"]
+
+
+async def test_a_channel_discord_py_has_not_cached_is_tried_anyway(cog):
+    """For a channel or thread missing from its cache discord.py hands over a
+    PartialMessageable, whose permissions_for() is always none(): read as "may not post",
+    every link there was dropped without a word, though replying works fine."""
+    channel = discord.PartialMessageable(state=None, id=123, guild_id=_Guild.id)
+    assert await urls(cog, "https://x.com/a/status/1", channel=channel) == ["https://x.com/a/status/1"]
 
 
 async def test_unsupported_links_are_ignored(cog):

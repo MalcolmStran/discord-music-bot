@@ -243,12 +243,18 @@ class Media(commands.Cog):
         # channel the bot may not post in, every link used to be fetched and compressed only
         # to fail with 403 on the final reply. attach_files is already False wherever the
         # bot can't send (discord.py applies that for threads too); a reply also needs Read
-        # Message History. A thread whose parent isn't cached raises, so try as before.
-        try:
-            perms = message.channel.permissions_for(message.guild.me)
-        except discord.ClientException:
-            perms = None
+        # Message History. A thread whose parent isn't cached raises, so try as before. So
+        # does any other channel type: discord.py hands over a PartialMessageable for a
+        # channel or thread it hasn't cached, and its permissions_for() is always none(),
+        # which read as "may not post" and silently dropped every link there.
+        perms = None
+        if isinstance(message.channel, (discord.abc.GuildChannel, discord.Thread)):
+            try:
+                perms = message.channel.permissions_for(message.guild.me)
+            except discord.ClientException:
+                pass
         if perms is not None and not (perms.attach_files and perms.read_message_history):
+            log.debug("no permission to upload in channel %s; leaving its links alone", message.channel.id)
             return
         # at most 2 videos per message, and never process the same message twice
         if message.id in self._inflight:
