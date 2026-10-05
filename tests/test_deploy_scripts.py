@@ -15,6 +15,8 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from packaging.markers import default_environment
+from packaging.requirements import Requirement
 
 REPO = Path(__file__).resolve().parent.parent
 ENTRYPOINT = REPO / "entrypoint.sh"
@@ -71,12 +73,22 @@ def _ytdlp_extras(spec: str):
     return {e.strip() for e in (m.group(1) or "").split(",") if e.strip()}
 
 
+def _requirements(machine: str):
+    """What `pip install -r requirements.txt` asks for on a CPython 3.13 Linux `machine`."""
+    env = {**default_environment(), "sys_platform": "linux", "platform_system": "Linux",
+           "platform_machine": machine, "python_version": "3.13", "python_full_version": "3.13.0"}
+    reqs = [Requirement(line) for line in REQUIREMENTS.read_text().splitlines()
+            if line.strip() and not line.lstrip().startswith("#")]
+    return {r.name: r for r in reqs if r.marker is None or r.marker.evaluate(env)}
+
+
 def _requirement_extras():
-    for line in REQUIREMENTS.read_text().splitlines():
-        extras = _ytdlp_extras(line)
-        if extras is not None:
-            return extras
-    raise AssertionError("requirements.txt has no yt-dlp line")
+    return set(_requirements("x86_64")["yt-dlp"].extras)
+
+
+def _installs_deno(machine: str) -> bool:
+    reqs = _requirements(machine)
+    return "deno" in reqs or "deno" in reqs["yt-dlp"].extras
 
 
 # ---------------------------------------------------------------- entrypoint.sh self-update
@@ -106,19 +118,32 @@ def test_entrypoint_says_so_when_the_self_update_is_off(sandbox, value):
     assert recorded[-1][0] == "setpriv", "the bot was not started"
 
 
-def test_requirements_ship_the_js_runtime_yt_dlp_uses_by_default():
+# x86_64/aarch64 are the image's platforms (python:3.13-slim on amd64/arm64); the other two
+# are how macOS arm64 and Windows x64 spell theirs, where deno also publishes wheels.
+@pytest.mark.parametrize("machine", ["x86_64", "aarch64", "arm64", "AMD64"])
+def test_requirements_ship_the_js_runtime_yt_dlp_uses_by_default(machine):
     """yt-dlp enables only Deno unless told otherwise (Debian's Node is below its 22+ floor
     anyway), and solves YouTube's challenges with the yt-dlp-ejs scripts from `default`."""
-    assert {"default", "deno"} <= _requirement_extras()
+    assert "default" in _requirements(machine)["yt-dlp"].extras
+    assert _installs_deno(machine), f"no Deno on {machine}, so no YouTube JS challenge solving"
+
+
+@pytest.mark.parametrize("machine", ["armv7l", "armv6l", "i686"])
+def test_requirements_do_not_ask_for_deno_where_it_has_no_wheels(machine):
+    """deno publishes no wheel there and its sdist refuses to build, so an unconditional
+    `yt-dlp[deno]` made `pip install -r requirements.txt` fail outright (32-bit Raspberry Pi OS)."""
+    assert "default" in _requirements(machine)["yt-dlp"].extras
+    assert not _installs_deno(machine)
 
 
 def test_entrypoint_self_update_keeps_the_requirement_extras(sandbox):
-    """A bare `pip install -U yt-dlp` upgrades yt-dlp past the yt-dlp-ejs it pins."""
+    """A bare `pip install -U yt-dlp` upgrades yt-dlp past the yt-dlp-ejs it pins. The image is
+    always x86_64/aarch64, so it keeps Deno too, via yt-dlp's own extra to track its floor."""
     _, recorded = sandbox(ENTRYPOINT)
     (pip,) = _pip_calls(recorded)
     specs = [a for a in pip if _ytdlp_extras(a) is not None]
     assert specs, pip
-    assert _ytdlp_extras(specs[0]) == _requirement_extras()
+    assert _ytdlp_extras(specs[0]) >= _requirement_extras() | {"deno"}
 
 
 # ---------------------------------------------------------------- run.sh settings volume

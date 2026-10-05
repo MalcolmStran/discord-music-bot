@@ -11,9 +11,11 @@ auto_update=${YTDLP_AUTO_UPDATE-}
 auto_update=${auto_update//[[:space:]]/}
 case "${auto_update,,}" in
     ""|1|true|yes|on)
-        # Keep the extras in step with requirements.txt: a bare `yt-dlp` upgrade leaves the
-        # pinned yt-dlp-ejs behind, which a newer yt-dlp rejects. pip's default only-if-needed
-        # strategy leaves the ~40 MB deno wheel alone unless yt-dlp starts requiring a newer one.
+        # Keep the extras: a bare `yt-dlp` upgrade leaves the pinned yt-dlp-ejs behind, which a
+        # newer yt-dlp rejects. requirements.txt lists deno on its own line behind a platform
+        # marker, but this image is always Debian x86_64/aarch64 where that marker holds, so ask
+        # for yt-dlp's `deno` extra here to keep deno at whatever floor the new yt-dlp sets.
+        # pip's default only-if-needed strategy leaves the ~40 MB wheel alone otherwise.
         if timeout 90 pip install --quiet --no-cache-dir --upgrade "yt-dlp[default,deno]"; then
             echo "yt-dlp: $(python -c 'import yt_dlp;print(yt_dlp.version.__version__)')"
         else
