@@ -317,13 +317,17 @@ async def test_too_long_tracks_do_not_count_toward_the_failure_streak(monkeypatc
     p.ytdl = _TooLongYTDL()
     _, said = _wire(p, monkeypatch)
     p.queue.extend([track(f"next{i}") for i in range(3)])
+    # The track that played before: make_player() starts with current=None, so without this
+    # the `current is None` check below could never fail.
+    p.current = track("prev")
 
     for _ in range(p.MAX_CONSECUTIVE_FAILURES + 1):
         await p._play_track(track("mix"))
 
     assert len(p.queue) == 3, "too-long tracks must not trip the failure cutoff"
     assert p._failures == 0
-    assert p.current is None, "a skipped track must not stay current (loop-all would re-queue it)"
+    assert p.current is None, "the previous track must not stay current (loop-all would re-queue it)"
+    assert p.loading is None and not p.is_busy, "/nowplaying would show 'Loading' for the skipped track"
     assert not any("Too many tracks failed" in m for m in said)
     assert all("Too long" in m for m in said) and len(said) == p.MAX_CONSECUTIVE_FAILURES + 1
 
@@ -487,6 +491,33 @@ async def test_a_voice_drop_during_the_resolve_holds_the_track_instead_of_skippi
     assert p._failures == 0, "a dropped connection is not a broken track"
     assert not said, f"nothing should be announced as skipped: {said}"
     assert p.current is None and p._source is None
+
+
+async def test_a_drop_is_judged_by_the_client_play_was_called_on(monkeypatch):
+    """A /play can put a NEW connected client on the guild while the old one drops mid-resolve.
+    play() then fails on the old client, and `self.connected` (the new one) would call that a
+    broken track: announced, counted, and lost instead of retried on the new connection."""
+    p = make_player()
+    p.bot = types.SimpleNamespace(loop=asyncio.get_running_loop())
+    old, new = _DroppingVC(), _DroppingVC()
+    clients = [old]
+    monkeypatch.setattr(type(p), "voice", property(lambda self: clients[-1]))
+    said = []
+
+    async def _announce(text):
+        said.append(text)
+
+    monkeypatch.setattr(p, "_announce", _announce)
+
+    async def drop_and_rejoin():
+        old.connected = False
+        clients.append(new)
+
+    p.ytdl = _StreamYTDL(during=drop_and_rejoin)
+    await p._play_track(track("A"))
+
+    assert [t.title for t in p.queue] == ["A"], "A must be held for the new connection"
+    assert p._failures == 0 and not said, said
 
 
 async def test_a_play_error_while_connected_still_counts_as_a_failure(monkeypatch):
