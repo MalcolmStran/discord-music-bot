@@ -27,9 +27,11 @@ You should see `online as <bot name> (<id>) in N guilds` within a few seconds. I
 don't, jump to [Troubleshooting](#troubleshooting).
 
 Running without Docker needs Python 3.11+ and `ffmpeg` (with `ffprobe`). yt-dlp also needs
-Deno to solve YouTube's challenges; `requirements.txt` installs it on x86_64 and aarch64
-(glibc 2.27+), macOS and 64-bit Windows. Elsewhere (32-bit ARM, musl/Alpine) it is skipped and
-YouTube runs without the challenge solver unless you install Deno yourself:
+Deno to solve YouTube's challenges; `requirements.txt` installs it on x86_64 and aarch64,
+macOS and 64-bit Windows, and skips it on other CPUs (32-bit ARM, i686, riscv64), where YouTube
+runs without the challenge solver unless you install Deno yourself. On musl (Alpine) or glibc
+older than 2.27 there's no Deno build for pip to install, so delete the `deno` line from
+`requirements.txt` first:
 
 ```bash
 pip install -r requirements.txt
@@ -226,7 +228,7 @@ up on a gateway connection that stayed dead for 10 minutes (`gateway dead for â€
 
 ```bash
 ./check.sh --install      # install dev deps, then lint + the whole suite
-./check.sh                # lint + tests (581, no Discord and no network)
+./check.sh                # lint + tests (596, no Discord and no network)
 ./check.sh --docker       # also build the image and run the suite inside it
 ```
 
