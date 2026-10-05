@@ -27,7 +27,9 @@ You should see `online as <bot name> (<id>) in N guilds` within a few seconds. I
 don't, jump to [Troubleshooting](#troubleshooting).
 
 Running without Docker needs Python 3.11+ and `ffmpeg` (with `ffprobe`). yt-dlp also needs
-Deno to solve YouTube's challenges; `requirements.txt` installs it via `yt-dlp[default,deno]`:
+Deno to solve YouTube's challenges; `requirements.txt` installs it on x86_64 and aarch64
+(glibc 2.27+), macOS and 64-bit Windows. Elsewhere (32-bit ARM, musl/Alpine) it is skipped and
+YouTube runs without the challenge solver unless you install Deno yourself:
 
 ```bash
 pip install -r requirements.txt
@@ -111,7 +113,7 @@ Use `!sync` (owner only) to force a refresh.
 
 | Command | Aliases | Notes |
 |---|---|---|
-| *(paste a Twitter/X or TikTok link)* | | converted automatically; the original embed is hidden only when every link in the message was converted. Links inside `\|\|spoiler\|\|` tags are uploaded as spoilers. Profile, hashtag, live and Space links are left alone |
+| *(paste a Twitter/X or TikTok link)* | | converted automatically; the original embed is hidden only when every link in the message was converted. Links inside `\|\|spoiler\|\|` tags are uploaded as spoilers. Profile, hashtag, live and Space links are left alone (no ⏳, and they don't use up one of the two links converted per message) |
 | *(paste an fxtwitter / vxtwitter / fixupx / fixvx / twittpr / vxtiktok / tnktok link)* | | **left alone** — it already embeds its own video, so converting would post the clip twice |
 | *(a clip with no audio track)* | | sent as a looping GIF sized to fit the upload cap; set `MAX_GIF_SECONDS=0` to disable |
 | `/convert <url>` | | manual conversion, works on fixer links too |
@@ -170,8 +172,12 @@ A host path in `YTDL_COOKIES_FILE` doesn't exist inside the container. Put the f
 `docker-compose.yml`, uncomment the `./cookies.txt:/app/cookies.txt:ro` line there, and set
 `YTDL_COOKIES_FILE=/app/cookies.txt`. Create the file first, or Docker creates a directory
 in its place. With `run.sh`, add `-v "$PWD/cookies.txt:/app/cookies.txt:ro"` to its
-`docker run` line. If the file is missing, the bot logs a warning at start-up instead of
-silently going without.
+`docker run` line.
+
+If the path is missing, is a directory, or can't be read, the bot logs a warning at start-up
+and runs without cookies rather than failing every download. If Docker already created a
+`cookies.txt` directory, remove it on the host (`rmdir cookies.txt`), create the file, and
+recreate the container.
 
 ---
 
@@ -192,7 +198,8 @@ Either `.env` is missing, or the token is still the `your_discord_token_here` pl
 **YouTube playback suddenly fails everywhere.**
 YouTube changed something and yt-dlp needs updating. The container self-updates on start,
 so `docker compose restart` usually fixes it; if the log shows `yt-dlp: self-update
-disabled`, `YTDLP_AUTO_UPDATE` is off. If it persists, the video may be age-gated or
+disabled`, `YTDLP_AUTO_UPDATE` is off. "The site refused the request" means YouTube (or the
+source site) turned the bot away, which is usually rate-limiting of the bot's IP. If it persists, the video may be age-gated or
 rate-limited — export a `cookies.txt` and set it up as in
 [Cookies under Docker](#cookies-under-docker).
 
@@ -219,7 +226,7 @@ up on a gateway connection that stayed dead for 10 minutes (`gateway dead for �
 
 ```bash
 ./check.sh --install      # install dev deps, then lint + the whole suite
-./check.sh                # lint + tests (499, no Discord and no network)
+./check.sh                # lint + tests (581, no Discord and no network)
 ./check.sh --docker       # also build the image and run the suite inside it
 ```
 
@@ -342,7 +349,7 @@ hand off to whatever link the tweet contains. So downloads are also restricted t
 `twitter`, `tiktok` and `vm.tiktok` extractors, and the generic one can never run.
 
 **yt-dlp needs a JS runtime** for YouTube, and by default it only uses Deno. The image ships
-Deno through the `yt-dlp[deno]` extra. Debian's Node is below yt-dlp's minimum version, and
+Deno as the pip `deno` wheel. Debian's Node is below yt-dlp's minimum version, and
 yt-dlp ignores Node unless it's told to use it.
 
 ---
