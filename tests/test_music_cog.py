@@ -214,3 +214,11 @@ async def test_an_unbalanced_quote_gets_the_argument_hint_not_an_internal_error(
         await Music.cog_command_error(cog, ctx, error)
     assert sink.sent == ["That argument doesn't look right — check `/help`."]
     assert not caplog.records, "a typo must not be logged as an internal error"
+
+
+async def test_status_shows_the_volume_that_was_set():
+    """/status had its own `int(volume * 100)` and still said 28% after `/volume 29`."""
+    cog, player, ctx, sink = _cog_and_player()
+    player.set_volume(29 / 100)
+    await Music.status.callback(cog, ctx)
+    assert {f.name: f.value for f in sink.sent[-1].fields}["Volume"] == "29%"

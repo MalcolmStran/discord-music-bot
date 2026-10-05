@@ -378,6 +378,44 @@ async def test_alone_check_stays_if_someone_returns_during_its_announcement(monk
         await teardown(player)
 
 
+async def test_alone_check_stays_if_a_join_starts_during_its_announcement(monkeypatch):
+    """The post-announce re-check must also see a /play or /join that began moving the bot
+    while the goodbye was sending: disconnect() queues behind the move and then tears down
+    the channel the bot was just summoned to."""
+    env = _env(monkeypatch)
+    monkeypatch.setattr(Music, "ALONE_CHECK_DELAY", 0.0)
+    g = env.guild
+    a, b = FakeChannel(g, "A", humans=1), FakeChannel(g, "B", humans=1)
+    player = make_player(env)
+    await player.connect(a)
+    vc = g.voice_client
+    leaver = a.humans.pop()
+    gate, announcing = asyncio.Event(), asyncio.Event()
+
+    async def slow_send(content=None, **kw):
+        announcing.set()
+        await gate.wait()
+
+    player.text_channel.send = slow_send
+    vc.move_gate = asyncio.Event()
+    check = asyncio.create_task(env.cog.on_voice_state_update(
+        leaver, types.SimpleNamespace(channel=a), types.SimpleNamespace(channel=None)))
+    try:
+        await asyncio.wait_for(announcing.wait(), timeout=1)
+        moving = asyncio.create_task(player.connect(b))   # /play from B, still moving
+        await until(lambda: player.connecting)
+        gate.set()
+        await asyncio.sleep(0.02)                     # the check re-reads A: still empty
+        vc.move_gate.set()
+        await moving
+        await check
+        assert player.connected and player.channel is b, "left the channel it was summoned to"
+    finally:
+        gate.set()
+        vc.move_gate.set()
+        await teardown(player)
+
+
 # ============================================ our own leaves are not external drops
 async def test_leave_is_not_logged_as_a_failed_recovery(monkeypatch, caplog):
     """Discord echoes our own leave exactly like a kick, so every /leave logged 'bot left
@@ -451,6 +489,28 @@ async def test_idle_timer_does_not_leave_while_play_is_resolving(monkeypatch):
         assert player.connected, f"left mid-/play: {player.text_channel.sent}"
         assert player.current.title == "song"
         assert not any("Nothing played" in m for m in player.text_channel.texts)
+    finally:
+        await teardown(player)
+
+
+async def test_a_cancelled_play_does_not_hold_off_idle_leaves_for_good(monkeypatch):
+    """The reservation must be released however /play ends. A cancelled /play (or one whose
+    reply raised) that kept its count blocked every idle leave in that guild until restart."""
+    env = _env(monkeypatch)
+    a = FakeChannel(env.guild, "A")
+    player = make_player(env, idle=0.03)
+    env.cog.ytdl.gate = asyncio.Event()
+    ctx, _ = make_ctx(env, a)
+    playing = asyncio.create_task(Music.play.callback(env.cog, ctx, query="song"))
+    try:
+        await until(lambda: env.cog.ytdl.queries)     # joined, resolving, reservation held
+        playing.cancel()
+        try:
+            await playing
+        except asyncio.CancelledError:
+            pass
+        await until(lambda: not player.connected, timeout=1)
+        assert any("Nothing played" in m for m in player.text_channel.texts)
     finally:
         await teardown(player)
 
@@ -625,6 +685,20 @@ async def test_full_channel_is_refused_at_once(monkeypatch):
     assert sink.sent and "**Duo** is full" in sink.sent[0]
 
 
+async def test_full_channel_counts_occupants_the_member_cache_cannot_resolve(monkeypatch):
+    """Without the members intent `channel.members` drops uncached occupants, so a full
+    channel read as having room and the 30 s connect timeout was back."""
+    env = _env(monkeypatch)
+    duo = FakeChannel(env.guild, "Duo", humans=2, user_limit=2)
+    for m in duo.humans:
+        del env.guild.members[m.id]                   # in voice, but not in the member cache
+    player = make_player(env)
+    ctx, sink = make_ctx(env, duo, author=duo.humans[0])
+    assert await Music._join_author_channel(env.cog, ctx, player) is False
+    assert duo.connects == 0
+    assert sink.sent and "**Duo** is full" in sink.sent[0]
+
+
 async def test_full_channel_is_fine_with_move_members_or_when_already_in_it(monkeypatch):
     env = _env(monkeypatch)
     duo = FakeChannel(env.guild, "Duo", humans=2, user_limit=2)
@@ -681,6 +755,9 @@ async def test_stage_join_asks_to_speak(monkeypatch):
     try:
         assert await Music._join_author_channel(env.cog, ctx, player) is True
         assert calls == [("edit", {"suppress": False})]
+        # a later /play there: already a speaker, so no PATCH (or 403 retry) on every command
+        assert await Music._join_author_channel(env.cog, ctx, player) is True
+        assert calls == [("edit", {"suppress": False})]
         assert sink.sent == []
     finally:
         await teardown(player)
@@ -705,6 +782,23 @@ async def test_stage_join_without_moderator_rights_requests_to_speak_and_says_so
         assert await Music._join_author_channel(env.cog, ctx, player) is True
         assert calls == ["request"]
         assert len(sink.sent) == 1 and "Stage moderator" in sink.sent[0]
+    finally:
+        await teardown(player)
+
+
+async def test_stage_unsuppress_failing_otherwise_does_not_fail_the_join(monkeypatch):
+    env = _env(monkeypatch)
+
+    async def edit(**kw):
+        raise _http_error(discord.HTTPException, 500)
+
+    env.guild.me.edit = edit
+    stage = _Stage(env.guild)
+    player = make_player(env)
+    ctx, sink = make_ctx(env, stage)
+    try:
+        assert await Music._join_author_channel(env.cog, ctx, player) is True
+        assert sink.sent == []
     finally:
         await teardown(player)
 
@@ -745,18 +839,48 @@ async def test_play_reports_the_real_position_while_the_first_track_resolves(mon
     await teardown(player)
 
 
+async def test_play_reports_a_position_whenever_something_is_ahead_of_it(monkeypatch):
+    """Either term alone misses a case: a stream resolving with nothing queued behind it, and
+    tracks queued that the loop has not picked up yet (both with `current` None)."""
+    env = _env(monkeypatch)
+    a = FakeChannel(env.guild, "A")
+    player = make_player(env)
+    await player.connect(a)
+    monkeypatch.setattr(player, "ensure_loop", lambda: None)   # keep the loop out of it
+    ctx, sink = make_ctx(env, a)
+    try:
+        player._loading = track("resolving")          # the loop is resolving; queue empty
+        await Music.play.callback(env.cog, ctx, query="A")
+        assert sink.sent[-1].title == "➕ Added to queue"
+        assert {f.name: f.value for f in sink.sent[-1].fields}["Position"] == "1"
+
+        player._loading = None
+        player.queue.clear()
+        player.queue.extend([track("q1"), track("q2")])   # queued, loop not busy yet
+        await Music.play.callback(env.cog, ctx, query="B")
+        assert sink.sent[-1].title == "➕ Added to queue"
+        assert {f.name: f.value for f in sink.sent[-1].fields}["Position"] == "3"
+    finally:
+        player._loading = None
+        await teardown(player)
+
+
 # ============================================ shutdown
 async def test_unload_leaves_every_guild_concurrently_and_within_a_bound(monkeypatch):
     """With the gateway down every voice disconnect waits 30 s for an echo. One guild at a
     time, shutdown outran docker's stop_grace_period and the container was SIGKILLed."""
     env = _env(monkeypatch)
     monkeypatch.setattr(Music, "UNLOAD_TIMEOUT", 0.05)
-    started = []
+    started, cancelled = [], []
 
     class _Hung:
         async def disconnect(self):
             started.append(self)
-            await asyncio.Event().wait()              # an echo that never comes
+            try:
+                await asyncio.Event().wait()          # an echo that never comes
+            except asyncio.CancelledError:
+                cancelled.append(self)
+                raise
 
     env.cog.players = {1: _Hung(), 2: _Hung(), 3: _Hung()}
     try:
@@ -765,3 +889,5 @@ async def test_unload_leaves_every_guild_concurrently_and_within_a_bound(monkeyp
         raise AssertionError(f"shutdown did not finish; {len(started)} of 3 guilds were asked to leave") from None
     assert len(started) == 3, "every guild should have been asked to leave at once"
     assert env.cog.players == {}
+    # abandoned, not left running into the loop's shutdown
+    await until(lambda: len(cancelled) == 3, timeout=0.5)
