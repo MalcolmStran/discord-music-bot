@@ -1,6 +1,7 @@
 """ytdl helpers (shell quoting, header handling, format picking, error mapping), and
 resolve/fetch_stream driven through a real YoutubeDL with offline fake extractors."""
 import asyncio
+import itertools
 import shlex
 import threading
 
@@ -174,13 +175,42 @@ def _video(vid, **kw):
 
 
 class _FakeChannelIE(InfoExtractor):
-    """A collection URL with no playlist hint in it, like youtube.com/@name."""
-    _VALID_URL = r"https://fake\.test/@chan"
+    """Shaped like YoutubeTabIE on a channel root (youtube.com/@name, no playlist hint): a
+    playlist of the channel's tabs, each a playlist that already holds its videos. _tab.py
+    builds the tabs with _real_extract, not url_result, "even with --flat-playlist"."""
+    _VALID_URL = r"https://fake\.test/@(?P<id>chan|small)"
     IE_NAME = "fakechannel"
 
     def _real_extract(self, url):
-        return self.playlist_result(
-            (self.url_result(f"https://fake.test/v/{i}", _FakeVideoIE) for i in range(500)), "chan", "Channel")
+        n = 500 if self._match_id(url) == "chan" else 2
+        # a YouTube Music artist's first tab lists albums (YoutubeTab links) among the songs
+        album = [] if n == 500 else [self.url_result("https://music.youtube.com/browse/MPREb_y", "YoutubeTab")]
+
+        def tab(name, entries):
+            return {**self.playlist_result(entries, f"chan-{name}", f"Channel - {name}"),
+                    "webpage_url": f"https://fake.test/@chan/{name}",
+                    "extractor": self.IE_NAME, "extractor_key": self.ie_key()}
+        return self.playlist_result([
+            tab("videos", itertools.chain(album, (_video(f"v{i}") for i in range(n)))),
+            tab("streams", [_video("onair", live_status="is_live"), _video("vod", live_status="was_live")]),
+            tab("shorts", (_video(f"s{i}") for i in range(n))),
+        ], "chan", "Channel")
+
+
+class _FakeUserPageIE(InfoExtractor):
+    """A flat listing whose entries are partly collections: a SoundCloud user page links its
+    sets (no ie_key), a Bandcamp discography its albums, a YouTube Music artist its albums
+    (ie_key YoutubeTab, browse URL with no playlist hint)."""
+    _VALID_URL = r"https://fake\.test/user/(?P<id>mixed|only)"
+    IE_NAME = "fakeuserpage"
+
+    def _real_extract(self, url):
+        entries = [self.url_result("https://soundcloud.com/u/sets/mix"),
+                   self.url_result("https://u.bandcamp.com/album/lp"),
+                   self.url_result("https://music.youtube.com/browse/MPREb_x", "YoutubeTab")]
+        if self._match_id(url) == "mixed":
+            entries.insert(1, _video("9"))
+        return self.playlist_result(entries, "user")
 
 
 class _FakePagedIE(InfoExtractor):
@@ -248,7 +278,8 @@ class _FakeSitesYDL(yt_dlp.YoutubeDL):
 
     def __init__(self, params=None, auto_init=True):
         super().__init__(params, auto_init=False)
-        for ie in (_FakeSearchIE, _FakeChannelIE, _FakePagedIE, _FakeVideoIE, _FakeErrorIE, _FakeCrashyIE):
+        for ie in (_FakeSearchIE, _FakeChannelIE, _FakeUserPageIE, _FakePagedIE,
+                   _FakeVideoIE, _FakeErrorIE, _FakeCrashyIE):
             self.add_info_extractor(ie())
         self.add_default_info_extractors()
 
@@ -270,13 +301,31 @@ def _no_probe(ytdl):
     return probed
 
 
-async def test_a_channel_url_resolves_flat_and_capped(fake_sites):
+async def test_a_channel_url_queues_its_videos_flat_and_capped(fake_sites):
     """A collection URL without a playlist hint used to be fully extracted entry by entry,
-    with no MAX_QUEUE_SIZE cap: hours of requests on a worker thread for a big channel."""
-    y = YTDL(max_playlist=50)
-    tracks = await y.resolve("https://fake.test/@chan")
-    assert len(tracks) == 50
+    with no MAX_QUEUE_SIZE cap: hours of requests on a worker thread for a big channel.
+    Then the channel's tabs were queued as tracks ("Channel - Videos", ...) that could never
+    play, and the videos yt-dlp had already listed in them were dropped. playlistend caps
+    each tab separately, so the total has to be capped as well."""
+    tracks = await YTDL(max_playlist=50).resolve("https://fake.test/@chan")
+    assert [t.webpage_url for t in tracks] == [f"https://fake.test/v/v{i}" for i in range(50)]
     assert _FakeVideoIE.extractions == 0
+
+
+async def test_a_channel_with_few_videos_skips_live_streams_and_albums(fake_sites):
+    """Past the Videos tab come Live and Shorts; a stream that is live right now never ends,
+    and an album link inside a tab is no more playable than one at the top level."""
+    tracks = await YTDL(max_playlist=50).resolve("https://fake.test/@small")
+    assert [t.title for t in tracks] == ["tv0", "tv1", "tvod", "ts0", "ts1"]
+
+
+async def test_entries_that_are_collections_are_not_queued_as_tracks(fake_sites):
+    """A SoundCloud user page lists its sets, a Bandcamp page its albums, a YouTube Music
+    artist its albums: each was queued and then failed with "No playable stream found."."""
+    tracks = await YTDL().resolve("https://fake.test/user/mixed")
+    assert [t.webpage_url for t in tracks] == ["https://fake.test/v/9"]
+    with pytest.raises(LookupError, match=r"^Playlist is empty or unavailable\.$"):
+        await YTDL().resolve("https://fake.test/user/only")
 
 
 async def test_a_failed_later_page_keeps_the_pages_that_loaded(fake_sites):

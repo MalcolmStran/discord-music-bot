@@ -11,6 +11,7 @@ Design notes
 from __future__ import annotations
 
 import asyncio
+import itertools
 import logging
 import re
 import time
@@ -88,6 +89,37 @@ def looks_like_playlist(q: str) -> bool:
     return looks_like_url(q) and bool(_PLAYLIST_HINT.search(q))
 
 
+# Flat entries that are collections, not tracks: a channel's /playlists tab and YouTube Music
+# shelves (YoutubeTab), SoundCloud user pages listing their sets, Bandcamp discographies.
+# Queued, each failed in fetch_stream with "No playable stream found." and fed the failure streak.
+_COLLECTION_IES = frozenset({"YoutubeTab", "YoutubePlaylist", "SoundcloudSet", "SoundcloudPlaylist",
+                             "SoundcloudUser", "BandcampAlbum", "BandcampUser"})
+
+
+def _is_collection(entry: dict[str, Any]) -> bool:
+    return (entry.get("_type") == "playlist" or entry.get("ie_key") in _COLLECTION_IES
+            or looks_like_playlist(entry.get("url") or ""))
+
+
+def _track_entries(entries):
+    """The entries of a flat result that can be queued, with one nested level flattened.
+
+    A channel root (youtube.com/@name, a YouTube Music artist) is a playlist of its tabs, and
+    yt-dlp fills each tab with its videos even when flat. Taking the tabs as entries queued
+    "X - Videos", "X - Live" and "X - Shorts", none of them playable, and dropped the videos.
+    """
+    for e in entries:
+        if not e:
+            continue
+        if e.get("_type") == "playlist" or e.get("entries") is not None:
+            for sub in e.get("entries") or []:
+                # a tab's live stream never ends, so it would hold the queue forever
+                if sub and sub.get("live_status") != "is_live" and not _is_collection(sub):
+                    yield sub
+        elif not _is_collection(e):
+            yield e
+
+
 class YTDL:
     """Thin async wrapper around yt_dlp.YoutubeDL."""
 
@@ -156,7 +188,9 @@ class YTDL:
         entries = info.get("entries")
         if entries is None:
             return [self._to_track(info, requester_id)]
-        tracks = [self._to_track(e, requester_id) for e in entries if e]
+        # playlistend caps each channel tab on its own, so the total is capped here
+        tracks = [self._to_track(e, requester_id)
+                  for e in itertools.islice(_track_entries(entries), self.max_playlist)]
         if not tracks:
             # a search with zero hits is an empty playlist to yt-dlp, not to the user
             raise LookupError(errors.friendly("No results." if is_search else "Playlist is empty or unavailable."))
