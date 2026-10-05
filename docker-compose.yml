@@ -15,8 +15,11 @@ services:
     volumes:
       - ./logs:/app/logs
       - bot-downloads:/app/downloads   # temp media + guild settings (persisted)
-      # yt-dlp cookies: a host path in YTDL_COOKIES_FILE doesn't exist in the container and is
-      # silently skipped. Create the file, uncomment this, and set YTDL_COOKIES_FILE=/app/cookies.txt.
+      # yt-dlp cookies: a host path in YTDL_COOKIES_FILE doesn't exist in the container, so the bot
+      # warns at start-up and runs without cookies. Create ./cookies.txt FIRST, then uncomment this
+      # and set YTDL_COOKIES_FILE=/app/cookies.txt. Mounting a missing file makes Docker create a
+      # directory in its place; the bot ignores that with a warning too, but it stays on the host
+      # until you `rmdir cookies.txt`, create the file and recreate the container.
       # The bot only reads it (cookies are never written back), so :ro is fine.
       # - ./cookies.txt:/app/cookies.txt:ro
     # `deploy.resources` is swarm-only and is ignored by `docker compose up`, so the cap
