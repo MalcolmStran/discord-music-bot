@@ -45,7 +45,8 @@ class Music(commands.Cog):
     ALONE_CHECK_DELAY: float = 10.0
     # Shutdown budget for leaving every voice channel. Each VoiceClient.disconnect() waits up
     # to 30 s for a gateway echo that never comes when the uplink is down, and docker's
-    # stop_grace_period is 20 s, after which the container is SIGKILLed mid-teardown.
+    # stop_grace_period is 30 s (compose and run.sh); this 8 s plus up to 10 s of gateway close
+    # keeps a clean shutdown inside it before the container is SIGKILLed mid-teardown.
     UNLOAD_TIMEOUT: float = 8.0
 
     def __init__(self, bot: commands.Bot):
