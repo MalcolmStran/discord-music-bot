@@ -3,6 +3,7 @@
 Drives the real Media.on_message with stand-ins for Discord and for the conversion itself,
 because this is where both the embed-fixer rule and the per-user opt-out actually apply.
 """
+import logging
 from pathlib import Path
 
 import discord
@@ -23,8 +24,8 @@ class _Guild:
     me = object()
 
 
-class _Channel(discord.abc.GuildChannel):
-    """A guild text channel as far as the permission pre-check can tell."""
+class _Perms:
+    """Answers permissions_for() with the given permissions, or raises them."""
 
     def __init__(self, perms):
         self.perms = perms
@@ -35,6 +36,15 @@ class _Channel(discord.abc.GuildChannel):
         if isinstance(self.perms, Exception):
             raise self.perms
         return self.perms
+
+
+class _Channel(_Perms, discord.abc.GuildChannel):
+    """A guild text channel as far as the permission pre-check can tell."""
+
+
+class _Thread(_Perms, discord.Thread):
+    """A thread. discord.Thread is NOT a GuildChannel subclass, so the pre-check only
+    covers threads because it names this type too."""
 
 
 # What a bot that may post in the channel has.
@@ -120,6 +130,16 @@ async def test_embed_fixer_links_are_skipped(cog, link):
     assert await urls(cog, f"check this {link}") == []
 
 
+async def test_bare_and_mobile_tiktok_posts_are_converted(cog):
+    """yt-dlp's TikTok extractor only matches www.tiktok.com, so the listener has to ask
+    downloadable() about the normalised link; asked about the posted one, it reads these
+    as profile-like links and leaves them alone without a word."""
+    got = await urls(cog, "https://tiktok.com/@u/video/7123456789012345678 "
+                          "https://m.tiktok.com/@u/video/7123456789012345679")
+    assert got == ["https://www.tiktok.com/@u/video/7123456789012345678",
+                   "https://www.tiktok.com/@u/video/7123456789012345679"]
+
+
 @pytest.mark.parametrize("link", [
     "https://vm.tiktok.com/ZM1/",
     "https://vt.tiktok.com/ZS1/",
@@ -174,6 +194,7 @@ async def test_at_most_two_links_per_message(cog):
     assert len(await urls(cog, many)) == 2
 
 
+@pytest.mark.parametrize("where", [_Channel, _Thread])
 @pytest.mark.parametrize("perms", [
     # restricted to a #media channel: can read here, not post
     discord.Permissions(view_channel=True, read_message_history=True, add_reactions=True),
@@ -182,17 +203,19 @@ async def test_at_most_two_links_per_message(cog):
     # may post files, but a reply (message_reference) also needs Read Message History
     discord.Permissions(view_channel=True, send_messages=True, attach_files=True),
 ])
-async def test_nothing_is_downloaded_where_the_upload_would_be_refused(cog, perms):
+async def test_nothing_is_downloaded_where_the_upload_would_be_refused(cog, caplog, where, perms):
     """Every link was downloaded and compressed, holding the encode slots, only for the
     final reply to fail with 403."""
-    assert await urls(cog, "https://x.com/a/status/1", perms=perms) == []
+    with caplog.at_level(logging.DEBUG, logger="bot.cogs.media"):
+        assert await urls(cog, "https://x.com/a/status/1", channel=where(perms)) == []
+    assert "no permission to upload in channel 42" in caplog.text
 
 
 async def test_an_uncached_thread_parent_does_not_stop_conversion(cog):
     """Thread.permissions_for raises when the parent channel isn't cached; that must not
     turn into an error on every message in the thread."""
-    got = await urls(cog, "https://x.com/a/status/1", perms=discord.ClientException("Parent channel not found"))
-    assert got == ["https://x.com/a/status/1"]
+    thread = _Thread(discord.ClientException("Parent channel not found"))
+    assert await urls(cog, "https://x.com/a/status/1", channel=thread) == ["https://x.com/a/status/1"]
 
 
 async def test_a_channel_discord_py_has_not_cached_is_tried_anyway(cog):
@@ -315,6 +338,27 @@ async def test_a_repeat_inside_a_spoiler_blurs_the_upload(cog):
 async def test_skipped_fixer_links_are_counted(cog):
     await urls(cog, "https://fxtwitter.com/a/1 https://vxtwitter.com/b/2 https://x.com/c/status/3")
     assert cog.stats["skipped"] == 2
+
+
+async def test_mediainfo_reports_the_skip_counter_as_links_left_alone(cog, tmp_path: Path):
+    """It counts profile links as well as embed fixers, so the label must not say "fixer"."""
+    class Ctx:
+        guild = type("G", (_Guild,), {"filesize_limit": 10 * 1048576})()
+        author = _Author(100)
+
+        def __init__(self):
+            self.embeds = []
+
+        async def send(self, content=None, *, embed=None, **kw):
+            self.embeds.append(embed)
+
+    cog.cfg = type("Cfg", (_Cfg,), {"max_download_mb": 500, "rapidapi_key": None, "max_gif_seconds": 0})()
+    cog.workdir = tmp_path
+    await urls(cog, "https://fxtwitter.com/a/1 https://www.tiktok.com/@me https://x.com/c/status/3")
+    ctx = Ctx()
+    await Media.mediainfo.callback(cog, ctx)
+    fields = {f.name: f.value for f in ctx.embeds[0].fields}
+    assert fields["Links left alone"] == "2"
 
 
 # ------------------------------------------------- links no allowed extractor can fetch
